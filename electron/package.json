@@ -1,0 +1,20 @@
+{
+  "name": "electron",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -b && tsc -p tsconfig.preload.json",
+    "dev": "npm run build && electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "dotenv": "^17.4.2",
+    "electron": "^44.3.0",
+    "typescript": "^7.0.2"
+  }
+}

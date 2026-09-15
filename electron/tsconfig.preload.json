@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Preload scripts are loaded by Electron as CommonJS regardless of
+    // package.json "type": "module", so compile this pass to CJS.
+    "module": "commonjs",
+    "verbatimModuleSyntax": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "files": ["preload.ts"],
+  "exclude": ["dist"]
+}
