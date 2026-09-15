@@ -15,11 +15,11 @@ export function AudioBars({ active = false, state }: AudioBarsProps) {
     <BarVisualizer
       state={effectiveState}
       demo={true}
-      barCount={12}
-      minHeight={8}
+      barCount={16}
+      minHeight={12}
       maxHeight={85}
       centerAlign={true}
-      className="h-14 w-52 items-center gap-1 bg-primary-foreground p-0"
+      className="h-20 w-full my-4 items-center gap-1 bg-transparent p-0"
     />
   )
 }   

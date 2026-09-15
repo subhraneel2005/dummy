@@ -15,7 +15,8 @@ const electronAPI = {
       ipcRenderer.removeListener("global-shortcut:down", onDown)
       ipcRenderer.removeListener("global-shortcut:up", onUp)
     }
-  }
+  },
+  ready: () => ipcRenderer.send("renderer:ready")
 }
 
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)

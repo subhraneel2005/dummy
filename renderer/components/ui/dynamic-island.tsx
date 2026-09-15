@@ -25,6 +25,7 @@ type SizePresets =
   | "tall"
   | "ultra"
   | "massive"
+  | "chat"
   | "minimalLeading"
   | "minimalTrailing"
   | "reset"
@@ -46,6 +47,7 @@ const PRESETS: Record<SizePresets, Preset> = {
   tall:             { width: 200, height: 160 },
   ultra:            { width: 320, height: 200 },
   massive:          { width: 380, height: 280 },
+  chat:             { width: 480, height: 620 },
   minimalLeading:   { width: 48,  height: 48 },
   minimalTrailing:  { width: 48,  height: 48 },
   reset:            { width: 120, height: 40 },
@@ -177,7 +179,7 @@ function DynamicIsland({ id, children, className, ...props }: DynamicIslandProps
       id={id}
       data-state={state.size}
       className={cn(
-        "relative overflow-hidden bg-black text-white shadow-lg",
+        "relative overflow-hidden bg-background text-primary shadow-lg rounded-4xl",
         className
       )}
       initial={false}

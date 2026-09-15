@@ -5,13 +5,14 @@ import { fileURLToPath } from "node:url"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
+let pendingPttDown = false
 
-const PTT_KEY = "Space+D"
+const PTT_KEY = "Alt+D"
 
 function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 320,
-    height: 160,
+  mainWindow = new BrowserWindow ({
+    width: 520,
+    height: 680,
     frame: false,
     transparent: true,
     hasShadow: false,
@@ -40,12 +41,22 @@ function registerIpcHandlers() {
     if (mainWindow.isMaximized()) mainWindow.unmaximize()
     else mainWindow.maximize()
   })
+  ipcMain.on("renderer:ready", () => {
+    if (!pendingPttDown) return
+    pendingPttDown = false
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("global-shortcut:down")
+    }
+  })
 }
 
 function registerGlobalShortcut() {
-  if (!mainWindow) return
   const ok = globalShortcut.register(PTT_KEY, () => {
-    if (!mainWindow) return
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      pendingPttDown = true
+      createWindow()
+      return
+    }
     mainWindow.show()
     mainWindow.focus()
     mainWindow.webContents.send("global-shortcut:down")

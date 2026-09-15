@@ -9,6 +9,7 @@ declare global {
         toggleMaximize: () => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
+      ready: () => void
     }
   }
 }
