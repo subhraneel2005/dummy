@@ -4,7 +4,10 @@ const electronAPI = {
   window: {
     close: () => ipcRenderer.send("window:close"),
     minimize: () => ipcRenderer.send("window:minimize"),
-    toggleMaximize: () => ipcRenderer.send("window:toggle-maximize")
+    toggleMaximize: () => ipcRenderer.send("window:toggle-maximize"),
+    startDrag: () => ipcRenderer.invoke("window:start-drag"),
+    moveDrag: () => ipcRenderer.send("window:drag-move"),
+    endDrag: () => ipcRenderer.send("window:drag-end")
   },
   onGlobalShortcut: (callback: (phase: "down" | "up") => void) => {
     const onDown = () => callback("down")

@@ -7,6 +7,9 @@ declare global {
         close: () => void
         minimize: () => void
         toggleMaximize: () => void
+        startDrag: () => void
+        moveDrag: () => void
+        endDrag: () => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
       ready: () => void

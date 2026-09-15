@@ -6,6 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
 let pendingPttDown = false
+let dragOffset: { dx: number; dy: number } | null = null
 
 const PTT_KEY = "Alt+D"
 
@@ -40,6 +41,20 @@ function registerIpcHandlers() {
     if (!mainWindow) return
     if (mainWindow.isMaximized()) mainWindow.unmaximize()
     else mainWindow.maximize()
+  })
+  ipcMain.handle("window:start-drag", () => {
+    if (!mainWindow) return
+    const [x = 0, y = 0] = mainWindow.getPosition()
+    const cursor = screen.getCursorScreenPoint()
+    dragOffset = { dx: cursor.x - x, dy: cursor.y - y }
+  })
+  ipcMain.on("window:drag-move", () => {
+    if (!mainWindow || !dragOffset) return
+    const cursor = screen.getCursorScreenPoint()
+    mainWindow.setPosition(cursor.x - dragOffset.dx, cursor.y - dragOffset.dy)
+  })
+  ipcMain.on("window:drag-end", () => {
+    dragOffset = null
   })
   ipcMain.on("renderer:ready", () => {
     if (!pendingPttDown) return

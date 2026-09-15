@@ -144,10 +144,19 @@ function MessageRow({ message }: { message: Message }) {
   );
 }
 
-function IslandContent({ open }: { open: boolean }) {
+function IslandContent({
+  open,
+  onMouseDown,
+}: {
+  open: boolean;
+  onMouseDown: (e: React.MouseEvent) => void;
+}) {
   return (
     <DynamicContainer className="flex h-full w-full flex-col bg-background backdrop-blur-md">
-      <div className="app-region-drag flex flex-col shrink-0 items-center justify-between gap-2 px-3 pb-1 pt-2">
+      <div
+        className="flex shrink-0 cursor-grab flex-col items-center justify-between gap-2 px-3 pb-1 pt-2 active:cursor-grabbing"
+        onMouseDown={onMouseDown}
+      >
         <CloseButton />
         <AudioBars active={open} />
       </div>
@@ -171,6 +180,19 @@ function Island() {
     setSize("chat" as SizePresets);
   }, [setSize]);
 
+  const startDrag = useCallback((e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("button")) return;
+    const move = () => window.electronAPI?.window.moveDrag();
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      window.electronAPI?.window.endDrag();
+    };
+    window.electronAPI?.window.startDrag();
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }, []);
+
   // Global Alt+D opens the panel; it stays open until closed via the X button.
   useEffect(() => {
     window.electronAPI?.ready();
@@ -182,7 +204,7 @@ function Island() {
 
   return (
     <DynamicIsland id="audio-bars-island">
-      <IslandContent open={open} />
+      <IslandContent open={open} onMouseDown={startDrag} />
     </DynamicIsland>
   );
 }
