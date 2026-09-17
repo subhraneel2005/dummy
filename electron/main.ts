@@ -12,20 +12,25 @@ const PTT_KEY = "Alt+D"
 
 function createWindow() {
   mainWindow = new BrowserWindow ({
-    width: 520,
-    height: 680,
+
     frame: false,
     transparent: true,
     hasShadow: false,
     resizable: false,
     fullscreenable : false,
     alwaysOnTop: true ,
+    enableLargerThanScreen: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       sandbox: true
     }
   })
+
+  mainWindow.setAlwaysOnTop(true, "screen-saver")
+  if (process.platform !== "darwin") {
+    mainWindow.setIgnoreMouseEvents(true, { forward: true })
+  }
 
   mainWindow.loadURL("http://localhost:3000")
 
@@ -55,6 +60,10 @@ function registerIpcHandlers() {
   })
   ipcMain.on("window:drag-end", () => {
     dragOffset = null
+  })
+  ipcMain.on("window:set-ignore-mouse-events", (_event, ignore: boolean) => {
+    if (!mainWindow) return
+    mainWindow.setIgnoreMouseEvents(ignore, { forward: true })
   })
   ipcMain.on("renderer:ready", () => {
     if (!pendingPttDown) return
