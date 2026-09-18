@@ -117,6 +117,28 @@ function Island() {
     return () => window.removeEventListener("mousemove", onMouseMove);
   }, []);
 
+  // Keep the native window sized to the island so there's no oversized
+  // transparent area to block clicks/scroll on the screen behind.
+  useEffect(() => {
+    const el = document.getElementById("audio-bars-island");
+    if (!el) return;
+    let lastW = -1;
+    let lastH = -1;
+    const report = () => {
+      const rect = el.getBoundingClientRect();
+      const w = Math.round(rect.width);
+      const h = Math.round(rect.height);
+      if (w === lastW && h === lastH) return;
+      lastW = w;
+      lastH = h;
+      window.electronAPI?.window.setIslandSize(w, h);
+    };
+    const observer = new ResizeObserver(report);
+    observer.observe(el);
+    report();
+    return () => observer.disconnect();
+  }, []);
+
   return (
     <DynamicIsland id="audio-bars-island">
       <IslandContent open={open} onMouseDown={startDrag} />

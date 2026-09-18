@@ -12,6 +12,7 @@ declare global {
         moveDrag: () => void
         endDrag: () => void
         setIgnoreMouseEvents: (ignore: boolean) => void
+        setIslandSize: (width: number, height: number) => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
       ready: () => void

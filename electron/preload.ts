@@ -10,7 +10,9 @@ const electronAPI = {
     moveDrag: () => ipcRenderer.send("window:drag-move"),
     endDrag: () => ipcRenderer.send("window:drag-end"),
     setIgnoreMouseEvents: (ignore: boolean) =>
-      ipcRenderer.send("window:set-ignore-mouse-events", ignore)
+      ipcRenderer.send("window:set-ignore-mouse-events", ignore),
+    setIslandSize: (width: number, height: number) =>
+      ipcRenderer.send("window:set-island-size", width, height)
   },
   onGlobalShortcut: (callback: (phase: "down" | "up") => void) => {
     const onDown = () => callback("down")

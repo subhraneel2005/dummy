@@ -175,13 +175,17 @@ interface DynamicIslandProps extends Omit<HTMLMotionProps<"div">, "children"> {
 function DynamicIsland({ id, children, className, ...props }: DynamicIslandProps) {
   const { state } = useDynamicIslandSize()
   const preset = PRESETS[state.size] ?? PRESETS.default
+  const isEmpty = state.size === "empty"
 
   return (
     <motion.div
       id={id}
       data-state={state.size}
       className={cn(
-        "relative overflow-hidden bg-background text-primary shadow-lg rounded-xl border border-black/10 dark:border-white/20",
+        "relative overflow-hidden rounded-xl text-primary",
+        isEmpty
+          ? "bg-transparent"
+          : "border border-black/10 bg-background shadow-lg dark:border-white/20",
         className
       )}
       initial={false}

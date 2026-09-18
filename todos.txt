@@ -1,0 +1,17 @@
+i need to finish the first version of this project of mine very fast cuz i need to post it on twitter and i need to keep adding new features on top of it.
+
+my plans that are yet to be completed:
+- actual local stt using whisper.cpp
+- screenshot capture on full circle of my mouse
+- notion like minimal markdown like chatscreen 
+- a sidebar of apps we can connect to 
+- apps for mvp (gmail, cal.com, gmeet)
+- architectural diagram agent using tldraw sdk
+- surf browser using the browseruse repo
+
+lets keep repo opensource and charge 4$ per month for a 'go' plan with limited free usage so everybody can try it out :)
+
+anyone can run this locally: clone it -> setup using docker/normally -> byok -> run it through localhost :)
+or they can directly download from the build file from github actions -> install it -> choose from 'limited free usage' or 'go' or 'premium'
+
+fuck it dont focus on pricing now -> just build the fucking thing :D
