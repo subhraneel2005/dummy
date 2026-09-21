@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from "electron"
 
+interface DictationStatus {
+  state: "transcribing" | "done" | "error"
+  text?: string
+  message?: string
+}
+
 const electronAPI = {
   platform: process.platform,
   window: {
@@ -13,6 +19,14 @@ const electronAPI = {
       ipcRenderer.send("window:set-ignore-mouse-events", ignore),
     setIslandSize: (width: number, height: number) =>
       ipcRenderer.send("window:set-island-size", width, height)
+  },
+  dictation: {
+    sendAudio: (wav: ArrayBuffer) => ipcRenderer.send("dictation:audio", wav),
+    onStatus: (callback: (status: DictationStatus) => void) => {
+      const handler = (_event: unknown, status: DictationStatus) => callback(status)
+      ipcRenderer.on("dictation:status", handler)
+      return () => ipcRenderer.removeListener("dictation:status", handler)
+    }
   },
   onGlobalShortcut: (callback: (phase: "down" | "up") => void) => {
     const onDown = () => callback("down")
@@ -30,3 +44,4 @@ const electronAPI = {
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
 
 export type ElectronAPI = typeof electronAPI
+export type { DictationStatus }

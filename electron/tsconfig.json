@@ -40,5 +40,5 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
   },
-  "exclude": ["dist", "preload.ts", "tsconfig.preload.json"]
+  "exclude": ["dist", "preload.ts", "tsconfig.preload.json", "vendor", "models"]
 }

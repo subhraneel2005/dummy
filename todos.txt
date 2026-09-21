@@ -15,3 +15,9 @@ anyone can run this locally: clone it -> setup using docker/normally -> byok -> 
 or they can directly download from the build file from github actions -> install it -> choose from 'limited free usage' or 'go' or 'premium'
 
 fuck it dont focus on pricing now -> just build the fucking thing :D
+
+instgram acc names:
+"subhraneel" + "goswami" => "goneelgo" 
+bio => "i can build anything, cuz i am tony stank 📩subhraneeljobs@gmail.com 📍ccu, india"
+
+

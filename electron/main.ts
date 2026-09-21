@@ -1,12 +1,15 @@
-import { app, BrowserWindow, globalShortcut, ipcMain, screen } from "electron"
+import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, screen } from "electron"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+
+import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
 let pendingPttDown = false
 let dragOffset: { dx: number; dy: number } | null = null
+let isRecording = false
 
 const PTT_KEY = "Alt+D"
 
@@ -41,6 +44,16 @@ function createWindow() {
   }
 
   mainWindow.loadURL("http://localhost:3000")
+
+  // Global shortcuts have no key-up event, so catch the D/Alt release here and
+  // relay it as the "up" phase while the window is focused on a recording.
+  mainWindow.webContents.on("before-input-event", (_event, input) => {
+    if (input.type !== "keyUp" || !isRecording) return
+    const key = input.key.toLowerCase()
+    if (key === "d" || key === "alt" || key === "option") {
+      mainWindow?.webContents.send("global-shortcut:up")
+    }
+  })
 
   const { width: displayWidth } = screen.getPrimaryDisplay().workArea
   mainWindow.setPosition(Math.round((displayWidth - (ISLAND_WIDTH + PAD * 2)) / 2), 40)
@@ -97,15 +110,47 @@ function registerIpcHandlers() {
       mainWindow.webContents.send("global-shortcut:down")
     }
   })
+
+  ipcMain.on("dictation:audio", async (event, wav: ArrayBuffer) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    isRecording = false
+
+    const ready = whisperReady()
+    if (!ready.ready) {
+      mainWindow.webContents.send("dictation:status", { state: "error", message: ready.reason })
+      return
+    }
+
+    const buffer = Buffer.from(wav)
+    mainWindow.webContents.send("dictation:status", { state: "transcribing" })
+
+    try {
+      const text = await transcribeWav(buffer)
+      if (!text) {
+        mainWindow.webContents.send("dictation:status", {
+          state: "error",
+          message: "Nothing heard — try speaking closer or louder.",
+        })
+        return
+      }
+      clipboard.writeText(text)
+      mainWindow.webContents.send("dictation:status", { state: "done", text })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      mainWindow.webContents.send("dictation:status", { state: "error", message })
+    }
+  })
 }
 
 function registerGlobalShortcut() {
   const ok = globalShortcut.register(PTT_KEY, () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       pendingPttDown = true
+      isRecording = true
       createWindow()
       return
     }
+    isRecording = true
     mainWindow.show()
     mainWindow.focus()
     mainWindow.webContents.send("global-shortcut:down")

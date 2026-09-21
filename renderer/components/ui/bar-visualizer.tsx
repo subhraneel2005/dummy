@@ -186,16 +186,23 @@ export function useMultibandVolume(
       return
     }
 
-    const { analyser, cleanup } = createAudioAnalyser(
+    const { analyser, audioContext, cleanup } = createAudioAnalyser(
       mediaStream,
       opts.analyserOptions
     )
 
     const bufferLength = analyser.frequencyBinCount
     const dataArray = new Float32Array(bufferLength)
-    const sliceStart = opts.loPass!
-    const sliceEnd = opts.hiPass!
-    const sliceLength = sliceEnd - sliceStart
+    const nyquist = audioContext.sampleRate / 2
+    const binStart = Math.max(
+      0,
+      Math.min(bufferLength - 1, Math.round((opts.loPass! / nyquist) * bufferLength))
+    )
+    const binEnd = Math.max(
+      binStart + 1,
+      Math.min(bufferLength, Math.round((opts.hiPass! / nyquist) * bufferLength))
+    )
+    const sliceLength = binEnd - binStart
     const chunkSize = Math.ceil(sliceLength / opts.bands!)
 
     let lastUpdate = 0
@@ -211,8 +218,8 @@ export function useMultibandVolume(
         for (let i = 0; i < opts.bands!; i++) {
           let sum = 0
           let count = 0
-          const startIdx = sliceStart + i * chunkSize
-          const endIdx = Math.min(sliceStart + (i + 1) * chunkSize, sliceEnd)
+          const startIdx = binStart + i * chunkSize
+          const endIdx = Math.min(binStart + (i + 1) * chunkSize, binEnd)
 
           for (let j = startIdx; j < endIdx; j++) {
             sum += normalizeDb(dataArray[j])
@@ -353,6 +360,10 @@ export interface BarVisualizerProps extends HTMLAttributes<HTMLDivElement> {
   demo?: boolean
   /** Align bars from center instead of bottom */
   centerAlign?: boolean
+  /** Low frequency cutoff (Hz) for real audio band analysis */
+  loPass?: number
+  /** High frequency cutoff (Hz) for real audio band analysis */
+  hiPass?: number
 }
 
 const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
@@ -365,6 +376,8 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
       maxHeight = 100,
       demo = false,
       centerAlign = false,
+      loPass = 100,
+      hiPass = 200,
       className,
       style,
       ...props
@@ -374,8 +387,8 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
     // Audio processing
     const realVolumeBands = useMultibandVolume(mediaStream, {
       bands: barCount,
-      loPass: 100,
-      hiPass: 200,
+      loPass,
+      hiPass,
     })
 
     // Generate fake volume data for demo mode using refs to avoid state updates
@@ -384,6 +397,7 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
       new Array(barCount).fill(0.2)
     )
     const fakeAnimationRef = useRef<number | undefined>(undefined)
+    const idleFrame = useRef<number | undefined>(undefined)
 
     // Animate fake volume bands for speaking and listening states
     useEffect(() => {
@@ -447,6 +461,39 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
       [demo, fakeVolumeBands, realVolumeBands]
     )
 
+    // Idle "breathing" motion for live mic listening so bars aren't a dead
+    // flat line before the user speaks. Cheap per-bar offset from time.
+    const [idleOffset, setIdleOffset] = useState<number[]>(() =>
+      new Array(barCount).fill(0)
+    )
+    useEffect(() => {
+      if (demo || !mediaStream || state !== "listening") return
+      let lastUpdate = 0
+      const updateInterval = 100
+      const startTime = performance.now()
+      const updateIdle = (timestamp: number) => {
+        if (timestamp - lastUpdate >= updateInterval) {
+          const t = (timestamp - startTime) / 1000
+          const next = new Array(barCount)
+          for (let i = 0; i < barCount; i++) {
+            const phase = (Math.PI * 2 * i) / barCount
+            next[i] = 0.28 + 0.14 * Math.sin(t * 2 + phase)
+          }
+          setIdleOffset(next)
+          lastUpdate = timestamp
+        }
+        idleFrame.current = requestAnimationFrame(updateIdle)
+      }
+      idleFrame.current = requestAnimationFrame(updateIdle)
+      return () => cancelAnimationFrame(idleFrame.current ?? 0)
+    }, [demo, mediaStream, state, barCount])
+
+    // Volume for listening above idle breathing floor
+    const displayBands = useMemo(() => {
+      if (demo || !mediaStream || state !== "listening") return volumeBands
+      return volumeBands.map((v, i) => Math.max(v, idleOffset[i] ?? 0))
+    }, [volumeBands, idleOffset, mediaStream, state, demo])
+
     // Animation sequencing
     const highlightedIndices = useBarAnimator(
       state,
@@ -475,7 +522,7 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
         }}
         {...props}
       >
-        {volumeBands.map((volume, index) => {
+        {displayBands.map((volume, index) => {
           const heightPct = Math.min(
             maxHeight,
             Math.max(minHeight, volume * 100 + 5)
@@ -540,6 +587,8 @@ const BarVisualizer = memo(BarVisualizerComponent, (prevProps, nextProps) => {
     prevProps.maxHeight === nextProps.maxHeight &&
     prevProps.demo === nextProps.demo &&
     prevProps.centerAlign === nextProps.centerAlign &&
+    prevProps.loPass === nextProps.loPass &&
+    prevProps.hiPass === nextProps.hiPass &&
     prevProps.className === nextProps.className &&
     JSON.stringify(prevProps.style) === JSON.stringify(nextProps.style)
   )

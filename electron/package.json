@@ -5,7 +5,9 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -b && tsc -p tsconfig.preload.json",
-    "dev": "npm run build && electron ."
+    "dev": "sh scripts/dev.sh",
+    "dev:electron": "npm run build && electron .",
+    "setup:whisper": "sh scripts/setup-whisper.sh"
   },
   "keywords": [],
   "author": "",

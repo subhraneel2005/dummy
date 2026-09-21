@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { MessagesSquare, Send, X } from "lucide-react";
+import { useCallback, useEffect } from "react";
+import { CircleCheck, CircleAlert, ClipboardCheck, Mic, X } from "lucide-react";
 
 import { AudioBars } from "@/components/audio-bars-demo";
 import {
@@ -12,56 +12,78 @@ import {
   type SizePresets,
 } from "@/components/ui/dynamic-island";
 import { Button } from "@/components/ui/button";
+import { useDictation, type DictationState } from "@/hooks/use-dictation";
 
-function CloseButton() {
+const HINT: Partial<Record<DictationState, string>> = {
+  listening: "Release to transcribe…",
+  transcribing: "Transcribing…",
+  done: "Copied to clipboard",
+};
+
+function CloseButton({ onClose }: { onClose: () => void }) {
   return (
     <Button
       variant={"outline"}
       size={"icon-xs"}
-      onClick={() => window.electronAPI?.window.close()}
+      onClick={onClose}
       className="app-region-no-drag"
-      aria-label="Close window"
+      aria-label="Dismiss"
     >
-      <X className="h-4 w-4" />
+      <X className="size-3" />
     </Button>
   );
 }
 
 function IslandContent({
-  open,
+  state,
+  transcript,
+  message,
+  mediaStream,
   onMouseDown,
+  onClose,
 }: {
-  open: boolean;
+  state: DictationState;
+  transcript: string;
+  message: string;
+  mediaStream: MediaStream | null;
   onMouseDown: (e: React.MouseEvent) => void;
+  onClose: () => void;
 }) {
+  if (state === "idle") return null;
+
   return (
     <DynamicContainer className="flex h-full w-full flex-col bg-background px-4 py-2 backdrop-blur-md">
       <div
-        className="flex h-full min-w-0 flex-1 cursor-grab items-center justify-center active:cursor-grabbing"
+        className="flex h-full min-w-0 flex-1 cursor-grab items-center justify-center gap-2 active:cursor-grabbing"
         onMouseDown={onMouseDown}
       >
-        <AudioBars active={open} />
+        {state === "listening" && <AudioBars active mediaStream={mediaStream} />}
+        {state === "transcribing" && <AudioBars active state="thinking" />}
+        {state === "done" && (
+          <span
+            className="flex items-center gap-1.5 text-center text-xs leading-snug text-primary"
+          >
+            <CircleCheck className="size-3.5 shrink-0 text-green-600" />
+            <span className="line-clamp-2">{transcript}</span>
+          </span>
+        )}
+        {state === "error" && (
+          <span className="flex min-w-0 items-center gap-1.5 text-center text-xs text-destructive">
+            <CircleAlert className="size-3.5 shrink-0" />
+            <span className="line-clamp-2">{message}</span>
+          </span>
+        )}
       </div>
       <div className="flex shrink-0 items-center justify-center gap-1.5">
-      <CloseButton />
-        <Button
-          variant="outline"
-          size="xs"
-          type="button"
-          className="app-region-no-drag gap-1"
-        >
-          <MessagesSquare className="size-3" />
-          Open chat
-        </Button>
-        <Button
-          variant="default"
-          size="xs"
-          type="button"
-          className="app-region-no-drag gap-1"
-        >
-          <Send className="size-3" />
-          Send to chat
-        </Button>
+        {state === "done" ? <ClipboardCheck className="size-3 text-muted-foreground" /> : null}
+        {state === "listening" || state === "transcribing" ? (
+          <Mic className="size-3 text-muted-foreground" />
+        ) : null}
+        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          {HINT[state]}
+        </span>
+        <span className="mx-0.5" />
+        <CloseButton onClose={onClose} />
       </div>
     </DynamicContainer>
   );
@@ -69,12 +91,7 @@ function IslandContent({
 
 function Island() {
   const { setSize } = useDynamicIslandSize();
-  const [open, setOpen] = useState(false);
-
-  const openPanel = useCallback(() => {
-    setOpen(true);
-    setSize("panel" as SizePresets);
-  }, [setSize]);
+  const { state, text: transcript, message, mediaStream, reset } = useDictation();
 
   const startDrag = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;
@@ -89,18 +106,8 @@ function Island() {
     window.addEventListener("mouseup", up);
   }, []);
 
-  // Global Alt+D opens the panel; it stays open until closed via the X button.
-  useEffect(() => {
-    window.electronAPI?.ready();
-    const unsub = window.electronAPI?.onGlobalShortcut((phase) => {
-      if (phase === "down") openPanel();
-    });
-    return unsub;
-  }, [openPanel]);
-
-  // On Windows the transparent window captures input, so toggle click-through
-  // based on whether the cursor is over the island. macOS passes input through
-  // transparent areas natively, so leave it alone there.
+  // Toggle click-through on Windows based on whether the cursor is over the
+  // island (macOS passes through transparent areas natively).
   useEffect(() => {
     if (window.electronAPI?.platform === "darwin") return;
     let ignoring = true;
@@ -139,9 +146,25 @@ function Island() {
     return () => observer.disconnect();
   }, []);
 
+  // Ready handshake on mount, then keep the window hidden when idle.
+  useEffect(() => {
+    window.electronAPI?.ready();
+  }, []);
+
+  useEffect(() => {
+    setSize(state === "idle" ? ("empty" as SizePresets) : ("panel" as SizePresets));
+  }, [setSize, state]);
+
   return (
-    <DynamicIsland id="audio-bars-island">
-      <IslandContent open={open} onMouseDown={startDrag} />
+    <DynamicIsland id="audio-bars-island" data-state={state}>
+      <IslandContent
+        state={state}
+        transcript={transcript}
+        message={message}
+        mediaStream={mediaStream}
+        onMouseDown={startDrag}
+        onClose={reset}
+      />
     </DynamicIsland>
   );
 }
