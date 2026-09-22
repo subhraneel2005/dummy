@@ -6,6 +6,23 @@ interface DictationStatus {
   message?: string
 }
 
+interface OpenCodeModel {
+  providerID: string
+  providerName: string
+  modelID: string
+  name: string
+  vision: boolean
+}
+
+type OpenCodeStatus =
+  | { state: "connecting" }
+  | { state: "ready"; version: string }
+  | { state: "error"; message: string }
+
+type OpenCodeResult =
+  | { ok: true; models: OpenCodeModel[] }
+  | { ok: false; error: string }
+
 const electronAPI = {
   platform: process.platform,
   window: {
@@ -38,10 +55,32 @@ const electronAPI = {
       ipcRenderer.removeListener("global-shortcut:up", onUp)
     }
   },
+  opencode: {
+    onOpenPicker: (callback: () => void) => {
+      const handler = () => callback()
+      ipcRenderer.on("opencode:open-picker", handler)
+      return () => ipcRenderer.removeListener("opencode:open-picker", handler)
+    },
+    onStatus: (callback: (status: OpenCodeStatus) => void) => {
+      const handler = (_event: unknown, status: OpenCodeStatus) => callback(status)
+      ipcRenderer.on("opencode:status", handler)
+      return () => ipcRenderer.removeListener("opencode:status", handler)
+    },
+    listModels: () => ipcRenderer.invoke("opencode:models") as Promise<OpenCodeResult>,
+    getModel: () =>
+      ipcRenderer.invoke("opencode:get-model") as Promise<
+        { ok: true; model: OpenCodeModel | null } | { ok: false; error: string }
+      >,
+    setModel: (model: OpenCodeModel) =>
+      ipcRenderer.invoke("opencode:set-model", model) as Promise<{
+        ok: true
+        model: OpenCodeModel
+      }>
+  },
   ready: () => ipcRenderer.send("renderer:ready")
 }
 
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
 
 export type ElectronAPI = typeof electronAPI
-export type { DictationStatus }
+export type { DictationStatus, OpenCodeModel, OpenCodeResult, OpenCodeStatus }

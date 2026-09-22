@@ -2,16 +2,25 @@ import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, screen } from "
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
+import {
+  getSelectedModel,
+  listModels,
+  onOpenCodeStatus,
+  setSelectedModel,
+  stopOpenCode,
+} from "./opencode.js"
 import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
 let pendingPttDown = false
+let pendingModelPicker = false
 let dragOffset: { dx: number; dy: number } | null = null
 let isRecording = false
 
 const PTT_KEY = "Alt+D"
+const MODEL_PICKER_KEY = "Alt+M"
 
 const PAD = 12
 const ISLAND_WIDTH = 280
@@ -91,9 +100,17 @@ function registerIpcHandlers() {
     const h = Math.max(1, Math.round(height)) + PAD * 2
     const [x = 0, y = 0] = mainWindow.getPosition()
     const [currentWidth = 0, currentHeight = 0] = mainWindow.getSize()
+    // Center horizontally around the current window, but anchor the top edge
+    // so growing the island doesn't push it off the top of the screen.
+    let nextX = Math.round(x + (currentWidth - w) / 2)
+    let nextY = y
+    // Keep the window fully inside the display's work area.
+    const { workArea } = screen.getDisplayNearestPoint({ x, y })
+    nextX = Math.min(Math.max(nextX, workArea.x), workArea.x + workArea.width - w)
+    nextY = Math.min(Math.max(nextY, workArea.y), workArea.y + workArea.height - h)
     mainWindow.setBounds({
-      x: Math.round(x + (currentWidth - w) / 2),
-      y: Math.round(y + (currentHeight - h) / 2),
+      x: nextX,
+      y: nextY,
       width: w,
       height: h
     })
@@ -104,10 +121,35 @@ function registerIpcHandlers() {
     }
   })
   ipcMain.on("renderer:ready", () => {
-    if (!pendingPttDown) return
-    pendingPttDown = false
+    if (pendingPttDown) {
+      pendingPttDown = false
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("global-shortcut:down")
+      }
+    }
+    if (pendingModelPicker) {
+      pendingModelPicker = false
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show()
+        mainWindow.focus()
+        mainWindow.webContents.send("opencode:open-picker")
+      }
+    }
+  })
+
+  ipcMain.handle("opencode:models", () => listModels())
+  ipcMain.handle("opencode:get-model", () => ({
+    ok: true as const,
+    model: getSelectedModel(),
+  }))
+  ipcMain.handle("opencode:set-model", (_event, model) => {
+    setSelectedModel(model)
+    return { ok: true as const, model }
+  })
+
+  onOpenCodeStatus((status) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("global-shortcut:down")
+      mainWindow.webContents.send("opencode:status", status)
     }
   })
 
@@ -158,6 +200,22 @@ function registerGlobalShortcut() {
   if (!ok) {
     console.warn(`Failed to register global shortcut: ${PTT_KEY}`)
   }
+
+  const okPicker = globalShortcut.register(MODEL_PICKER_KEY, () => {
+    if (mainWindow && mainWindow.isDestroyed()) {
+      pendingModelPicker = true
+      createWindow()
+      return
+    }
+    if (mainWindow) {
+      mainWindow.show()
+      mainWindow.focus()
+      mainWindow.webContents.send("opencode:open-picker")
+    }
+  })
+  if (!okPicker) {
+    console.warn(`Failed to register global shortcut: ${MODEL_PICKER_KEY}`)
+  }
 }
 
 app.whenReady().then(() => {
@@ -172,6 +230,7 @@ app.whenReady().then(() => {
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll()
+  stopOpenCode()
 })
 
 app.on("window-all-closed", () => {

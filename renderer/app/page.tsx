@@ -13,6 +13,8 @@ import {
 } from "@/components/ui/dynamic-island";
 import { Button } from "@/components/ui/button";
 import { useDictation, type DictationState } from "@/hooks/use-dictation";
+import { useOpencode } from "@/hooks/use-opencode";
+import { ModelPicker } from "@/components/model-picker";
 
 const HINT: Partial<Record<DictationState, string>> = {
   listening: "Release to transcribe…",
@@ -92,6 +94,9 @@ function IslandContent({
 function Island() {
   const { setSize } = useDynamicIslandSize();
   const { state, text: transcript, message, mediaStream, reset } = useDictation();
+  const opencode = useOpencode();
+
+  const pickerOpen = opencode.phase !== "closed";
 
   const startDrag = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;
@@ -152,19 +157,34 @@ function Island() {
   }, []);
 
   useEffect(() => {
-    setSize(state === "idle" ? ("empty" as SizePresets) : ("panel" as SizePresets));
-  }, [setSize, state]);
+    if (pickerOpen) {
+      setSize("models" as SizePresets);
+    } else {
+      setSize(state === "idle" ? ("empty" as SizePresets) : ("panel" as SizePresets));
+    }
+  }, [setSize, state, pickerOpen]);
 
   return (
     <DynamicIsland id="audio-bars-island" data-state={state}>
-      <IslandContent
-        state={state}
-        transcript={transcript}
-        message={message}
-        mediaStream={mediaStream}
-        onMouseDown={startDrag}
-        onClose={reset}
-      />
+      {pickerOpen ? (
+        <ModelPicker
+          phase={opencode.phase}
+          models={opencode.models}
+          selected={opencode.selected}
+          message={opencode.message}
+          onClose={opencode.close}
+          onSelect={opencode.select}
+        />
+      ) : (
+        <IslandContent
+          state={state}
+          transcript={transcript}
+          message={message}
+          mediaStream={mediaStream}
+          onMouseDown={startDrag}
+          onClose={reset}
+        />
+      )}
     </DynamicIsland>
   );
 }

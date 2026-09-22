@@ -18,5 +18,8 @@
     "dotenv": "^17.4.2",
     "electron": "^44.3.0",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.32"
   }
 }

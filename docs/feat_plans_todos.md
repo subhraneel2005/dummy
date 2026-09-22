@@ -133,6 +133,75 @@ decodeAudioData → 16 kHz mono PCM       spawn whisper-cli -m ggml-base.en.bin
 2. Key-release reliability if the renderer loses focus mid-hold — is the 60 s cap + re-press cancel acceptable for v1?
 3. Should transcribing ever apply `$1`/command shortcuts (e.g. paste-directly)? (Not in v1.)
 
+---
+
+## Feature 2 — OpenCode Model Access (auth + discovery + selection ONLY)
+
+### Goal
+The app talks to a local OpenCode server that inherits the user's existing OpenCode installation/auth (`~/.local/share/opencode/auth.json` + `opencode.json`), lists the **active** models that account can access, lets the user pick one, and persists the choice. **No AI features** — no prompts, no streaming, no clipboard AI output, no "ask" flow.
+
+### User Flow (v1)
+1. **Alt+M** global shortcut opens the island in model-picker mode.
+2. Island shows a compact, scrollable list of active models (name + provider; vision-capable flag shown as metadata, ready for F3).
+3. User picks one → selection persisted → island briefly confirms ("Model set: <name>") → auto-hide.
+4. Error states: opencode binary missing, not logged in, server failed to start — message in island.
+
+### Architecture Overview
+```
+Electron main (spawns managed child)          SDK
+────────────────────────────────              ─────────────
+opencode serve --port <free>                   @opencode-ai/sdk
+  child of app, killed on quit                 createOpencodeClient({baseUrl})
+  reads existing auth.json/config ──► lists user's available models
+```
+- Binary resolution: `OPENCODE_BIN` env → `which opencode` (= `/opt/homebrew/bin/opencode` v1.18.31). Spawn child directly for control; connect via SDK client. Server binds a **free port** each launch; readiness via polling `GET /global/health`.
+- Auth inherited automatically from existing OpenCode install — no keys stored in the app.
+- Model list: `config.providers()` → `{ providers, default }`; each provider's `models` keyed by id. Filter `status: "active"` (skip deprecated/experimental). Include `providerID`, `id`, `name`, `capabilities.input.image` flag.
+- Selected model persisted in a small JSON under `app.getPath("userData")` (no new deps).
+
+### IPC Surface (additions)
+- main → renderer: `opencode:status` (events: `connecting` / `ready` / `error` with message).
+- renderer → main: `opencode:models` (invoke → flat list), `opencode:get-model` (invoke), `opencode:set-model` (invoke, persists).
+
+### Platforms
+- macOS dev (current target). Server child lifecycle: spawn on first use, keep alive, respawn once on crash, kill on quit (`will-quit`).
+
+---
+
+## Todos — Feature 2
+
+### Phase A — OpenCode service (`electron/opencode.ts`)
+- [x] Resolve binary (`OPENCODE_BIN` env → `which opencode`)
+- [x] Spawn managed `opencode serve` child on a free port; health-poll `GET /global/health`
+- [x] `listModels()` — active models flat list w/ provider + vision flag
+- [x] `getSelectedModel()` / `setSelectedModel()` — persisted JSON in `userData`
+- [x] Lifecycle: spawn on first use, respawn once on crash, `stop()` on quit
+- [x] `@opencode-ai/sdk` dependency added
+
+### Phase B — IPC + preload
+- [x] `opencode:status` event (`connecting`/`ready`/`error`)
+- [x] `opencode:models`, `opencode:get-model`, `opencode:set-model` handlers
+- [x] Extend `electron.d.ts` + preload bridge
+
+### Phase C — Renderer UI
+- [x] `useOpencode` hook (status, models, get/set selected)
+- [x] Alt+M opens island in model-picker state
+- [x] Island states: connecting / models / error (+ loading)
+- [x] Model list rendering: shadcn `Command` palette (search, keyboard nav, scroll) with provider groups, vision badge, selected check
+- [x] Selection → confirm message → auto-hide (mirror existing island sizing/auto-hide)
+
+### Phase D — Polish / hardening
+- [x] Errors surfaced for missing binary / no auth / server start failure
+- [ ] Port-in-use retry; server-crash respawn (respawn-once implemented)
+- [x] Island grows top-anchored + clamped to work area (no cut-off when picker opens)
+- [x] `tsc` + lint green in `electron/` and `renderer/` (feature files; pre-existing errors remain in untouched files)
+- [ ] Manual test: Alt+M → list → select → confirm → persists across restart
+
+---
+
+## Open Questions
+- F2: default selection = user's configured default provider/model from OpenCode config? (currently just persisted selection)
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - LLM agent hookup: transcript → local chat panel (`Send to chat` / `Open chat` buttons).

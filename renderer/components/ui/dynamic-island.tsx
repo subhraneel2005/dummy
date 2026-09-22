@@ -29,6 +29,7 @@ type SizePresets =
   | "panel"
   | "minimalLeading"
   | "minimalTrailing"
+  | "models"
   | "reset"
   | "empty"
 
@@ -52,6 +53,7 @@ const PRESETS: Record<SizePresets, Preset> = {
   panel:            { width: 280, height: 84 },
   minimalLeading:   { width: 48,  height: 48 },
   minimalTrailing:  { width: 48,  height: 48 },
+  models:           { width: 340, height: 470 },
   reset:            { width: 120, height: 40 },
   empty:            { width: 0,   height: 0 },
 }
