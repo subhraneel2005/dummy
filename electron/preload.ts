@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron"
 
 interface DictationStatus {
-  state: "transcribing" | "done" | "error"
+  state: "transcribing" | "polishing" | "done" | "error"
   text?: string
   message?: string
 }

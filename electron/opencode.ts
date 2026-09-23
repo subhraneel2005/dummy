@@ -272,3 +272,117 @@ export function stopOpenCode(): void {
   client = null
   serverUrl = null
 }
+
+const POLISH_SYSTEM_PROMPT =
+  "You fix transcription errors in technical/developer speech. Output ONLY the corrected " +
+  "transcript. Do not add commentary, paraphrases, quotes, markdown, or reword phrasing. " +
+  "Preserve sentence structure, punctuation, capitalization, and line breaks exactly. Correct: " +
+  "library/package/tool names, identifiers, flags, commands, version numbers, URLs, APIs, file " +
+  "paths, and technical terms. If raw terms look like deliberate speech (e.g. intentional names), " +
+  "keep them."
+
+// OpenCode's own agent system prompt can override the `system` field, so the
+// instruction is repeated in the user text part to make it reliable.
+export const POLISH_USER_PROMPT = (raw: string) =>
+  [
+    "Correct ONLY the technical spelling in the following dictated transcript.",
+    "Fix tool/package names, commands, flags, APIs, identifiers, and version numbers.",
+    "Do NOT reword, paraphrase, comment, explain, or add code blocks/markdown or backticks.",
+    "Output ONLY the corrected transcript as plain prose, no formatting.",
+    "TRANSCRIPT:",
+    raw,
+  ].join("\n")
+
+const POLISH_TIMEOUT_MS = 30_000
+
+// The fetch/system prompt doesn't reliably suppress OpenCode's coding-agent
+// behavior, so disable every built-in tool explicitly. This makes the model
+// reply inline instead of searching the project or asking follow-up questions.
+const POLISH_DISABLED_TOOLS = {
+  read: false,
+  write: false,
+  edit: false,
+  bash: false,
+  glob: false,
+  grep: false,
+  task: false,
+  todo: false,
+  list: false,
+  search: false,
+  apply_patch: false,
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("Timed out waiting for the model to polish the transcript.")),
+      ms
+    )
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
+async function runPolish(client: OpencodeClient, model: OpenCodeModel, raw: string) {
+  const created = (await client.session.create({
+    throwOnError: true,
+    responseStyle: "data",
+  } as Parameters<typeof client.session.create>[0])) as unknown as { id: string }
+
+  const sessionID = created.id
+  try {
+    const res = (await client.session.prompt({
+      throwOnError: true,
+      responseStyle: "data",
+      path: { id: sessionID },
+      body: {
+        model: { providerID: model.providerID, modelID: model.modelID },
+        system: POLISH_SYSTEM_PROMPT,
+        tools: POLISH_DISABLED_TOOLS,
+        parts: [{ type: "text", text: POLISH_USER_PROMPT(raw) }],
+      },
+    } as Parameters<typeof client.session.prompt>[0])) as unknown as {
+      parts: Array<{ type: string; text?: string }>
+    }
+    const textPart = res.parts.find((part) => part.type === "text")
+    const text = textPart?.text?.trim()
+    return text || raw
+  } finally {
+    try {
+      await client.session.delete({
+        throwOnError: true,
+        responseStyle: "data",
+        path: { id: sessionID },
+      } as Parameters<typeof client.session.delete>[0])
+    } catch {
+      // best-effort cleanup of the ephemeral session
+    }
+  }
+}
+
+export async function polishTranscript(raw: string): Promise<string> {
+  const trimmed = raw.trim()
+  if (!trimmed) return raw
+
+  const model = getSelectedModel()
+  if (!model) return raw
+
+  const error = await start()
+  if (error || !client) return raw
+
+  try {
+    const corrected = await withTimeout(runPolish(client, model, trimmed), POLISH_TIMEOUT_MS)
+    return corrected.trim() || trimmed
+  } catch {
+    // Never block dictation on the LLM pass — fall back to the raw transcript.
+    return trimmed
+  }
+}

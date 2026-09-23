@@ -19,6 +19,7 @@ import { ModelPicker } from "@/components/model-picker";
 const HINT: Partial<Record<DictationState, string>> = {
   listening: "Release to transcribe…",
   transcribing: "Transcribing…",
+  polishing: "Polishing technical terms…",
   done: "Copied to clipboard",
 };
 
@@ -61,6 +62,7 @@ function IslandContent({
       >
         {state === "listening" && <AudioBars active mediaStream={mediaStream} />}
         {state === "transcribing" && <AudioBars active state="thinking" />}
+        {state === "polishing" && <AudioBars active state="thinking" />}
         {state === "done" && (
           <span
             className="flex items-center gap-1.5 text-center text-xs leading-snug text-primary"
@@ -78,7 +80,9 @@ function IslandContent({
       </div>
       <div className="flex shrink-0 items-center justify-center gap-1.5">
         {state === "done" ? <ClipboardCheck className="size-3 text-muted-foreground" /> : null}
-        {state === "listening" || state === "transcribing" ? (
+        {state === "listening" ||
+        state === "transcribing" ||
+        state === "polishing" ? (
           <Mic className="size-3 text-muted-foreground" />
         ) : null}
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">

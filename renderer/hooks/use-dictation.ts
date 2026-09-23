@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { blobToMono16kWav } from "@/lib/wav";
 
-export type DictationState = "idle" | "listening" | "transcribing" | "done" | "error";
+export type DictationState = "idle" | "listening" | "transcribing" | "polishing" | "done" | "error";
 
 export interface DictationStatus {
-  state: "transcribing" | "done" | "error";
+  state: "transcribing" | "polishing" | "done" | "error";
   text?: string;
   message?: string;
 }
@@ -180,7 +180,9 @@ export function useDictation() {
 
   useEffect(() => {
     const unsub = window.electronAPI?.dictation.onStatus((status: DictationStatus) => {
-      if (status.state === "done") {
+      if (status.state === "polishing") {
+        setState("polishing");
+      } else if (status.state === "done") {
         setMessage("");
         setText(status.text ?? "");
         setState("done");

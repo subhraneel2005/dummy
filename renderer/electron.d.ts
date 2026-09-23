@@ -34,7 +34,7 @@ declare global {
       dictation: {
         sendAudio: (wav: ArrayBuffer) => void
         onStatus: (callback: (status: {
-          state: "transcribing" | "done" | "error"
+          state: "transcribing" | "polishing" | "done" | "error"
           text?: string
           message?: string
         }) => void) => () => void

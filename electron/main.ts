@@ -6,6 +6,7 @@ import {
   getSelectedModel,
   listModels,
   onOpenCodeStatus,
+  polishTranscript,
   setSelectedModel,
   stopOpenCode,
 } from "./opencode.js"
@@ -175,8 +176,10 @@ function registerIpcHandlers() {
         })
         return
       }
-      clipboard.writeText(text)
-      mainWindow.webContents.send("dictation:status", { state: "done", text })
+      mainWindow.webContents.send("dictation:status", { state: "polishing" })
+      const polished = await polishTranscript(text)
+      clipboard.writeText(polished)
+      mainWindow.webContents.send("dictation:status", { state: "done", text: polished })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       mainWindow.webContents.send("dictation:status", { state: "error", message })

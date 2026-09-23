@@ -202,6 +202,101 @@ opencode serve --port <free>                   @opencode-ai/sdk
 ## Open Questions
 - F2: default selection = user's configured default provider/model from OpenCode config? (currently just persisted selection)
 
+---
+
+## Feature 2.5 — Technical-Jargon Post-Processing (LLM pass over transcribed text)
+
+### Goal
+`base.en`-class whisper transcribes everyday English well but mangles technical jargon (library/package names, identifiers, flags, version strings, commands like `pnpm dlx`, APIs like `getUserMedia`, terms like "idempotent"). **We will NOT scale whisper up to `small`/`medium`** (already decided). Instead, once Feature 2's model selection exists, we post-process the raw transcript through the **user's selected OpenCode model** via the already-running local OpenCode server, and copy the corrected text to the clipboard.
+
+### Why not another whisper model
+- `base.en` → `small.en` costs ~4x RAM (+~300 MB on an 8 GB M1) and only marginally helps domain terms it was never trained to spell.
+- Technical accuracy needs a model that knows **the user's own stack + OpenCode's vocab**, not a generic English model. LLM pass fixes the specific failure mode (spelling/munging of jargon) without the RAM/disk cost.
+
+### User Flow (v1)
+1. User holds Alt+D, speaks (existing F1 flow).
+2. Release → whisper `base.en` transcribes (existing F1) → **raw transcript**.
+3. Island switches to a **"Polishing…"** state (between transcribing and done).
+4. Main sends raw text to the selected OpenCode model with a strict "fix jargon, don't rephrase" prompt (via F2's already-spawned `opencode serve` + SDK).
+5. Corrected text → `clipboard.writeText()` → island "Copied to clipboard" state (same auto-hide as F1).
+6. **Fallbacks (never worse than today):** no model selected / server down / model error / timeout → copy the raw whisper transcript and skip step 3–4 (or show a brief "polish skipped" hint).
+
+### Architecture Overview
+```
+renderer                               electron/main
+─────────                              ─────────────
+whisper transcribes (unchanged F1)     transcribeWav() → raw text
+   │                                        │
+   │  dictation:status "polishing"          │  polishTranscript(rawText)
+   │◄───────────────────────────────────────┤  (reuses F2 client/server)
+   │                                        │  session.create()
+   │                                        │  session.prompt({
+   │                                        │    model: selected F2 model,
+   │                                        │    system: fix-jargon prompt,
+   │                                        │    parts: [text(raw)] })
+   │                                        │  → extract first text part
+   │                                        │
+   │  clipboard.writeText(corrected) ◄──────┤
+   │  "done" + auto-hide                    │
+```
+- **No second server** — reuse the F2 managed `opencode serve` child + `@opencode-ai/sdk` client (`start()` spins it up lazily if the picker was never opened).
+- **Prompt model** = the persisted F2 selection. (Note: users may want a fast/cheap model for this; selection is theirs.)
+- Ephemeral session per clip (`session.create` → push one message → `session.delete`); no conversation state.
+
+### The fix-jargon prompt (main-process constant, single-turn, `system` + one `text` part)
+- Instruction (`system`): "You fix transcription errors in technical/developer speech. Output ONLY the corrected transcript. Do not add commentary, paraphrases, quotes, markdown, or reword phrasing. Preserve sentence structure, punctuation, capitalization, and line breaks exactly. Correct: library/package/tool names, identifiers, flags, commands, version numbers, URLs, APIs, file paths, and technical terms. If raw terms look like deliberate speech (e.g. intentional names), keep them."
+- Single `text` part = raw transcript. Never chat/multi-turn.
+- Verify against the SDK response shape: `SessionPromptResponses["200"] = { info: AssistantMessage, parts: Array<Part> }`; take the first `Part` with `type === "text"`.
+
+### Latency & budget
+- Adds one network LLM call per clip (1–3 s typical for a fast model). Acceptable for push-to-talk; island shows "Polishing…".
+- Hard timeout in main (e.g. 30 s) → fall back to raw text.
+- Skip preprocessing entirely when raw transcript is empty/whitespace (raw copy/no-op, as F1).
+
+### IPC Surface (additions)
+- main → renderer: `dictation:status` states extended: reuse `transcribing`, add `polishing`.
+- No new renderer→main channels: flow stays inside the existing `dictation:audio` handler (transcribe → polish → clipboard → status).
+- `polishTranscript(raw)` lives in the F2 `opencode.ts` service (already has client + storage).
+
+### Renderer / island (additions)
+- New `DictationStatus.state = "polishing"` + island hint ("Polishing technical terms…"): map to an added state in `useDictation`; reuse the existing spinner/thinking bars; keep auto-hide timing for `done`/`error` unchanged.
+
+### Platforms / errors
+- macOS dev (target). All failure paths degrade to **raw transcript** (never block dictation on the LLM).
+- Error paths handled: F2 server not started / start fails, no selected model, session.prompt throws, empty model reply, timeout.
+
+---
+
+## Todos — Feature 2.5
+
+### Phase A — Service: `polishTranscript(raw)` in `electron/opencode.ts`
+- [x] `polishTranscript(raw: string): Promise<string>` — reuse F2 `start()` client; create ephemeral session, send prompt w/ selected model, extract first `text` part, delete session
+- [x] Fix-jargon system prompt constant + hard timeout (e.g. 30 s) + empty-reply guard
+- [x] Behavior when no model selected / server unavailable → return raw text unchanged
+- [x] Tools disabled explicitly (OpenCode's agent prompt overrides `system` otherwise); instruction inlined in the user text part (reliable); backticks rejected in output
+
+### Phase B — Main: wire into `dictation:audio` handler
+- [x] After `transcribeWav()` → call `polishTranscript()` → write corrected text; on success send `done`, mark it polished
+- [x] On any polish failure → fall back to raw transcript copy (same `done` path)
+- [x] Send `dictation:status { state: "polishing" }` between transcribe and done
+- [x] Update `DictationStatus` type in `preload.ts` + `electron.d.ts` with `polishing`
+
+### Phase C — Renderer UI
+- [x] `useDictation` + island: `polishing` state → "Polishing technical terms…" hint (spinner/thinking bars, existing patterns)
+- [x] Auto-hide timing unchanged; transcribe→polish→done sequence renders cleanly
+
+### Phase D — Validation
+- [x] `tsc` + lint green (`electron/` + `renderer/` feature files)
+- [x] Smoke-tested `polishTranscript` against real `opencode serve`: jargon corrected (`p n m dlx` → `pnpm dlx`, `get user media` → `getUserMedia`, `use autos effects hook` → `useAutoEffect hook`), no backticks/markdown; warm-call ~6.3 s (within 30 s timeout); no-model/empty/timeout/error all fall back to raw; no lingering processes on stop
+- [ ] Manual test: hold Alt+D, speak a jargon-heavy phrase, verify corrected clipboard text + fallback when no model selected
+
+---
+
+## Open Questions
+- F2.5: should "polish skipped" (fallback) be silent or briefly indicated in the island? (leaning: silent, since dictation still works)
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - LLM agent hookup: transcript → local chat panel (`Send to chat` / `Open chat` buttons).
