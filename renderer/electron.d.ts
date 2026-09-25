@@ -1,20 +1,47 @@
 export {}
 
-interface OpenCodeModel {
-  providerID: string
-  providerName: string
-  modelID: string
-  name: string
-  vision: boolean
+interface AiConfig {
+  provider: string | null
+  model: string | null
+  hasKey: boolean
+  encryptionAvailable: boolean
 }
 
-type OpenCodeStatus =
-  | { state: "connecting" }
-  | { state: "ready"; version: string }
-  | { state: "error"; message: string }
+interface ModelInfo {
+  id: string
+  label: string
+}
 
-type OpenCodeResult =
-  | { ok: true; models: OpenCodeModel[] }
+interface ProviderInfo {
+  id: string
+  label: string
+  keyPlaceholder: string
+  docsUrl: string
+}
+
+type AiConfigResult = { ok: true; config: AiConfig } | { ok: false; error: string }
+type AiCatalogResult = {
+  ok: true
+  providers: Record<string, ProviderInfo>
+  models: Record<string, ModelInfo[]>
+}
+type AiModelsResult =
+  | { ok: true; models: ModelInfo[] }
+  | { ok: false; error: string; models?: ModelInfo[] }
+
+interface ChatMessage {
+  role: "user" | "assistant"
+  text: string
+}
+
+type ChatEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string }
+
+type ChatSendResult = { ok: true } | { ok: false; error: string }
+type ChatHistoryResult =
+  | { ok: true; messages: ChatMessage[] }
   | { ok: false; error: string }
 
 declare global {
@@ -39,14 +66,21 @@ declare global {
           message?: string
         }) => void) => () => void
       }
-      opencode: {
-        onOpenPicker: (callback: () => void) => () => void
-        onStatus: (callback: (status: OpenCodeStatus) => void) => () => void
-        listModels: () => Promise<OpenCodeResult>
-        getModel: () => Promise<
-          { ok: true; model: OpenCodeModel | null } | { ok: false; error: string }
-        >
-        setModel: (model: OpenCodeModel) => Promise<{ ok: true; model: OpenCodeModel }>
+      ai: {
+        onOpenSettings: (callback: () => void) => () => void
+        getConfig: () => Promise<AiConfigResult>
+        getCatalog: () => Promise<AiCatalogResult>
+        listModels: (provider: string) => Promise<AiModelsResult>
+        setProvider: (provider: string) => Promise<AiConfigResult>
+        setModel: (model: string) => Promise<AiConfigResult>
+        setKey: (provider: string, key: string) => Promise<AiConfigResult>
+        clearKey: (provider: string) => Promise<AiConfigResult>
+      }
+      chat: {
+        send: (text: string) => Promise<ChatSendResult>
+        history: () => Promise<ChatHistoryResult>
+        reset: () => Promise<ChatSendResult>
+        onEvent: (callback: (event: ChatEvent) => void) => () => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
       ready: () => void

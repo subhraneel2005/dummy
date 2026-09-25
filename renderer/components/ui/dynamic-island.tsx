@@ -29,7 +29,7 @@ type SizePresets =
   | "panel"
   | "minimalLeading"
   | "minimalTrailing"
-  | "models"
+  | "settings"
   | "reset"
   | "empty"
 
@@ -49,11 +49,11 @@ const PRESETS: Record<SizePresets, Preset> = {
   tall:             { width: 200, height: 160 },
   ultra:            { width: 320, height: 200 },
   massive:          { width: 380, height: 280 },
-  chat:             { width: 480, height: 620 },
+  chat:             { width: 560, height: 720 },
   panel:            { width: 280, height: 84 },
   minimalLeading:   { width: 48,  height: 48 },
   minimalTrailing:  { width: 48,  height: 48 },
-  models:           { width: 340, height: 470 },
+  settings:         { width: 360, height: 330 },
   reset:            { width: 120, height: 40 },
   empty:            { width: 0,   height: 0 },
 }

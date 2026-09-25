@@ -195,11 +195,12 @@ export function useDictation() {
     return () => unsub?.();
   }, []);
 
+  // Only the error state auto-hides back to idle. The done state stays put so
+  // the user can read the result and act on it (Send to chat / Open chat);
+  // it is dismissed manually via the island close button.
   useEffect(() => {
     clearHideTimer();
-    if (state === "done") {
-      hideTimerRef.current = window.setTimeout(resetToIdle, DONE_HIDE_MS);
-    } else if (state === "error") {
+    if (state === "error") {
       hideTimerRef.current = window.setTimeout(resetToIdle, ERROR_HIDE_MS);
     }
     return clearHideTimer;

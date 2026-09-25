@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect } from "react";
-import { CircleCheck, CircleAlert, ClipboardCheck, Mic, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { CircleCheck, CircleAlert, ClipboardCheck, Mic, Send, X } from "lucide-react";
 
 import { AudioBars } from "@/components/audio-bars-demo";
 import {
@@ -13,8 +13,9 @@ import {
 } from "@/components/ui/dynamic-island";
 import { Button } from "@/components/ui/button";
 import { useDictation, type DictationState } from "@/hooks/use-dictation";
-import { useOpencode } from "@/hooks/use-opencode";
-import { ModelPicker } from "@/components/model-picker";
+import { useAiSettings } from "@/hooks/use-ai-settings";
+import { SettingsPanel } from "@/components/settings-panel";
+import { ChatPanel } from "@/components/chat-panel";
 
 const HINT: Partial<Record<DictationState, string>> = {
   listening: "Release to transcribe…",
@@ -44,6 +45,7 @@ function IslandContent({
   mediaStream,
   onMouseDown,
   onClose,
+  onOpenChat,
 }: {
   state: DictationState;
   transcript: string;
@@ -51,6 +53,7 @@ function IslandContent({
   mediaStream: MediaStream | null;
   onMouseDown: (e: React.MouseEvent) => void;
   onClose: () => void;
+  onOpenChat: (initialText: string) => void;
 }) {
   if (state === "idle") return null;
 
@@ -64,12 +67,23 @@ function IslandContent({
         {state === "transcribing" && <AudioBars active state="thinking" />}
         {state === "polishing" && <AudioBars active state="thinking" />}
         {state === "done" && (
-          <span
-            className="flex items-center gap-1.5 text-center text-xs leading-snug text-primary"
-          >
-            <CircleCheck className="size-3.5 shrink-0 text-green-600" />
-            <span className="line-clamp-2">{transcript}</span>
-          </span>
+          <div className="flex w-full flex-col items-center gap-1.5">
+            <span className="flex max-w-full items-center gap-1.5 text-center text-xs leading-snug text-primary">
+              <CircleCheck className="size-3.5 shrink-0 text-green-600" />
+              <span className="line-clamp-2">{transcript}</span>
+            </span>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onOpenChat(transcript)}
+                className="h-6 rounded-full px-2.5 text-[10px]"
+              >
+                <Send className="size-3" />
+                Send to chat
+              </Button>
+            </div>
+          </div>
         )}
         {state === "error" && (
           <span className="flex min-w-0 items-center gap-1.5 text-center text-xs text-destructive">
@@ -98,9 +112,14 @@ function IslandContent({
 function Island() {
   const { setSize } = useDynamicIslandSize();
   const { state, text: transcript, message, mediaStream, reset } = useDictation();
-  const opencode = useOpencode();
+  const settings = useAiSettings();
 
-  const pickerOpen = opencode.phase !== "closed";
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatDraft, setChatDraft] = useState("");
+  const settingsOpen = settings.phase !== "closed";
+
+  // ChatPanel lives inside the same island; opening it swaps the island size
+  // to the "chat" preset and renders the conversation in its place.
 
   const startDrag = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;
@@ -161,23 +180,39 @@ function Island() {
   }, []);
 
   useEffect(() => {
-    if (pickerOpen) {
-      setSize("models" as SizePresets);
+    if (settingsOpen) {
+      setSize("settings" as SizePresets);
+    } else if (chatOpen) {
+      setSize("chat" as SizePresets);
     } else {
       setSize(state === "idle" ? ("empty" as SizePresets) : ("panel" as SizePresets));
     }
-  }, [setSize, state, pickerOpen]);
+  }, [setSize, state, settingsOpen, chatOpen]);
 
   return (
     <DynamicIsland id="audio-bars-island" data-state={state}>
-      {pickerOpen ? (
-        <ModelPicker
-          phase={opencode.phase}
-          models={opencode.models}
-          selected={opencode.selected}
-          message={opencode.message}
-          onClose={opencode.close}
-          onSelect={opencode.select}
+      {settingsOpen ? (
+        <SettingsPanel
+          phase={settings.phase}
+          config={settings.config}
+          providers={settings.providers}
+          models={settings.models}
+          liveModels={settings.liveModels}
+          modelsLoading={settings.modelsLoading}
+          modelsNotice={settings.modelsNotice}
+          message={settings.message}
+          keyDraft={settings.keyDraft}
+          onKeyDraftChange={settings.setKeyDraft}
+          onClose={settings.close}
+          onSelectProvider={settings.selectProvider}
+          onSelectModel={settings.selectModel}
+          onSaveKey={settings.saveKey}
+          onClearKey={settings.clearKey}
+        />
+      ) : chatOpen ? (
+        <ChatPanel
+          initialText={chatDraft}
+          onClose={() => setChatOpen(false)}
         />
       ) : (
         <IslandContent
@@ -187,6 +222,10 @@ function Island() {
           mediaStream={mediaStream}
           onMouseDown={startDrag}
           onClose={reset}
+          onOpenChat={(initialText) => {
+            setChatDraft(initialText);
+            setChatOpen(true);
+          }}
         />
       )}
     </DynamicIsland>

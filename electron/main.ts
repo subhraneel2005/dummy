@@ -2,26 +2,24 @@ import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, screen } from "
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import {
-  getSelectedModel,
-  listModels,
-  onOpenCodeStatus,
-  polishTranscript,
-  setSelectedModel,
-  stopOpenCode,
-} from "./opencode.js"
+import { getChatHistory, onChatEvent, resetChat, sendChatMessage } from "./ai/chat.js"
+import { listProviderModels } from "./ai/catalog.js"
+import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
+import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
+import { polishTranscript } from "./ai/polish.js"
+import { closeDb, initDb, migrateDb } from "./db/index.js"
 import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
 let pendingPttDown = false
-let pendingModelPicker = false
+let pendingSettings = false
 let dragOffset: { dx: number; dy: number } | null = null
 let isRecording = false
 
 const PTT_KEY = "Alt+D"
-const MODEL_PICKER_KEY = "Alt+M"
+const SETTINGS_KEY = "Alt+M"
 
 const PAD = 12
 const ISLAND_WIDTH = 280
@@ -128,30 +126,73 @@ function registerIpcHandlers() {
         mainWindow.webContents.send("global-shortcut:down")
       }
     }
-    if (pendingModelPicker) {
-      pendingModelPicker = false
+    if (pendingSettings) {
+      pendingSettings = false
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show()
         mainWindow.focus()
-        mainWindow.webContents.send("opencode:open-picker")
+        mainWindow.webContents.send("ai:open-settings")
       }
     }
   })
 
-  ipcMain.handle("opencode:models", () => listModels())
-  ipcMain.handle("opencode:get-model", () => ({
-    ok: true as const,
-    model: getSelectedModel(),
-  }))
-  ipcMain.handle("opencode:set-model", (_event, model) => {
-    setSelectedModel(model)
-    return { ok: true as const, model }
+  ipcMain.handle("chat:send", (_event, text: string) => sendChatMessage(text))
+  ipcMain.handle("chat:history", () => getChatHistory())
+  ipcMain.handle("chat:reset", () => resetChat())
+
+  // Stream the assistant reply to the island in real time.
+  onChatEvent((event) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("chat:event", event)
+    }
   })
 
-  onOpenCodeStatus((status) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("opencode:status", status)
+  ipcMain.handle("ai:get-config", () => getConfig().then((config) => ({ ok: true as const, config })))
+  ipcMain.handle("ai:catalog", () => ({
+    ok: true as const,
+    providers: PROVIDER_INFO,
+    models: MODEL_CATALOG,
+  }))
+
+  // The setters in `ai/config.ts` return void, so the post-mutation config has
+  // to be re-read here. Returning their resolution value directly would ship
+  // `{ ok: true, config: undefined }` to the renderer, which the preload cast
+  // hides from the type checker.
+  const mutateConfig = async (run: () => Promise<void>) => {
+    try {
+      await run()
+      return { ok: true as const, config: await getConfig() }
+    } catch (err) {
+      return { ok: false as const, error: err instanceof Error ? err.message : String(err) }
     }
+  }
+
+  ipcMain.handle("ai:set-provider", (_event, provider: string) => {
+    if (!isProviderId(provider)) {
+      return Promise.resolve({ ok: false as const, error: `Unknown provider: ${provider}` })
+    }
+    return mutateConfig(() => setProvider(provider))
+  })
+  ipcMain.handle("ai:set-model", (_event, model: string) => {
+    return mutateConfig(() => setModel(model))
+  })
+  ipcMain.handle("ai:set-key", (_event, provider: string, key: string) => {
+    if (!isProviderId(provider)) {
+      return Promise.resolve({ ok: false as const, error: `Unknown provider: ${provider}` })
+    }
+    return mutateConfig(() => setApiKey(provider, key))
+  })
+  ipcMain.handle("ai:clear-key", (_event, provider: string) => {
+    if (!isProviderId(provider)) {
+      return Promise.resolve({ ok: false as const, error: `Unknown provider: ${provider}` })
+    }
+    return mutateConfig(() => clearApiKey(provider))
+  })
+  ipcMain.handle("ai:list-models", (_event, provider: string) => {
+    if (!isProviderId(provider)) {
+      return Promise.resolve({ ok: false as const, error: `Unknown provider: ${provider}` })
+    }
+    return listProviderModels(provider)
   })
 
   ipcMain.on("dictation:audio", async (event, wav: ArrayBuffer) => {
@@ -204,24 +245,26 @@ function registerGlobalShortcut() {
     console.warn(`Failed to register global shortcut: ${PTT_KEY}`)
   }
 
-  const okPicker = globalShortcut.register(MODEL_PICKER_KEY, () => {
+  const okSettings = globalShortcut.register(SETTINGS_KEY, () => {
     if (mainWindow && mainWindow.isDestroyed()) {
-      pendingModelPicker = true
+      pendingSettings = true
       createWindow()
       return
     }
     if (mainWindow) {
       mainWindow.show()
       mainWindow.focus()
-      mainWindow.webContents.send("opencode:open-picker")
+      mainWindow.webContents.send("ai:open-settings")
     }
   })
-  if (!okPicker) {
-    console.warn(`Failed to register global shortcut: ${MODEL_PICKER_KEY}`)
+  if (!okSettings) {
+    console.warn(`Failed to register global shortcut: ${SETTINGS_KEY}`)
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  initDb()
+  await migrateDb()
   registerIpcHandlers()
   createWindow()
   registerGlobalShortcut()
@@ -233,7 +276,7 @@ app.whenReady().then(() => {
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll()
-  stopOpenCode()
+  closeDb()
 })
 
 app.on("window-all-closed", () => {

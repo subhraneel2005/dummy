@@ -6,21 +6,46 @@ interface DictationStatus {
   message?: string
 }
 
-interface OpenCodeModel {
-  providerID: string
-  providerName: string
-  modelID: string
-  name: string
-  vision: boolean
+interface AiConfig {
+  provider: string | null
+  model: string | null
+  hasKey: boolean
+  encryptionAvailable: boolean
 }
 
-type OpenCodeStatus =
-  | { state: "connecting" }
-  | { state: "ready"; version: string }
-  | { state: "error"; message: string }
+interface ModelInfo {
+  id: string
+  label: string
+}
 
-type OpenCodeResult =
-  | { ok: true; models: OpenCodeModel[] }
+interface ProviderInfo {
+  id: string
+  label: string
+  keyPlaceholder: string
+  docsUrl: string
+}
+
+type AiConfigResult = { ok: true; config: AiConfig } | { ok: false; error: string }
+type AiCatalogResult = {
+  ok: true
+  providers: Record<string, ProviderInfo>
+  models: Record<string, ModelInfo[]>
+}
+type AiModelsResult = { ok: true; models: ModelInfo[] } | { ok: false; error: string; models?: ModelInfo[] }
+
+interface ChatMessage {
+  role: "user" | "assistant"
+  text: string
+}
+
+type ChatEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string }
+
+type ChatSendResult = { ok: true } | { ok: false; error: string }
+type ChatHistoryResult =
+  | { ok: true; messages: ChatMessage[] }
   | { ok: false; error: string }
 
 const electronAPI = {
@@ -55,32 +80,38 @@ const electronAPI = {
       ipcRenderer.removeListener("global-shortcut:up", onUp)
     }
   },
-  opencode: {
-    onOpenPicker: (callback: () => void) => {
-      const handler = () => callback()
-      ipcRenderer.on("opencode:open-picker", handler)
-      return () => ipcRenderer.removeListener("opencode:open-picker", handler)
+    ai: {
+      onOpenSettings: (callback: () => void) => {
+        const handler = () => callback()
+        ipcRenderer.on("ai:open-settings", handler)
+        return () => ipcRenderer.removeListener("ai:open-settings", handler)
+      },
+      getConfig: () => ipcRenderer.invoke("ai:get-config") as Promise<AiConfigResult>,
+      getCatalog: () => ipcRenderer.invoke("ai:catalog") as Promise<AiCatalogResult>,
+      listModels: (provider: string) =>
+        ipcRenderer.invoke("ai:list-models", provider) as Promise<AiModelsResult>,
+      setProvider: (provider: string) =>
+        ipcRenderer.invoke("ai:set-provider", provider) as Promise<AiConfigResult>,
+      setModel: (model: string) => ipcRenderer.invoke("ai:set-model", model) as Promise<AiConfigResult>,
+      setKey: (provider: string, key: string) =>
+        ipcRenderer.invoke("ai:set-key", provider, key) as Promise<AiConfigResult>,
+      clearKey: (provider: string) =>
+        ipcRenderer.invoke("ai:clear-key", provider) as Promise<AiConfigResult>,
     },
-    onStatus: (callback: (status: OpenCodeStatus) => void) => {
-      const handler = (_event: unknown, status: OpenCodeStatus) => callback(status)
-      ipcRenderer.on("opencode:status", handler)
-      return () => ipcRenderer.removeListener("opencode:status", handler)
+    chat: {
+      send: (text: string) => ipcRenderer.invoke("chat:send", text) as Promise<ChatSendResult>,
+      history: () => ipcRenderer.invoke("chat:history") as Promise<ChatHistoryResult>,
+      reset: () => ipcRenderer.invoke("chat:reset") as Promise<ChatSendResult>,
+      onEvent: (callback: (event: ChatEvent) => void) => {
+        const handler = (_event: unknown, event: ChatEvent) => callback(event)
+        ipcRenderer.on("chat:event", handler)
+        return () => ipcRenderer.removeListener("chat:event", handler)
+      }
     },
-    listModels: () => ipcRenderer.invoke("opencode:models") as Promise<OpenCodeResult>,
-    getModel: () =>
-      ipcRenderer.invoke("opencode:get-model") as Promise<
-        { ok: true; model: OpenCodeModel | null } | { ok: false; error: string }
-      >,
-    setModel: (model: OpenCodeModel) =>
-      ipcRenderer.invoke("opencode:set-model", model) as Promise<{
-        ok: true
-        model: OpenCodeModel
-      }>
-  },
   ready: () => ipcRenderer.send("renderer:ready")
 }
 
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
 
 export type ElectronAPI = typeof electronAPI
-export type { DictationStatus, OpenCodeModel, OpenCodeResult, OpenCodeStatus }
+export type { AiCatalogResult, AiConfig, AiConfigResult, ChatEvent, ChatMessage, DictationStatus, ModelInfo, ProviderInfo }

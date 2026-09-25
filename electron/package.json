@@ -7,7 +7,8 @@
     "build": "tsc -b && tsc -p tsconfig.preload.json",
     "dev": "sh scripts/dev.sh",
     "dev:electron": "npm run build && electron .",
-    "setup:whisper": "sh scripts/setup-whisper.sh"
+    "setup:whisper": "sh scripts/setup-whisper.sh",
+    "db:generate": "drizzle-kit generate"
   },
   "keywords": [],
   "author": "",
@@ -16,10 +17,17 @@
   "devDependencies": {
     "@types/node": "^26.5.1",
     "dotenv": "^17.4.2",
+    "drizzle-kit": "^1.0.0-rc.4",
     "electron": "^44.3.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.18.32"
+    "@ai-sdk/anthropic": "^4.0.63",
+    "@ai-sdk/google": "^4.0.80",
+    "@ai-sdk/openai": "^4.0.75",
+    "@ai-sdk/xai": "^5.0.8",
+    "@libsql/client": "^0.18.0",
+    "ai": "^7.0.114",
+    "drizzle-orm": "^1.0.0-rc.4"
   }
 }
