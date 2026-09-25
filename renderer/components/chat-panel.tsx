@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import { ArrowUp, Eraser, X } from "lucide-react"
 
@@ -15,13 +15,25 @@ export function ChatPanel({
   initialText = "",
   onClose,
 }: {
-  hidden?: boolean
-  initialText?: string
-  onClose?: () => void
+  hidden?: boolean;
+  initialText?: string;
+  onClose?: () => void;
 }) {
   const { messages, streamingText, streaming, error, send, reset } = useChat();
   const [draft, setDraft] = useState(initialText);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+
+  // "Send to chat" hands the transcript over as `initialText`; submit it right
+  // away so the user doesn't have to press send a second time. The ref guards
+  // against re-running, since `send` changes identity whenever `sending` flips.
+  const autoSentRef = useRef(false);
+  useEffect(() => {
+    const text = initialText.trim();
+    if (!text || autoSentRef.current) return;
+    autoSentRef.current = true;
+    setDraft("");
+    void send(text);
+  }, [initialText, send]);
 
   const submit = () => {
     const text = draft.trim()

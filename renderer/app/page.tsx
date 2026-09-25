@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CircleCheck, CircleAlert, ClipboardCheck, Mic, Send, X } from "lucide-react";
+import { Send } from "lucide-react";
 
 import { AudioBars } from "@/components/audio-bars-demo";
 import {
@@ -17,34 +17,12 @@ import { useAiSettings } from "@/hooks/use-ai-settings";
 import { SettingsPanel } from "@/components/settings-panel";
 import { ChatPanel } from "@/components/chat-panel";
 
-const HINT: Partial<Record<DictationState, string>> = {
-  listening: "Release to transcribe…",
-  transcribing: "Transcribing…",
-  polishing: "Polishing technical terms…",
-  done: "Copied to clipboard",
-};
-
-function CloseButton({ onClose }: { onClose: () => void }) {
-  return (
-    <Button
-      variant={"outline"}
-      size={"icon-xs"}
-      onClick={onClose}
-      className="app-region-no-drag"
-      aria-label="Dismiss"
-    >
-      <X className="size-3" />
-    </Button>
-  );
-}
-
 function IslandContent({
   state,
   transcript,
   message,
   mediaStream,
   onMouseDown,
-  onClose,
   onOpenChat,
 }: {
   state: DictationState;
@@ -52,58 +30,35 @@ function IslandContent({
   message: string;
   mediaStream: MediaStream | null;
   onMouseDown: (e: React.MouseEvent) => void;
-  onClose: () => void;
   onOpenChat: (initialText: string) => void;
 }) {
   if (state === "idle") return null;
 
   return (
-    <DynamicContainer className="flex h-full w-full flex-col bg-background px-4 py-2 backdrop-blur-md">
+    <DynamicContainer className="flex h-full w-full flex-col bg-background px-2 py-2 backdrop-blur-md">
       <div
-        className="flex h-full min-w-0 flex-1 cursor-grab items-center justify-center gap-2 active:cursor-grabbing"
+        className="flex h-full min-w-0 flex-1 cursor-grab items-center justify-center active:cursor-grabbing"
         onMouseDown={onMouseDown}
       >
         {state === "listening" && <AudioBars active mediaStream={mediaStream} />}
         {state === "transcribing" && <AudioBars active state="thinking" />}
         {state === "polishing" && <AudioBars active state="thinking" />}
         {state === "done" && (
-          <div className="flex w-full flex-col items-center gap-1.5">
-            <span className="flex max-w-full items-center gap-1.5 text-center text-xs leading-snug text-primary">
-              <CircleCheck className="size-3.5 shrink-0 text-green-600" />
-              <span className="line-clamp-2">{transcript}</span>
-            </span>
-            <div className="flex items-center gap-1">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => onOpenChat(transcript)}
-                className="h-6 rounded-full px-2.5 text-[10px]"
-              >
-                <Send className="size-3" />
-                Send to chat
-              </Button>
-            </div>
-          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onOpenChat(transcript)}
+            className="h-6 shrink-0 rounded-full px-2 text-[10px]"
+          >
+            <Send className="size-2.5" />
+            Send to chat
+          </Button>
         )}
-        {state === "error" && (
-          <span className="flex min-w-0 items-center gap-1.5 text-center text-xs text-destructive">
-            <CircleAlert className="size-3.5 shrink-0" />
-            <span className="line-clamp-2">{message}</span>
+        {state === "error" ? (
+          <span className="line-clamp-2 px-1 text-center text-[11px] leading-snug text-destructive">
+            {message}
           </span>
-        )}
-      </div>
-      <div className="flex shrink-0 items-center justify-center gap-1.5">
-        {state === "done" ? <ClipboardCheck className="size-3 text-muted-foreground" /> : null}
-        {state === "listening" ||
-        state === "transcribing" ||
-        state === "polishing" ? (
-          <Mic className="size-3 text-muted-foreground" />
         ) : null}
-        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          {HINT[state]}
-        </span>
-        <span className="mx-0.5" />
-        <CloseButton onClose={onClose} />
       </div>
     </DynamicContainer>
   );
@@ -111,7 +66,7 @@ function IslandContent({
 
 function Island() {
   const { setSize } = useDynamicIslandSize();
-  const { state, text: transcript, message, mediaStream, reset } = useDictation();
+  const { state, text: transcript, message, mediaStream } = useDictation();
   const settings = useAiSettings();
 
   const [chatOpen, setChatOpen] = useState(false);
@@ -184,8 +139,13 @@ function Island() {
       setSize("settings" as SizePresets);
     } else if (chatOpen) {
       setSize("chat" as SizePresets);
+    } else if (state === "idle") {
+      setSize("empty" as SizePresets);
+    } else if (state === "error") {
+      // The tiny panel can't fit a readable failure message.
+      setSize("panelError" as SizePresets);
     } else {
-      setSize(state === "idle" ? ("empty" as SizePresets) : ("panel" as SizePresets));
+      setSize("panel" as SizePresets);
     }
   }, [setSize, state, settingsOpen, chatOpen]);
 
@@ -221,7 +181,6 @@ function Island() {
           message={message}
           mediaStream={mediaStream}
           onMouseDown={startDrag}
-          onClose={reset}
           onOpenChat={(initialText) => {
             setChatDraft(initialText);
             setChatOpen(true);

@@ -12,7 +12,8 @@ export interface DictationStatus {
 }
 
 const MAX_RECORD_MS = 60_000;
-const DONE_HIDE_MS = 2600;
+// Long enough to read the result and click "Send to chat" before it vanishes.
+const DONE_HIDE_MS = 5000;
 const ERROR_HIDE_MS = 3200;
 
 export function useDictation() {
@@ -195,12 +196,14 @@ export function useDictation() {
     return () => unsub?.();
   }, []);
 
-  // Only the error state auto-hides back to idle. The done state stays put so
-  // the user can read the result and act on it (Send to chat / Open chat);
-  // it is dismissed manually via the island close button.
+  // Both terminal states auto-hide back to idle. The island no longer has a
+  // close button, so without this the done/error island would stay on screen
+  // forever with no way to dismiss it.
   useEffect(() => {
     clearHideTimer();
-    if (state === "error") {
+    if (state === "done") {
+      hideTimerRef.current = window.setTimeout(resetToIdle, DONE_HIDE_MS);
+    } else if (state === "error") {
       hideTimerRef.current = window.setTimeout(resetToIdle, ERROR_HIDE_MS);
     }
     return clearHideTimer;

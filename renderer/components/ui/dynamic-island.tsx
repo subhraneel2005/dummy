@@ -27,6 +27,7 @@ type SizePresets =
   | "massive"
   | "chat"
   | "panel"
+  | "panelError"
   | "minimalLeading"
   | "minimalTrailing"
   | "settings"
@@ -49,8 +50,9 @@ const PRESETS: Record<SizePresets, Preset> = {
   tall:             { width: 200, height: 160 },
   ultra:            { width: 320, height: 200 },
   massive:          { width: 380, height: 280 },
-  chat:             { width: 560, height: 720 },
-  panel:            { width: 280, height: 84 },
+  chat:             { width: 640, height: 800 },
+  panel:            { width: 180, height: 64 },
+  panelError:       { width: 300, height: 80 },
   minimalLeading:   { width: 48,  height: 48 },
   minimalTrailing:  { width: 48,  height: 48 },
   settings:         { width: 360, height: 330 },
