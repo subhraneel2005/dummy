@@ -13,6 +13,16 @@ export const providerKeys = sqliteTable("provider_keys", {
 
 export type ChatRole = "user" | "assistant"
 
+// A chat session is the unit the sidebar lists. `chat_messages.sessionId`
+// already points at one of these; it stays a plain text column so existing rows
+// keep working without a backfill.
+export const chatSessions = sqliteTable("chat_sessions", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+})
+
 export const chatMessages = sqliteTable(
   "chat_messages",
   {
@@ -25,4 +35,4 @@ export const chatMessages = sqliteTable(
   (table) => [index("chat_messages_session_idx").on(table.sessionId)],
 )
 
-export const schema = { settings, providerKeys, chatMessages }
+export const schema = { settings, providerKeys, chatSessions, chatMessages }

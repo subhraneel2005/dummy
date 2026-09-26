@@ -545,26 +545,21 @@ const BarVisualizerComponent = forwardRef<HTMLDivElement, BarVisualizerProps>(
 )
 
 // Memoized Bar component to prevent unnecessary re-renders
-const BAR_COLORS = [
-  "bg-chart-1",
-  "bg-chart-2",
-  "bg-chart-3",
-  "bg-chart-4",
-  "bg-chart-5",
-] as const
-
+// Single shadcn `primary` fill for every bar. The depth cue comes from opacity
+// (highlighted vs. resting) rather than a per-index palette, which previously
+// cycled the five `--chart-*` tokens and read as a rainbow waveform.
 const Bar = memo<{
   index: number
   heightPct: number
   isHighlighted: boolean
   state?: AgentState
-}>(({ index, heightPct, isHighlighted, state }) => (
+}>(({ heightPct, isHighlighted, state }) => (
   <div
     data-highlighted={isHighlighted}
     className={cn(
       "max-w-[12px] min-w-[8px] flex-1 transition-all duration-150",
       "rounded-full",
-      BAR_COLORS[index % BAR_COLORS.length],
+      "bg-primary",
       isHighlighted ? "opacity-100" : "opacity-60",
       state === "thinking" && isHighlighted && "animate-pulse"
     )}

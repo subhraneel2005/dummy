@@ -39,21 +39,31 @@ interface ChatMessage {
 }
 
 type ChatEvent =
-  | { type: "delta"; text: string }
-  | { type: "done" }
-  | { type: "error"; message: string }
+  | { type: "delta"; sessionId: string; text: string }
+  | { type: "done"; sessionId: string }
+  | { type: "error"; sessionId: string; message: string }
+  | { type: "load-error"; message: string }
+
+type ChatSession = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+}
 
 type ChatSendResult = { ok: true } | { ok: false; error: string }
 type ChatHistoryResult =
   | { ok: true; messages: ChatMessage[] }
   | { ok: false; error: string }
+type ChatSessionsResult = { ok: true; sessions: ChatSession[] } | { ok: false; error: string }
+type ChatSessionResult = { ok: true; session: ChatSession } | { ok: false; error: string }
 
 const electronAPI = {
   platform: process.platform,
+  // The island and the chat window load the same bundle; the route tells the
+  // renderer which chrome to render.
+  windowRole: location.pathname.startsWith("/chat") ? ("chat" as const) : ("island" as const),
   window: {
-    close: () => ipcRenderer.send("window:close"),
-    minimize: () => ipcRenderer.send("window:minimize"),
-    toggleMaximize: () => ipcRenderer.send("window:toggle-maximize"),
     startDrag: () => ipcRenderer.invoke("window:start-drag"),
     moveDrag: () => ipcRenderer.send("window:drag-move"),
     endDrag: () => ipcRenderer.send("window:drag-end"),
@@ -81,11 +91,6 @@ const electronAPI = {
     }
   },
     ai: {
-      onOpenSettings: (callback: () => void) => {
-        const handler = () => callback()
-        ipcRenderer.on("ai:open-settings", handler)
-        return () => ipcRenderer.removeListener("ai:open-settings", handler)
-      },
       getConfig: () => ipcRenderer.invoke("ai:get-config") as Promise<AiConfigResult>,
       getCatalog: () => ipcRenderer.invoke("ai:catalog") as Promise<AiCatalogResult>,
       listModels: (provider: string) =>
@@ -99,9 +104,28 @@ const electronAPI = {
         ipcRenderer.invoke("ai:clear-key", provider) as Promise<AiConfigResult>,
     },
     chat: {
-      send: (text: string) => ipcRenderer.invoke("chat:send", text) as Promise<ChatSendResult>,
-      history: () => ipcRenderer.invoke("chat:history") as Promise<ChatHistoryResult>,
-      reset: () => ipcRenderer.invoke("chat:reset") as Promise<ChatSendResult>,
+      send: (text: string, sessionId: string) =>
+        ipcRenderer.invoke("chat:send", text, sessionId) as Promise<ChatSendResult>,
+      history: (sessionId: string) =>
+        ipcRenderer.invoke("chat:history", sessionId) as Promise<ChatHistoryResult>,
+      reset: (sessionId: string) =>
+        ipcRenderer.invoke("chat:reset", sessionId) as Promise<ChatSendResult>,
+      listSessions: () =>
+        ipcRenderer.invoke("chat:list-sessions") as Promise<ChatSessionsResult>,
+      ensureSession: (sessionId: string) =>
+        ipcRenderer.invoke("chat:ensure-session", sessionId) as Promise<ChatSessionResult>,
+      renameSession: (sessionId: string, title: string) =>
+        ipcRenderer.invoke("chat:rename-session", sessionId, title) as Promise<ChatSessionResult>,
+      deleteSession: (sessionId: string) =>
+        ipcRenderer.invoke("chat:delete-session", sessionId) as Promise<ChatSendResult>,
+      open: (text: string) => ipcRenderer.send("chat:open", text),
+      takeInitialText: () => ipcRenderer.invoke("chat:take-initial-text") as Promise<string | null>,
+      ackInitialText: () => ipcRenderer.invoke("chat:ack-initial-text") as Promise<boolean>,
+      onInitialText: (callback: (text: string) => void) => {
+        const handler = (_event: unknown, text: string) => callback(text)
+        ipcRenderer.on("chat:initial-text", handler)
+        return () => ipcRenderer.removeListener("chat:initial-text", handler)
+      },
       onEvent: (callback: (event: ChatEvent) => void) => {
         const handler = (_event: unknown, event: ChatEvent) => callback(event)
         ipcRenderer.on("chat:event", handler)
@@ -114,4 +138,4 @@ const electronAPI = {
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
 
 export type ElectronAPI = typeof electronAPI
-export type { AiCatalogResult, AiConfig, AiConfigResult, ChatEvent, ChatMessage, DictationStatus, ModelInfo, ProviderInfo }
+export type { AiCatalogResult, AiConfig, AiConfigResult, ChatEvent, ChatMessage, ChatSession, DictationStatus, ModelInfo, ProviderInfo }

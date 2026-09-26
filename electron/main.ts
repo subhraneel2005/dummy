@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, screen } from "electron"
+import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, nativeTheme, screen } from "electron"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -7,23 +7,59 @@ import { listProviderModels } from "./ai/catalog.js"
 import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
 import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
 import { polishTranscript } from "./ai/polish.js"
+import {
+  deleteSession,
+  ensureSession,
+  listSessions,
+  renameSession,
+} from "./ai/sessions.js"
 import { closeDb, initDb, migrateDb } from "./db/index.js"
 import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let mainWindow: BrowserWindow | null = null
+let chatWindow: BrowserWindow | null = null
+let pendingChatText: string | null = null
 let pendingPttDown = false
-let pendingSettings = false
 let dragOffset: { dx: number; dy: number } | null = null
 let isRecording = false
 
 const PTT_KEY = "Alt+D"
-const SETTINGS_KEY = "Alt+M"
 
 const PAD = 12
 const ISLAND_WIDTH = 280
 const ISLAND_HEIGHT = 84
+const CHAT_MIN_WIDTH = 1000
+const CHAT_MIN_HEIGHT = 640
+// Gap left around the chat window, in DIPs, when it is sized to the display.
+// Kept small so the default really does fill the screen, while still leaving a
+// visible edge to grab and resize from.
+const CHAT_SCREEN_MARGIN = 8
+// Upper bounds so an ultrawide or 5K display does not open a window that is
+// hard to work with; the window stays freely resizable past this.
+const CHAT_MAX_WIDTH = 1800
+const CHAT_MAX_HEIGHT = 1200
+
+/**
+ * Sizes the chat window to the display it will open on instead of a fixed pixel
+ * size. A hardcoded 1280x860 silently clamps on a 1440x807 display (the height
+ * overflows the work area), which is what made the old default feel arbitrary.
+ */
+function chatWindowSize(): { width: number; height: number } {
+  const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workAreaSize
+  return {
+    width: Math.min(CHAT_MAX_WIDTH, Math.max(CHAT_MIN_WIDTH, area.width - CHAT_SCREEN_MARGIN * 2)),
+    height: Math.min(CHAT_MAX_HEIGHT, Math.max(CHAT_MIN_HEIGHT, area.height - CHAT_SCREEN_MARGIN * 2)),
+  }
+}
+
+// Window controls are per-window, so resolve the target from the sender rather
+// than assuming the island. Otherwise the chat window's minimize button would
+// minimize the island instead.
+function windowFor(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) {
+  return BrowserWindow.fromWebContents(event.sender)
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow ({
@@ -67,16 +103,122 @@ function createWindow() {
   mainWindow.setPosition(Math.round((displayWidth - (ISLAND_WIDTH + PAD * 2)) / 2), 40)
 }
 
-function registerIpcHandlers() {
-  ipcMain.on("window:close", () => mainWindow?.close())
-  ipcMain.on("window:minimize", () => mainWindow?.minimize())
-  ipcMain.on("window:toggle-maximize", () => {
-    if (!mainWindow) return
-    if (mainWindow.isMaximized()) mainWindow.unmaximize()
-    else mainWindow.maximize()
+const IS_MAC = process.platform === "darwin"
+
+/** Matches the app's `--background` so the title bar blends into the content. */
+function chatBackgroundColor() {
+  return nativeTheme.shouldUseDarkColors ? "#09090b" : "#ffffff"
+}
+
+function createChatWindow() {
+  const size = chatWindowSize()
+
+  chatWindow = new BrowserWindow({
+    width: size.width,
+    height: size.height,
+    minWidth: CHAT_MIN_WIDTH,
+    minHeight: CHAT_MIN_HEIGHT,
+
+    // Native window controls with a transparent title bar: the traffic lights
+    // stay the real macOS ones, but the strip behind them has no fill of its
+    // own, so the app's own background runs through it. Windows/Linux keep the
+    // standard opaque system title bar. The window is never frameless, so the
+    // controls remain genuinely native rather than drawn by the app.
+    ...(IS_MAC
+      ? {
+          titleBarStyle: "hiddenInset" as const,
+          trafficLightPosition: { x: 14, y: 18 },
+        }
+      : {}),
+    transparent: false,
+    backgroundColor: chatBackgroundColor(),
+    show: false,
+    resizable: true,
+    maximizable: true,
+    fullscreenable: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      sandbox: true
+    }
   })
-  ipcMain.handle("window:start-drag", () => {
-    if (!mainWindow) return
+
+  // With `defaultTheme="system"` the app follows the OS, so the colour behind
+  // the page has to follow it too or a live switch shows a stale letterbox.
+  const syncBackground = () => {
+    if (chatWindow && !chatWindow.isDestroyed()) {
+      chatWindow.setBackgroundColor(chatBackgroundColor())
+    }
+  }
+  nativeTheme.on("updated", syncBackground)
+  chatWindow.on("closed", () => {
+    nativeTheme.off("updated", syncBackground)
+  })
+
+  chatWindow.on("closed", () => {
+    chatWindow = null
+    pendingChatText = null
+  })
+
+  // Created hidden so the first paint isn't a white flash. `ready-to-show` can
+  // be missed entirely if the dev server never finishes painting, so a timer
+  // guarantees the window surfaces instead of staying invisible.
+  const reveal = () => {
+    if (!chatWindow || chatWindow.isDestroyed()) return
+    chatWindow.show()
+    chatWindow.focus()
+  }
+  const revealFallback = setTimeout(reveal, 2500)
+  chatWindow.once("ready-to-show", () => {
+    clearTimeout(revealFallback)
+    reveal()
+  })
+
+  // If the renderer can't be reached (dev server down) the window would sit
+  // there as a blank white rectangle with no explanation. Surface it and bail.
+  chatWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    if (errorCode === -3) return // aborted, usually a redirect or supersede
+    console.error(`[chat] failed to load ${validatedURL}: ${errorDescription} (${errorCode})`)
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send(
+          "chat:event",
+          { type: "load-error", message: "Chat window could not load. Is the renderer dev server running on :3000?" }
+        )
+      }
+    }
+    if (chatWindow && !chatWindow.isDestroyed()) chatWindow.destroy()
+    chatWindow = null
+  })
+
+  chatWindow.loadURL("http://localhost:3000/chat")
+
+  const { workArea } = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  chatWindow.setPosition(
+    Math.round(workArea.x + (workArea.width - size.width) / 2),
+    Math.round(workArea.y + (workArea.height - size.height) / 2)
+  )
+}
+
+function openChatWindow(text: string) {
+  if (!chatWindow || chatWindow.isDestroyed()) {
+    pendingChatText = text || null
+    createChatWindow()
+    return
+  }
+  chatWindow.show()
+  chatWindow.focus()
+  // The renderer is already mounted, so hand the text over as an event rather
+  // than waiting for a fresh mount to pull it.
+  if (text) chatWindow.webContents.send("chat:initial-text", text)
+}
+
+function registerIpcHandlers() {
+  // Window minimize/maximize/close are the OS's own controls now, so the chat
+  // window needs no window-management IPC. The drag handlers below are for the
+  // island only, which drags from JS.
+  ipcMain.handle("window:start-drag", (event) => {
+    if (windowFor(event) !== mainWindow || !mainWindow) return
     const [x = 0, y = 0] = mainWindow.getPosition()
     const cursor = screen.getCursorScreenPoint()
     dragOffset = { dx: cursor.x - x, dy: cursor.y - y }
@@ -89,12 +231,12 @@ function registerIpcHandlers() {
   ipcMain.on("window:drag-end", () => {
     dragOffset = null
   })
-  ipcMain.on("window:set-ignore-mouse-events", (_event, ignore: boolean) => {
-    if (!mainWindow) return
+  ipcMain.on("window:set-ignore-mouse-events", (event, ignore: boolean) => {
+    if (windowFor(event) !== mainWindow || !mainWindow) return
     mainWindow.setIgnoreMouseEvents(ignore, { forward: true })
   })
-  ipcMain.on("window:set-island-size", (_event, width: number, height: number) => {
-    if (!mainWindow) return
+  ipcMain.on("window:set-island-size", (event, width: number, height: number) => {
+    if (windowFor(event) !== mainWindow || !mainWindow) return
     const w = Math.max(1, Math.round(width)) + PAD * 2
     const h = Math.max(1, Math.round(height)) + PAD * 2
     const [x = 0, y = 0] = mainWindow.getPosition()
@@ -126,24 +268,53 @@ function registerIpcHandlers() {
         mainWindow.webContents.send("global-shortcut:down")
       }
     }
-    if (pendingSettings) {
-      pendingSettings = false
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.show()
-        mainWindow.focus()
-        mainWindow.webContents.send("ai:open-settings")
-      }
-    }
   })
 
-  ipcMain.handle("chat:send", (_event, text: string) => sendChatMessage(text))
-  ipcMain.handle("chat:history", () => getChatHistory())
-  ipcMain.handle("chat:reset", () => resetChat())
+  // Session ids are minted by the renderer, so validate before they reach SQL.
+  const validSessionId = (value: unknown): value is string =>
+    typeof value === "string" && value.length > 0 && value.length <= 64
+  const badSession = { ok: false as const, error: "Invalid chat session id." }
 
-  // Stream the assistant reply to the island in real time.
+  ipcMain.handle("chat:send", (_event, text: string, sessionId: unknown) =>
+    validSessionId(sessionId) ? sendChatMessage(text, sessionId) : badSession,
+  )
+  ipcMain.handle("chat:history", (_event, sessionId: unknown) =>
+    validSessionId(sessionId) ? getChatHistory(sessionId) : badSession,
+  )
+  ipcMain.handle("chat:reset", (_event, sessionId: unknown) =>
+    validSessionId(sessionId) ? resetChat(sessionId) : badSession,
+  )
+
+  ipcMain.handle("chat:list-sessions", () => listSessions())
+  ipcMain.handle("chat:ensure-session", (_event, sessionId: unknown) =>
+    validSessionId(sessionId) ? ensureSession(sessionId) : badSession,
+  )
+  ipcMain.handle("chat:rename-session", (_event, sessionId: unknown, title: unknown) => {
+    if (!validSessionId(sessionId) || typeof title !== "string") return badSession
+    return renameSession(sessionId, title)
+  })
+  ipcMain.handle("chat:delete-session", (_event, sessionId: unknown) =>
+    validSessionId(sessionId) ? deleteSession(sessionId) : badSession,
+  )
+  ipcMain.on("chat:open", (_event, text: string) => openChatWindow(text))
+  // Pulled by the chat renderer on mount. The text is NOT cleared on read: the
+  // renderer may unmount/remount (HMR, reload) between the invoke and the state
+  // update, and clearing here destroyed the transcript with nothing to show for
+  // it. The renderer acks once it has actually taken ownership.
+  ipcMain.handle("chat:take-initial-text", (event) => {
+    if (windowFor(event) !== chatWindow) return null
+    return pendingChatText
+  })
+  ipcMain.handle("chat:ack-initial-text", (event) => {
+    if (windowFor(event) !== chatWindow) return false
+    pendingChatText = null
+    return true
+  })
+
+  // Stream the assistant reply to whichever window is showing the chat.
   onChatEvent((event) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("chat:event", event)
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send("chat:event", event)
     }
   })
 
@@ -243,22 +414,6 @@ function registerGlobalShortcut() {
   })
   if (!ok) {
     console.warn(`Failed to register global shortcut: ${PTT_KEY}`)
-  }
-
-  const okSettings = globalShortcut.register(SETTINGS_KEY, () => {
-    if (mainWindow && mainWindow.isDestroyed()) {
-      pendingSettings = true
-      createWindow()
-      return
-    }
-    if (mainWindow) {
-      mainWindow.show()
-      mainWindow.focus()
-      mainWindow.webContents.send("ai:open-settings")
-    }
-  })
-  if (!okSettings) {
-    console.warn(`Failed to register global shortcut: ${SETTINGS_KEY}`)
   }
 }
 

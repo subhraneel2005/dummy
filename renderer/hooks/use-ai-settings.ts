@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 export type SettingsPhase = "closed" | "loading" | "ready" | "saving" | "error";
 
@@ -195,13 +195,6 @@ export function useAiSettings() {
     apply(api.clearKey(config.provider));
   }, [apply, config.provider]);
 
-  useEffect(() => {
-    const unsub = window.electronAPI?.ai.onOpenSettings(() => load());
-    return () => {
-      unsub?.();
-    };
-  }, [load]);
-
   return {
     phase,
     config,
@@ -214,6 +207,7 @@ export function useAiSettings() {
     keyDraft,
     setKeyDraft,
     close,
+    load,
     selectProvider,
     selectModel,
     saveKey,

@@ -35,23 +35,35 @@ interface ChatMessage {
 }
 
 type ChatEvent =
-  | { type: "delta"; text: string }
-  | { type: "done" }
-  | { type: "error"; message: string }
+  | { type: "delta"; sessionId: string; text: string }
+  | { type: "done"; sessionId: string }
+  | { type: "error"; sessionId: string; message: string }
+  | { type: "load-error"; message: string }
+
+interface ChatSession {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+}
 
 type ChatSendResult = { ok: true } | { ok: false; error: string }
 type ChatHistoryResult =
   | { ok: true; messages: ChatMessage[] }
+  | { ok: false; error: string }
+type ChatSessionsResult =
+  | { ok: true; sessions: ChatSession[] }
+  | { ok: false; error: string }
+type ChatSessionResult =
+  | { ok: true; session: ChatSession }
   | { ok: false; error: string }
 
 declare global {
   interface Window {
     electronAPI?: {
       platform: string
+      windowRole: "island" | "chat"
       window: {
-        close: () => void
-        minimize: () => void
-        toggleMaximize: () => void
         startDrag: () => void
         moveDrag: () => void
         endDrag: () => void
@@ -67,7 +79,6 @@ declare global {
         }) => void) => () => void
       }
       ai: {
-        onOpenSettings: (callback: () => void) => () => void
         getConfig: () => Promise<AiConfigResult>
         getCatalog: () => Promise<AiCatalogResult>
         listModels: (provider: string) => Promise<AiModelsResult>
@@ -77,9 +88,17 @@ declare global {
         clearKey: (provider: string) => Promise<AiConfigResult>
       }
       chat: {
-        send: (text: string) => Promise<ChatSendResult>
-        history: () => Promise<ChatHistoryResult>
-        reset: () => Promise<ChatSendResult>
+        send: (text: string, sessionId: string) => Promise<ChatSendResult>
+        history: (sessionId: string) => Promise<ChatHistoryResult>
+        reset: (sessionId: string) => Promise<ChatSendResult>
+        listSessions: () => Promise<ChatSessionsResult>
+        ensureSession: (sessionId: string) => Promise<ChatSessionResult>
+        renameSession: (sessionId: string, title: string) => Promise<ChatSessionResult>
+        deleteSession: (sessionId: string) => Promise<ChatSendResult>
+        open: (text: string) => void
+        takeInitialText: () => Promise<string | null>
+        ackInitialText: () => Promise<boolean>
+        onInitialText: (callback: (text: string) => void) => () => void
         onEvent: (callback: (event: ChatEvent) => void) => () => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void

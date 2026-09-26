@@ -164,7 +164,7 @@ The renderer is `sandbox: true` + `contextIsolation: true` with no nodeIntegrati
 ```
 renderer (Next.js, sandboxed)              electron/main (Node, ESM)
 ----------------------------              -------------------------
-settings-panel.tsx (Alt+M)                 ai/provider.ts -> resolveModel()
+app/settings/page.tsx (sidebar route)      ai/provider.ts -> resolveModel()
   | ai:get-config      (invoke) --------->   settings table (provider, model)
   | ai:set-provider    (invoke) --------->   provider_keys table
   | ai:set-model       (invoke) --------->     + safeStorage.decryptString()
@@ -225,12 +225,12 @@ All four verified reachable (auth-gated 401/400, **not** 404) as of 2026-09-25.
 
 ### IPC Surface (replaces all `opencode:*`)
 - renderer -> main (invoke): `ai:get-config`, `ai:set-provider`, `ai:set-model`, `ai:set-key`, `ai:clear-key`.
-- main -> renderer: `ai:open-settings` event (Alt+M) — replaces `opencode:open-picker`.
+- **Removed:** the `ai:open-settings` event and its `Alt+M` shortcut — settings is a route (`/settings`) inside the chat window, opened from the sidebar.
 - **Removed:** `opencode:status`, `opencode:models`, `opencode:get-model`, `opencode:set-model`, `onOpenCodeStatus`, `stopOpenCode`.
 - `chat:*` channels keep their existing shapes so `use-chat.ts` / `chat-panel.tsx` barely change.
 
 ### User Flow (v1)
-1. **Alt+M** opens the island in settings mode.
+1. **AI Settings** in the chat sidebar opens the `/settings` page (same window).
 2. Provider row (OpenAI / Anthropic / Google / xAI) -> API key field (masked, write-only, shows "saved" state not the value) -> model row.
 3. Selection persisted to SQLite; key encrypted via safeStorage.
 4. Error states: no provider selected, no key set, encryption unavailable, invalid key.
@@ -266,7 +266,7 @@ All four verified reachable (auth-gated 401/400, **not** 404) as of 2026-09-25.
 ### Phase D — IPC + preload
 - [x] `ai:get-config` / `ai:catalog` / `ai:list-models` / `ai:set-provider` / `ai:set-model` / `ai:set-key` / `ai:clear-key` handlers
 - [x] All mutating handlers go through `mutateConfig()`, which re-reads `getConfig()` after the write (the setters return `void`, so resolving their value directly shipped `config: undefined` to the renderer)
-- [x] `ai:open-settings` event wired to Alt+M
+- [x] `ai:open-settings` event wired to Alt+M — later removed in favour of the `/settings` route
 - [x] Updated `electron/preload.ts` + `renderer/electron.d.ts`; all `opencode:*` types deleted
 - [x] `will-quit` closes the DB; `stopOpenCode()` dropped
 
@@ -281,7 +281,7 @@ All four verified reachable (auth-gated 401/400, **not** 404) as of 2026-09-25.
 - [x] Headless smoke: migration applied from the committed folder, settings persisted, safeStorage ciphertext on disk round-tripped, chat row persisted and cleared
 - [x] Headless smoke on the config path: `set-provider` / `set-model` return a defined config with a boolean `hasKey`; a live id outside the seed catalog is accepted; a missing key returns a clean error; a bad key falls back to the seed catalog
 - [x] All four list-models endpoints confirmed reachable (401/400 auth-gated, not 404)
-- [ ] Manual: Alt+M -> set provider -> enter key -> pick model -> persists across restart (needs a real provider key)
+- [ ] Manual: sidebar -> AI Settings -> set provider -> enter key -> pick model -> persists across restart (needs a real provider key)
 - [ ] Manual: confirm the key is ciphertext on disk and never appears in renderer memory/DevTools
 
 ---

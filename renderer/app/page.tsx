@@ -15,24 +15,25 @@ import { Button } from "@/components/ui/button";
 import { useDictation, type DictationState } from "@/hooks/use-dictation";
 import { useAiSettings } from "@/hooks/use-ai-settings";
 import { SettingsPanel } from "@/components/settings-panel";
-import { ChatPanel } from "@/components/chat-panel";
 
 function IslandContent({
   state,
-  transcript,
   message,
+  chatError,
   mediaStream,
+  onSend,
   onMouseDown,
-  onOpenChat,
 }: {
   state: DictationState;
-  transcript: string;
   message: string;
+  chatError: string;
   mediaStream: MediaStream | null;
+  onSend: () => void;
   onMouseDown: (e: React.MouseEvent) => void;
-  onOpenChat: (initialText: string) => void;
 }) {
-  if (state === "idle") return null;
+  if (state === "idle" && !chatError) return null;
+
+  const failure = chatError || message;
 
   return (
     <DynamicContainer className="flex h-full w-full flex-col bg-background px-2 py-2 backdrop-blur-md">
@@ -43,20 +44,20 @@ function IslandContent({
         {state === "listening" && <AudioBars active mediaStream={mediaStream} />}
         {state === "transcribing" && <AudioBars active state="thinking" />}
         {state === "polishing" && <AudioBars active state="thinking" />}
-        {state === "done" && (
+        {state === "done" && !chatError && (
           <Button
             variant="outline"
             size="sm"
-            onClick={() => onOpenChat(transcript)}
+            onClick={onSend}
             className="h-6 shrink-0 rounded-full px-2 text-[10px]"
           >
             <Send className="size-2.5" />
             Send to chat
           </Button>
         )}
-        {state === "error" ? (
+        {failure ? (
           <span className="line-clamp-2 px-1 text-center text-[11px] leading-snug text-destructive">
-            {message}
+            {failure}
           </span>
         ) : null}
       </div>
@@ -68,13 +69,30 @@ function Island() {
   const { setSize } = useDynamicIslandSize();
   const { state, text: transcript, message, mediaStream } = useDictation();
   const settings = useAiSettings();
+  const [chatError, setChatError] = useState("");
 
-  const [chatOpen, setChatOpen] = useState(false);
-  const [chatDraft, setChatDraft] = useState("");
   const settingsOpen = settings.phase !== "closed";
 
-  // ChatPanel lives inside the same island; opening it swaps the island size
-  // to the "chat" preset and renders the conversation in its place.
+  // A chat window that can't be created or can't load used to fail silently and
+  // leave a blank rectangle, so surface it in the island instead.
+  useEffect(() => {
+    const unsub = window.electronAPI?.chat.onEvent((event) => {
+      if (event.type !== "error") return;
+      setChatError(event.message || "Chat failed to open.");
+    });
+    return () => unsub?.();
+  }, []);
+
+  useEffect(() => {
+    if (!chatError) return;
+    const t = window.setTimeout(() => setChatError(""), 4000);
+    return () => window.clearTimeout(t);
+  }, [chatError]);
+
+  const sendToChat = useCallback(() => {
+    setChatError("");
+    window.electronAPI?.chat.open(transcript);
+  }, [transcript]);
 
   const startDrag = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;
@@ -137,17 +155,15 @@ function Island() {
   useEffect(() => {
     if (settingsOpen) {
       setSize("settings" as SizePresets);
-    } else if (chatOpen) {
-      setSize("chat" as SizePresets);
     } else if (state === "idle") {
       setSize("empty" as SizePresets);
-    } else if (state === "error") {
+    } else if (state === "error" || chatError) {
       // The tiny panel can't fit a readable failure message.
       setSize("panelError" as SizePresets);
     } else {
       setSize("panel" as SizePresets);
     }
-  }, [setSize, state, settingsOpen, chatOpen]);
+  }, [setSize, state, settingsOpen, chatError]);
 
   return (
     <DynamicIsland id="audio-bars-island" data-state={state}>
@@ -169,22 +185,14 @@ function Island() {
           onSaveKey={settings.saveKey}
           onClearKey={settings.clearKey}
         />
-      ) : chatOpen ? (
-        <ChatPanel
-          initialText={chatDraft}
-          onClose={() => setChatOpen(false)}
-        />
       ) : (
         <IslandContent
           state={state}
-          transcript={transcript}
           message={message}
+          chatError={chatError}
           mediaStream={mediaStream}
+          onSend={sendToChat}
           onMouseDown={startDrag}
-          onOpenChat={(initialText) => {
-            setChatDraft(initialText);
-            setChatOpen(true);
-          }}
         />
       )}
     </DynamicIsland>
