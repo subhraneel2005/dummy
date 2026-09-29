@@ -26,6 +26,7 @@ let dragOffset: { dx: number; dy: number } | null = null
 let isRecording = false
 
 const PTT_KEY = "Alt+D"
+const CHAT_KEY = "Alt+C"
 
 const PAD = 12
 const ISLAND_WIDTH = 280
@@ -367,34 +368,43 @@ function registerIpcHandlers() {
   })
 
   ipcMain.on("dictation:audio", async (event, wav: ArrayBuffer) => {
-    if (!mainWindow || mainWindow.isDestroyed()) return
+    // Reply to whichever window asked, so the island and the chat composer can
+    // both drive dictation off the same pipeline and get their own result.
+    const reply = event.sender
+    // Only the island's flow is paste-oriented: it has no text field to drop
+    // the transcript into, so it relies on the clipboard. The composer writes
+    // straight into its draft and must not clobber the user's clipboard.
+    const isIsland =
+      !!mainWindow &&
+      !mainWindow.isDestroyed() &&
+      event.sender === mainWindow.webContents
     isRecording = false
 
     const ready = whisperReady()
     if (!ready.ready) {
-      mainWindow.webContents.send("dictation:status", { state: "error", message: ready.reason })
+      reply.send("dictation:status", { state: "error", message: ready.reason })
       return
     }
 
     const buffer = Buffer.from(wav)
-    mainWindow.webContents.send("dictation:status", { state: "transcribing" })
+    reply.send("dictation:status", { state: "transcribing" })
 
     try {
       const text = await transcribeWav(buffer)
       if (!text) {
-        mainWindow.webContents.send("dictation:status", {
+        reply.send("dictation:status", {
           state: "error",
           message: "Nothing heard — try speaking closer or louder.",
         })
         return
       }
-      mainWindow.webContents.send("dictation:status", { state: "polishing" })
+      reply.send("dictation:status", { state: "polishing" })
       const polished = await polishTranscript(text)
-      clipboard.writeText(polished)
-      mainWindow.webContents.send("dictation:status", { state: "done", text: polished })
+      if (isIsland) clipboard.writeText(polished)
+      reply.send("dictation:status", { state: "done", text: polished })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      mainWindow.webContents.send("dictation:status", { state: "error", message })
+      reply.send("dictation:status", { state: "error", message })
     }
   })
 }
@@ -414,6 +424,22 @@ function registerGlobalShortcut() {
   })
   if (!ok) {
     console.warn(`Failed to register global shortcut: ${PTT_KEY}`)
+  }
+
+  // Show-or-create for the chat window, mirroring Alt+D: the shortcut works
+  // whether the window is already open (focus it), minimized/hidden (raise it),
+  // or has never been opened (create it).
+  const okChat = globalShortcut.register(CHAT_KEY, () => {
+    if (!chatWindow || chatWindow.isDestroyed()) {
+      createChatWindow()
+      return
+    }
+    if (chatWindow.isMinimized()) chatWindow.restore()
+    chatWindow.show()
+    chatWindow.focus()
+  })
+  if (!okChat) {
+    console.warn(`Failed to register global shortcut: ${CHAT_KEY}`)
   }
 }
 

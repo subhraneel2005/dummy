@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { CheckIcon, CopyIcon, PlusIcon } from "lucide-react"
+import { CheckIcon, CopyIcon, MicIcon, PlusIcon } from "lucide-react"
 
 import {
   Conversation,
@@ -34,9 +34,11 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input"
 import { AppSidebar, type ChatSession } from "@/components/app-sidebar"
+import AIVoice from "@/components/kokonutui/ai-voice"
 import { ProviderIcon, providerLabel } from "@/components/provider-icon"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { useChat, type ChatMessage } from "@/hooks/use-chat"
+import { useDictation } from "@/hooks/use-dictation"
 import { cn } from "@/lib/utils"
 
 /**
@@ -52,6 +54,21 @@ const MARKDOWN_SPACING = "[&>*]:!my-0 [&>*+*]:!mt-6"
 /** Shared measure for the transcript, the hero and the composer. */
 const CHAT_COLUMN = "mx-auto w-full max-w-3xl"
 
+// Filled bubbles rather than bare text. The prompt is the action, so it gets the
+// `primary` surface; the reply gets the quieter `secondary` one.
+//
+// The foreground is not symmetric, and that is deliberate. `text-primary-
+// foreground` is right on the prompt (6.3:1 light, 8.1:1 dark against
+// `--primary`), but it is unusable on the reply: light-mode `--secondary` is
+// oklch(0.967 …) and `--primary-foreground` is oklch(0.97 …), so the pairing
+// lands at 1.01:1 — white text on a near-white card. The reply therefore uses
+// `--secondary-foreground`, the token designed to sit on `--secondary`
+// (16.1:1 light, 14.3:1 dark).
+const USER_BUBBLE =
+  "group-[.is-user]:bg-primary group-[.is-user]:text-primary-foreground"
+const ASSISTANT_BUBBLE =
+  "group-[.is-assistant]:rounded-lg group-[.is-assistant]:bg-secondary group-[.is-assistant]:px-4 group-[.is-assistant]:py-3 group-[.is-assistant]:text-secondary-foreground"
+
 export default function ChatWindowPage() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<ChatSession[]>([])
@@ -63,6 +80,36 @@ export default function ChatWindowPage() {
     provider: null,
     model: null,
   })
+
+  // Same STT + polish pipeline the dictation island uses (whisper.cpp, then the
+  // technical-spelling pass), driven from a mic button instead of Alt+D. The
+  // polished transcript lands in the draft so it can be read before sending.
+  const {
+    state: voiceState,
+    text: voiceText,
+    message: voiceError,
+    start: startVoice,
+    stop: stopVoice,
+    reset: resetVoice,
+  } = useDictation()
+  const voiceBusy =
+    voiceState === "listening" ||
+    voiceState === "transcribing" ||
+    voiceState === "polishing"
+  const voiceListening = voiceState === "listening"
+
+  const toggleVoice = useCallback(() => {
+    if (voiceState === "listening") stopVoice()
+    else if (!voiceBusy) startVoice()
+  }, [startVoice, stopVoice, voiceBusy, voiceState])
+
+  // Land the transcript in the draft. `resetVoice` is stable, and it moves the
+  // state to "idle" straight after, so this cannot loop.
+  useEffect(() => {
+    if (voiceState !== "done" || !voiceText) return
+    setDraft((prev) => (prev.trim() ? `${prev.trimEnd()} ${voiceText}` : voiceText))
+    resetVoice()
+  }, [resetVoice, voiceState, voiceText])
 
   // The provider/model shown in the chrome comes from the same settings the
   // send path uses, so it can never drift from what actually answers.
@@ -261,7 +308,10 @@ export default function ChatWindowPage() {
 
               {streamingText ? (
                 <Message from="assistant" className="max-w-full">
-                  <MessageContent className="max-w-full" aria-live="polite">
+                  <MessageContent
+                    className={cn("max-w-full", ASSISTANT_BUBBLE)}
+                    aria-live="polite"
+                  >
                     <MessageResponse className={MARKDOWN_SPACING} isAnimating>
                       {streamingText}
                     </MessageResponse>
@@ -271,10 +321,8 @@ export default function ChatWindowPage() {
 
               {showThinking ? (
                 <Message from="assistant" className="max-w-full">
-                  <MessageContent className="max-w-full">
-                    <p className="text-sm text-muted-foreground motion-safe:animate-pulse">
-                      Thinking
-                    </p>
+                  <MessageContent className={cn("max-w-full", ASSISTANT_BUBBLE)}>
+                    <p className="text-sm motion-safe:animate-pulse">Thinking</p>
                   </MessageContent>
                 </Message>
               ) : null}
@@ -311,11 +359,16 @@ export default function ChatWindowPage() {
             onSubmit={submit}
             className="w-full shadow-none [&_[data-slot=input-group]]:gap-1 [&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border-border"
           >
-            <PromptAttachmentsHeader />
+            <ComposerHeader
+              voiceActive={voiceBusy}
+              voiceListening={voiceListening}
+              voiceError={voiceState === "error" ? voiceError : ""}
+              onStopVoice={stopVoice}
+            />
             <PromptInputTextarea
               value={draft}
               onChange={(e) => setDraft(e.currentTarget.value)}
-              placeholder="Send a message, or hold D to dictate…"
+              placeholder="Send a message, or tap the mic to dictate…"
               aria-label="Message"
               // `md:` is required: shadcn's Textarea ships `text-base md:text-sm`,
               // and the responsive variant survives twMerge as its own group.
@@ -328,6 +381,11 @@ export default function ChatWindowPage() {
             <PromptInputFooter className="px-1.5 pt-0 pb-1">
               <PromptInputTools>
                 <AddAttachmentsButton />
+                <VoiceButton
+                  listening={voiceListening}
+                  busy={voiceBusy}
+                  onToggle={toggleVoice}
+                />
               </PromptInputTools>
               <PromptInputSubmit
                 status={showThinking ? "submitted" : "ready"}
@@ -341,18 +399,84 @@ export default function ChatWindowPage() {
   )
 }
 
+function VoiceButton({
+  listening,
+  busy,
+  onToggle,
+}: {
+  listening: boolean
+  busy: boolean
+  onToggle: () => void
+}) {
+  return (
+    <PromptInputButton
+      variant="ghost"
+      tooltip={listening ? "Stop dictation" : busy ? "Working…" : "Dictate message"}
+      aria-label={listening ? "Stop dictation" : "Dictate message"}
+      aria-pressed={listening}
+      // Busy means the audio is already captured and is being transcribed, so
+      // there is nothing left to toggle.
+      disabled={busy && !listening}
+      onClick={onToggle}
+      className={cn(
+        "text-muted-foreground hover:text-foreground",
+        listening && "text-destructive hover:text-destructive"
+      )}
+    >
+      <MicIcon className={cn(listening && "motion-safe:animate-pulse")} />
+    </PromptInputButton>
+  )
+}
+
 /**
- * `PromptInputHeader` is an `InputGroupAddon`, so rendering it unconditionally
- * leaves a permanently empty row (6px + 8px padding plus an 4px group gap)
- * inside the composer. Gate it on the files actually being present.
+ * The composer's top strip. It is an `InputGroupAddon`, so it is only mounted
+ * when it has something to show: rendering it unconditionally would leave a
+ * permanently empty row (padding plus a group gap) in the box.
  */
-function PromptAttachmentsHeader() {
+function ComposerHeader({
+  voiceActive,
+  voiceListening,
+  voiceError,
+  onStopVoice,
+}: {
+  voiceActive: boolean
+  voiceListening: boolean
+  voiceError: string
+  onStopVoice: () => void
+}) {
   const attachments = usePromptInputAttachments()
-  if (!attachments.files.length) return null
+  const hasFiles = attachments.files.length > 0
+  if (!voiceActive && !voiceError && !hasFiles) return null
 
   return (
     <PromptInputHeader>
-      <PromptAttachments />
+      {voiceActive ? (
+        <AIVoice
+          // The spinning capture indicator only makes sense while the mic is
+          // actually open; transcribing and polishing keep the panel visible
+          // but idle, with the stage named in the caption.
+          active={voiceListening}
+          status={
+            voiceListening
+              ? "Listening..."
+              : voiceError
+                ? "Something went wrong"
+                : "Transcribing..."
+          }
+          onStop={voiceListening ? onStopVoice : undefined}
+        />
+      ) : null}
+
+      {voiceError ? (
+        <p
+          role="alert"
+          className="px-1 py-1.5 text-sm leading-relaxed text-destructive"
+        >
+          {voiceError}
+        </p>
+      ) : null}
+
+      {hasFiles ? <PromptAttachments /> : null}
     </PromptInputHeader>
   )
 }
@@ -399,7 +523,12 @@ function AddAttachmentsButton() {
 function ChatRow({ message }: { message: ChatMessage }) {
   return (
     <Message from={message.role} className="max-w-full gap-1.5">
-      <MessageContent className="max-w-full break-words text-[0.9375rem] leading-relaxed">
+      <MessageContent
+        className={cn(
+          "max-w-full break-words text-[0.9375rem] leading-relaxed",
+          message.role === "user" ? USER_BUBBLE : ASSISTANT_BUBBLE
+        )}
+      >
         <MessageResponse className={MARKDOWN_SPACING} isAnimating={false}>
           {message.text}
         </MessageResponse>

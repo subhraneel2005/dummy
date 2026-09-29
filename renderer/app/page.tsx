@@ -67,7 +67,7 @@ function IslandContent({
 
 function Island() {
   const { setSize } = useDynamicIslandSize();
-  const { state, text: transcript, message, mediaStream } = useDictation();
+  const { state, text: transcript, message, mediaStream } = useDictation({ pushToTalk: true });
   const settings = useAiSettings();
   const [chatError, setChatError] = useState("");
 

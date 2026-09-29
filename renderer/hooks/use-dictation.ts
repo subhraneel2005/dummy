@@ -16,7 +16,20 @@ const MAX_RECORD_MS = 60_000;
 const DONE_HIDE_MS = 5000;
 const ERROR_HIDE_MS = 3200;
 
-export function useDictation() {
+export interface UseDictationOptions {
+  /**
+   * Bind the global `Alt+D` push-to-talk shortcut and the key-up that ends it.
+   *
+   * This is opt-in because the `d`/Alt key-up listener ends recording on ANY
+   * such key press, which is correct for the dictation island but wrong for the
+   * chat composer — there, typing "d" in the message box would cut the
+   * recording short. A composer drives `start`/`stop` from its mic button
+   * instead and leaves this off.
+   */
+  pushToTalk?: boolean;
+}
+
+export function useDictation({ pushToTalk = false }: UseDictationOptions = {}) {
   const [state, setState] = useState<DictationState>("idle");
   const [text, setText] = useState("");
   const [message, setMessage] = useState("");
@@ -210,6 +223,7 @@ export function useDictation() {
   }, [clearHideTimer, resetToIdle, state]);
 
   useEffect(() => {
+    if (!pushToTalk) return
     const unsub = window.electronAPI?.onGlobalShortcut((phase) => {
       if (phase === "down") start();
       else stop();
@@ -224,7 +238,7 @@ export function useDictation() {
       unsub?.();
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [start, stop]);
+  }, [pushToTalk, start, stop]);
 
   useEffect(() => {
     return () => {
@@ -239,5 +253,7 @@ export function useDictation() {
     };
   }, [clearCapTimer, clearHideTimer, stopTracks]);
 
-  return { state, text, message, mediaStream, reset: resetToIdle };
+  // `start`/`stop` are part of the public surface so a mic button can drive
+  // dictation without the global shortcut.
+  return { state, text, message, mediaStream, start, stop, reset: resetToIdle };
 }
