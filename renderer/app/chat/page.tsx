@@ -51,6 +51,26 @@ import { cn } from "@/lib/utils"
  */
 const MARKDOWN_SPACING = "[&>*]:!my-0 [&>*+*]:!mt-6"
 
+/**
+ * Lists need their own rules, and they cannot come from the block rhythm above.
+ *
+ * Tailwind's preflight resets `ol, ul, menu` to `list-style: none; margin: 0;
+ * padding: 0`, and Streamdown contributes no list styling of its own, so a
+ * bulleted answer arrived with no marker indent and no breathing room inside —
+ * visibly out of step with the paragraphs around it. `my-0` in
+ * {@link MARKDOWN_SPACING} also strips the list's own block margin, so the
+ * indent and item spacing are stated explicitly here.
+ */
+const MARKDOWN_LISTS = [
+  "[&_ul]:list-disc [&_ol]:list-decimal",
+  "[&_ul]:!pl-6 [&_ol]:!pl-6",
+  "[&_li]:!my-0 [&_li+li]:!mt-1.5",
+  "[&_li]:marker:text-muted-foreground",
+  // Nested lists sit tight under their parent item, indented a step further.
+  "[&_li>ul]:!mt-1.5 [&_li>ol]:!mt-1.5",
+  "[&_li>ul]:!pl-5 [&_li>ol]:!pl-5",
+].join(" ")
+
 /** Shared measure for the transcript, the hero and the composer. */
 const CHAT_COLUMN = "mx-auto w-full max-w-3xl"
 
@@ -76,6 +96,7 @@ export default function ChatWindowPage() {
   const [job, setJob] = useState<{ id: number; text: string } | null>(null)
   const jobIdRef = useRef(0)
   const [draft, setDraft] = useState("")
+  const inputRef = useRef<HTMLTextAreaElement>(null)
   const [config, setConfig] = useState<{ provider: string | null; model: string | null }>({
     provider: null,
     model: null,
@@ -103,13 +124,42 @@ export default function ChatWindowPage() {
     else if (!voiceBusy) startVoice()
   }, [startVoice, stopVoice, voiceBusy, voiceState])
 
-  // Land the transcript in the draft. `resetVoice` is stable, and it moves the
-  // state to "idle" straight after, so this cannot loop.
-  useEffect(() => {
-    if (voiceState !== "done" || !voiceText) return
+  // The finished transcript is an event, not derived state, so it is consumed
+  // during render (React's documented pattern for "a prop changed, adjust
+  // state") instead of being synced from an effect, which costs an extra render
+  // pass and trips the set-state-in-effect rule. `consumedTranscript` keeps the
+  // same result from being appended twice, and clears on the next recording so
+  // dictating identical words twice in a row still works.
+  const [consumedTranscript, setConsumedTranscript] = useState("")
+  if (voiceListening && consumedTranscript) setConsumedTranscript("")
+  if (voiceState === "done" && voiceText && voiceText !== consumedTranscript) {
+    setConsumedTranscript(voiceText)
     setDraft((prev) => (prev.trim() ? `${prev.trimEnd()} ${voiceText}` : voiceText))
-    resetVoice()
-  }, [resetVoice, voiceState, voiceText])
+  }
+
+  // The hook holds a finished transcript on screen for a few seconds. Drop it as
+  // soon as it has been consumed so the voice panel closes and the composer
+  // returns to its resting height.
+  useEffect(() => {
+    if (voiceState === "done") resetVoice()
+  }, [resetVoice, voiceState])
+
+  // Enter-to-send is handled by the textarea's own keydown, so it only fires
+  // while the textarea holds focus. Stopping dictation moves focus to the voice
+  // panel's stop button, and that panel unmounts as soon as the session
+  // settles, which drops focus to <body> and leaves Enter doing nothing. Hand
+  // focus back the moment a session finishes — however it finished, so an
+  // error or a dropped recording behaves the same as a good one.
+  const voiceSessionRef = useRef(false)
+  useEffect(() => {
+    if (voiceBusy) {
+      voiceSessionRef.current = true
+      return
+    }
+    if (!voiceSessionRef.current) return
+    voiceSessionRef.current = false
+    inputRef.current?.focus()
+  }, [voiceBusy])
 
   // The provider/model shown in the chrome comes from the same settings the
   // send path uses, so it can never drift from what actually answers.
@@ -293,7 +343,7 @@ export default function ChatWindowPage() {
             <div className={cn(CHAT_COLUMN, "flex flex-col gap-6 px-6 py-6")}>
               {isEmpty ? (
                 <div className="flex flex-col items-center gap-2 text-center">
-                  <h1 className="text-2xl font-bold tracking-tight text-balance">
+                  <h1 className="text-4xl font-bold tracking-tighter text-balance">
                     Lock In
                   </h1>
                   <p className="text-sm text-muted-foreground">
@@ -312,7 +362,7 @@ export default function ChatWindowPage() {
                     className={cn("max-w-full", ASSISTANT_BUBBLE)}
                     aria-live="polite"
                   >
-                    <MessageResponse className={MARKDOWN_SPACING} isAnimating>
+                    <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating>
                       {streamingText}
                     </MessageResponse>
                   </MessageContent>
@@ -366,6 +416,7 @@ export default function ChatWindowPage() {
               onStopVoice={stopVoice}
             />
             <PromptInputTextarea
+              ref={inputRef}
               value={draft}
               onChange={(e) => setDraft(e.currentTarget.value)}
               placeholder="Send a message, or tap the mic to dictate…"
@@ -529,7 +580,7 @@ function ChatRow({ message }: { message: ChatMessage }) {
           message.role === "user" ? USER_BUBBLE : ASSISTANT_BUBBLE
         )}
       >
-        <MessageResponse className={MARKDOWN_SPACING} isAnimating={false}>
+        <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating={false}>
           {message.text}
         </MessageResponse>
       </MessageContent>

@@ -104,9 +104,7 @@ function createWindow() {
   mainWindow.setPosition(Math.round((displayWidth - (ISLAND_WIDTH + PAD * 2)) / 2), 40)
 }
 
-const IS_MAC = process.platform === "darwin"
-
-/** Matches the app's `--background` so the title bar blends into the content. */
+/** Matches the app's `--background` so the window body and title bar agree. */
 function chatBackgroundColor() {
   return nativeTheme.shouldUseDarkColors ? "#09090b" : "#ffffff"
 }
@@ -120,17 +118,10 @@ function createChatWindow() {
     minWidth: CHAT_MIN_WIDTH,
     minHeight: CHAT_MIN_HEIGHT,
 
-    // Native window controls with a transparent title bar: the traffic lights
-    // stay the real macOS ones, but the strip behind them has no fill of its
-    // own, so the app's own background runs through it. Windows/Linux keep the
-    // standard opaque system title bar. The window is never frameless, so the
-    // controls remain genuinely native rather than drawn by the app.
-    ...(IS_MAC
-      ? {
-          titleBarStyle: "hiddenInset" as const,
-          trafficLightPosition: { x: 14, y: 18 },
-        }
-      : {}),
+    // Standard native title bar on every platform, including macOS. No
+    // `titleBarStyle`/`trafficLightPosition` overrides, so the system chrome is
+    // the real thing and the web contents start below it — nothing in the app
+    // has to imitate window controls or reserve a strip for them.
     transparent: false,
     backgroundColor: chatBackgroundColor(),
     show: false,

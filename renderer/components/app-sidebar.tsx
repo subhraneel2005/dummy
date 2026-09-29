@@ -1,5 +1,6 @@
 "use client"
 
+import Image from "next/image"
 import { useRouter } from "next/navigation"
 import { useEffect, useRef, useState } from "react"
 import {
@@ -15,7 +16,6 @@ import {
 
 import { ModeToggle } from "@/components/mode-toggle"
 import { ProviderIcon, providerLabel } from "@/components/provider-icon"
-import { usePlatform } from "@/hooks/use-platform"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -28,7 +28,6 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { cn } from "@/lib/utils"
 import {
   Sidebar,
   SidebarContent,
@@ -73,7 +72,6 @@ export function AppSidebar({
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null)
   const { toggleSidebar, state } = useSidebar()
-  const isMac = usePlatform() === "darwin"
   const router = useRouter()
 
   return (
@@ -86,10 +84,26 @@ export function AppSidebar({
         className="group-data-[side=left]:border-r-0 group-data-[side=right]:border-l-0"
       >
         {/* The collapse control lives in the sidebar itself, so it stays put
-            instead of drifting out to the far edge of the window. On macOS the
-            title bar is transparent, so the sidebar has to start below the
-            native traffic lights rather than underneath them. */}
-        <SidebarHeader className={cn("px-2 pb-1", isMac ? "pt-12" : "pt-3")}>
+            instead of drifting out to the far edge of the window. The window
+            uses the standard native title bar, so the web contents already
+            begin below it and the header needs no extra top padding to clear
+            the traffic lights. */}
+        <SidebarHeader className="px-2 pb-1 pt-3">
+          <div className="flex items-center gap-2 px-1.5 pb-1">
+            <Image
+              src="/bloub-nuage-excite-bleu-anime.svg"
+              alt=""
+              width={22}
+              height={22}
+              aria-hidden="true"
+              className="size-5.5 shrink-0"
+            />
+            {/* Hidden in the collapsed rail, where the icon alone stands in
+                for the wordmark. */}
+            <span className="truncate text-[0.9375rem] leading-none font-bold tracking-tighter group-data-[collapsible=icon]:hidden">
+              dummy
+            </span>
+          </div>
           <Button
             type="button"
             variant="ghost"

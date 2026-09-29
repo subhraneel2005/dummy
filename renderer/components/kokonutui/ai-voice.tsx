@@ -54,12 +54,18 @@ export default function AIVoice({
   className,
 }: AIVoiceProps) {
   const [time, setTime] = useState(0);
+  const [counting, setCounting] = useState(active);
+
+  // Reset the readout when capture stops. Done during render rather than in an
+  // effect body, because a synchronous setState inside an effect cascades an
+  // extra render pass. No visual change: the same 00:00 shows either way.
+  if (counting !== active) {
+    setCounting(active);
+    if (!active) setTime(0);
+  }
 
   useEffect(() => {
-    if (!active) {
-      setTime(0);
-      return;
-    }
+    if (!active) return;
     const intervalId = setInterval(() => {
       setTime((t) => t + 1);
     }, 1000);
@@ -132,7 +138,7 @@ export default function AIVoice({
               style={
                 active
                   ? {
-                      height: `${20 + Math.random() * 80}%`,
+                      height: `${barHeight(i)}%`,
                       animationDelay: `${i * 0.05}s`,
                     }
                   : undefined
