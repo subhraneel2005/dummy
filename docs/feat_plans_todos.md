@@ -490,6 +490,252 @@ useChat hook                            db/ (SQLite chat_messages)
 
 ---
 
+## Feature 4 — Circle-Capture Screenshots (Alt+D drag-select → multimodal chat)
+
+### Goal
+While holding **Alt+D**, the user drags the mouse to circle any region of the screen; on release that region is screenshotted. Multiple captures per hold are allowed. On release of Alt+D the polished transcript (F1 + F2.5) **and** all captures are staged into the chat composer (F3) for review, then sent as one multimodal message.
+
+### Non-goals (v1)
+- No capture outside an Alt+D hold — no standalone screenshot key.
+- No OCR / text extraction; the model reads the pixels.
+- No annotation tools (arrow, blur, redact) beyond optionally echoing the drawn ellipse.
+- **No re-sending past screenshots to the model** (strictly one message only — see below).
+- No dragging the selection onto a second display mid-hold.
+
+### Locked decisions (confirmed with user)
+1. **Delivery** — stage in the composer, review, then send. Nothing is sent blind.
+2. **Shape** — **plain rectangle** of the circled region. The ellipse is a *selection gesture*, not the output shape (vision models handle rectangles best; no transparent corners to confuse them).
+3. **History** — **strictly one message only**. Captures from an earlier hold are never attached to a later message and never re-sent.
+4. **Resolution** — long edge capped at **1568px** before send.
+5. **Limit** — **5 captures per hold**; the 6th drag shows a brief "limit reached" notice and does not capture.
+6. **Scope** — Alt+D flow only. Drag-and-drop / paste of picked image files starts working for free (side effect of fixing the send path).
+7. **Feedback** — a **mild live highlight** while circling, so the gesture is visually understandable.
+8. **Scoping** — **one shared multimodal path**, which also fixes the currently-discarded file-picker attachments.
+
+### The "strictly one message only" decision collapses the history design
+If a capture is used in model context **exactly once**, `loadHistory` never needs to re-hydrate images. That deletes the single most expensive part of the design:
+
+| | Naive design | Chosen (one-shot) |
+|---|---|---|
+| `loadHistory` | join `chat_attachments`, read PNGs off disk, emit `FilePart[]` for every historical image | **plain text for all history**; images only on the in-flight message |
+| Cost per turn | grows with session length (needs a cap policy) | bounded: ≤5 images × 1568px, once |
+| Latency | re-reads all images every turn | none after send |
+| "How many images in history" question | had to be answered | **moot — deleted** |
+
+Attachments still persist to disk + a table, but only so thumbnails render in the UI history. The AI-context path becomes trivial. The accepted cost: a follow-up like *"and how do I fix that?"* no longer sees the screenshot it referred to.
+
+### Platform API names (verified against bundled `ai@7` source and `electron.d.ts` — NOT from memory)
+- **`ImagePart` is DEPRECATED in `ai@7.0.114`.** The bundled `@ai-sdk/provider-utils` marks it `@deprecated Use FilePart with mediaType: 'image' instead`. The current shape is:
+  ```ts
+  { type: "file", mediaType: "image/png", filename: "capture-1.png",
+    data: { type: "data", data: <Uint8Array | ArrayBuffer | Buffer | base64 string> } }
+  ```
+  Planning this from memory with `ImagePart` would have shipped a deprecated API. Same class of trap as `instructions`/`inputSchema` in F2.
+- `FilePart` **is** re-exported from `ai` (re-exported from `@ai-sdk/provider-utils`), so no extra import path is needed.
+- `mediaType` accepts a full IANA type (`image/png`) or just the top-level segment (`image`); providers normalise `image/*` → `image`.
+- `DataContent = string | Uint8Array | ArrayBuffer | Buffer`.
+- Electron `DesktopSource.display_id` (`electron.d.ts:7701`) — *"A unique identifier that will correspond to the `id` of the matching Display returned by the Screen API… It will be an **empty string if not available**."* → **a fallback source-match strategy is mandatory**, not optional.
+- Electron `focusable?: boolean` (`electron.d.ts:3887`), `showInactive()`, `NativeImage.crop()`, `toPNG()` — all confirmed present.
+
+### Hardware context
+- MacBook Air M1, built-in **2560×1600 Retina, scale factor 2** (verified via `system_profiler SPDisplaysDataType`).
+- Consequence: a full-screen crop is a **2560×1600 px** image (~2–6 MB PNG) and a half-screen region is still ~1800×900. This is exactly why the 1568px cap (decision 4) matters — it cuts both upload time and vision tokens, at the cost of softening small UI text.
+- 8 GB RAM constraint from F1 still applies, though image work is transient and bounded at 5 captures.
+
+### The gap being closed: chat is text-only end to end
+Every one of these layers independently drops an attachment. Phase C must fix **all** of them:
+1. `renderer/app/chat/page.tsx` — `submit({ text, files })` receives `files` and **throws them away**.
+2. `renderer/components/ai-elements/prompt-input.tsx` — `handleSubmit` base64-encodes blob URLs to data URLs (this part already works).
+3. `renderer/hooks/use-chat.ts` — `send(text, sessionId)`, two string params only.
+4. `dispatch` in the chat page — text only.
+5. preload bridge — `chat.send(text, sessionId)`.
+6. `main.ts` `chat:send` handler — `(text, sessionId)`.
+7. `electron/ai/chat.ts` `insertMessage` — `content: row.text`.
+8. `ChatMessage` type — `{ role, text }` only.
+9. `chat_messages.content` — plain `TEXT` column, no attachment table.
+10. `normalizeMessages` — would **silently drop** any non-`{role, text}` entry rather than render it.
+
+### Capture lifecycle (one-shot)
+```
+Alt+D down ──► dictationHoldId created; capture overlay shown (focusable:false)
+   │
+   ├─ drag #1..5 ─► hide overlay → getSources → match display_id
+   │                → thumbnail.crop(rect scaled by getSize()/bounds) → toPNG()
+   │                → downscale long edge to 1568px
+   │                → write staging/<holdId>/<n>.png
+   │                → showInactive() → add File to composer, tagged with holdId
+   │                → 250ms accent flash + numbered badge; island counter ticks 1..5
+   │
+Alt+D up ──► whisper ──► polish ──► dictation:status done { text }
+            └─► chat:initial-text { text, holdId } ──► seed draft, focus input
+Enter / send ──► chat:send(text, sessionId, attachments)
+                 ├─► main moves PNGs out of staging, inserts chat_attachments rows
+                 └─► ToolLoopAgent messages: [ { type:"text", text },
+                                               { type:"file", mediaType:"image/png",
+                                                 data:{ type:"data", data: bytes } }, … ]
+                 └─► next turn's history = TEXT ONLY (decision 3)
+```
+
+### Highlight behavior (decision 7)
+- **While dragging** — a soft `rgba(0,0,0,0.18)` scrim over everything *outside* the ellipse, ellipse interior left at full brightness, 2px accent stroke, crosshair cursor. Reads clearly without feeling like a heavy spotlight.
+- **On release** — 250ms accent-tinted fade over just the captured rect, confirming the shot landed even if the user wasn't looking at that part of the screen.
+- **Already captured** — small numbered badges linger ~2s at each ellipse's centre, cross-checkable against the island's counter.
+- **At the limit** — brief "limit reached (5)" toast near the cursor; no capture, overlay stays up.
+
+### Architecture Overview
+```
+renderer (Next.js, sandboxed)              electron/main (Node, ESM)
+----------------------------              -------------------------
+island  (Alt+D down/up, holds focus)
+  | dictation:audio  ──────────────────►   whisper → polish → text
+  |                                            |
+  | capture overlay (/capture, focusable:false) |
+  |   mousedown/move/up → screenX/screenY      |
+  |   capture:select { rect, displayId } ──────┤
+  |                                            ├─ overlay.hide()   ← don't photograph ourselves
+  |                                            ├─ desktopCapturer.getSources(types:["screen"])
+  |                                            ├─ crop → toPNG → downscale 1568px
+  |                                            ├─ overlay.showInactive()
+  |  capture:staged { id, mediaType,           │
+  |      name, dataBase64, w, h } ◄────────────┤  (writes staging/<holdId>/<n>.png)
+  |                                            │
+  |  File -> usePromptInputAttachments().add()  │
+  |  (existing preview/remove UI, reused as-is)│
+  |                                            │
+  | chat:send(text, sessionId, attachments) ───►  move out of staging
+  |                                            │  insert chat_attachments rows
+  |  chat:delta / chat:done ◄─────────────────┤  ToolLoopAgent + FilePart
+  |                                            │  next history = text only
+```
+
+### Capture overlay window (new, in `main.ts`)
+- Full `display.bounds`, `frame:false`, `transparent:true`, `hasShadow:false`, `resizable:false`, `movable:false`, `minimizable:false`, `maximizable:false`, `fullscreenable:false`, `skipTaskbar:true`, `show:false`, **`focusable:false`**, `alwaysOnTop:true`, `enableLargerThanScreen:true`.
+- **`focusable:false` is load-bearing.** Alt+D key-up is read from `mainWindow.webContents` `before-input-event` (F1). If the overlay ever takes focus, release detection dies and recording runs to the 60s cap. Needs a fallback key-up source on the capture window itself if this doesn't hold on some macOS/Electron combo.
+- Shown with `showInactive()` on PTT-down (capped to the display under the cursor at that moment); hidden on PTT-up, cancel, and blur.
+- New `/capture` route driven by `event.screenX/screenY` for absolute coords (no window-offset math). Esc cancels; click-without-drag or rect < ~8px = cancel.
+
+### Capture service (`electron/capture.ts`)
+`captureRegion(displayId, rect): Promise<Buffer /* PNG */>`
+1. `desktopCapturer.getSources({ types: ["screen"], thumbnailSize: bounds × scaleFactor })` — request full pixel size for Retina fidelity.
+2. Pick source by `source.display_id === String(display.id)`, **with fallback** (by name/index) because `display_id` may be `""`.
+3. `source.thumbnail.isEmpty()` ⇒ Screen Recording permission denied → throw a typed, actionable error.
+4. Crop scale `sx = thumbnail.getSize().width / bounds.width` (guards Electron's aspect-preserving thumbnail resize); crop rect = `round(rect × s)`, clamped to image bounds.
+5. `thumbnail.crop(...).toPNG()` → downscale long edge to 1568px.
+6. Hide-overlay-before-capture and show-after must be **awaited in that order**.
+
+### Permissions / Platform notes
+- **macOS Screen Recording** — new TCC permission, separate from the existing mic grant.
+- **TCC attributes the grant to the "responsible process", not to `Electron.app`.** This cost hours of debugging and is the single most important note in this section. An Electron app started via `npm run dev` is a *child of the terminal*, so macOS walks the process tree and blames the terminal. Granting Screen Recording to "Electron" does **nothing** — the row TCC reads is the terminal's (`Ghostty.app` here). Confirmed by the official `desktopCapturer` docs ("macOS attributes that permission to the responsible process, so when running unpackaged from a terminal or IDE it is the terminal or IDE that must be granted access") and by the VS Code maintainer in electron#20242 ("the electron process was hiding in my permissions list as my terminal application… only after resetting all of my camera permissions via `tccutil reset ScreenCapture` did I realize this"). `responsibleProcess()` in `electron/capture.ts` walks the same ancestry and is logged on every check.
+- **Secondary trap: all Electron dev builds share `CFBundleIdentifier = com.github.Electron`.** TCC keys the grant on that bundle id, so there is no per-path grant — one row governs every Electron build on the machine. Granting "the correct binary path" is not a thing that exists.
+- **`getMediaAccessStatus("screen")` alone is not trustworthy** — it reads per-process cached TCC state and does not reflect a grant toggled while the app is running. `refreshScreenCapturePermission()` therefore prefers a live `desktopCapturer.getSources` probe, which reflects what the OS will actually allow. The probe uses `thumbnailSize: { width: 0, height: 0 }` per the docs — a non-zero thumbnail still makes Chromium pull screen pixels, i.e. it measures the very thing it is testing.
+- **If not granted, dictation proceeds completely untouched** — a missing capture permission must never block the mic. The overlay still opens and states the reason rather than failing silently, because the original silent-skip produced the worst symptom of all: no overlay, no captures, no explanation.
+- No packaging config exists yet, so dev grants permissions to the *launching terminal* (same class of problem as `NSMicrophoneUsageDescription` in F1). A packaged build will need `NSScreenCaptureUsageDescription` via `extendInfo`; cannot be done yet.
+- **The overlay swallows all mouse clicks while Alt+D is held** — by design, the user is dictating, not clicking.
+
+### IPC Surface
+| Direction | Channel | Payload |
+|---|---|---|
+| main → renderer | `capture:staged` | `{ id, mediaType, name, dataBase64, width, height }` |
+| main → renderer | `capture:state` | `{ active: boolean, count: number }` |
+| main → renderer | `capture:show` | `{ holdId, displayId, bounds, count, max, granted, permissionMessage }` |
+| main → renderer | `capture:error` | `{ message }` |
+| invoke | `capture:permission` | → `{ granted, status, responsible, message }` |
+| invoke | `capture:open-settings` | deep-links to the Screen Recording pane |
+| invoke | `capture:consume` | `(holdId)` → staged captures, then deletes the staging dir |
+| invoke | `capture:begin` / `capture:cancel` | — |
+| send | `capture:select` | `{ rect, displayId }` |
+| **changed** | `chat:send` | `(text, sessionId, attachments)` |
+| **changed** | `chat:initial-text` | `{ text, holdId }` (was a bare string) |
+| **changed** | `ChatMessage` | `+ attachments: ChatAttachment[]` |
+
+### Security note
+- `chat:send` validates attachment count, a `mediaType` allowlist (`image/png`, `image/jpeg`), and a per-file byte cap.
+- **Main derives the on-disk path itself from the attachment id** — the renderer never supplies a filesystem path ⇒ no path-traversal surface.
+- Captured screenshots can contain anything on screen (passwords, tokens, private messages). They are stored unencrypted in `userData`, same class of trust as the unencrypted `chat_messages` body. Stated explicitly so it is a conscious choice, not an oversight.
+
+### Risks
+1. **Screen Recording TCC is a hard blocker** if denied — mitigated by an actionable error, by naming the responsible process, and by never blocking dictation.
+2. **History image bloat** — resolved by decision 3 (one-shot); cost is bounded by construction.
+3. **`focusable:false` is load-bearing** — if it fails to hold, Alt+D release detection breaks. The fallback key-up source on the capture window is still unimplemented; today release detection only reads `mainWindow`.
+4. **Non-vision model ids would 400** on image parts — surface the provider error clearly instead of failing silently.
+5. **Retina crop math must be verified empirically**, not assumed from the source code.
+6. **`display_id` may be empty** — a broken source match yields a wrong-display or empty capture. Needs a real multi-display test.
+
+### Two judgment calls (flagged, pending veto)
+1. **Superseding an unsent hold.** If the user dictates + circles, then starts a *second* Alt+D hold before sending, the composer **accumulates** (text appends; captures from both holds queue; per-hold cap still 5) rather than silently discarding dictated text. A confirm dialog would interrupt push-to-talk; silent deletion would lose speech.
+2. **Screenshots stay visible but context-free.** Images render in history as thumbnails forever, yet are never re-sent (decision 3). This leaves room for a later explicit "attach this again" affordance **without re-architecting**.
+
+---
+
+## Todos — Feature 4
+
+> **Status: shipped.** Phases A–E are implemented, and the core manual path (Alt+D → circle → composer → send) plus the denied-permission path are verified working. Three items remain genuinely open and are deliberately left unchecked rather than ticked on faith: the capture-window key-up fallback, the headless `FilePart` smoke test (the Electron harness cannot be run headlessly in this environment), and the two multi-display / Retina manual checks.
+
+### Phase A — Capture overlay window
+- [x] `captureWindow` in `electron/main.ts` — full `display.bounds`, transparent, frameless, `focusable:false`, `skipTaskbar`, `alwaysOnTop`, `enableLargerThanScreen`; shown via `showInactive()` on PTT-down, hidden on PTT-up / cancel / blur
+- [x] Cap the overlay to the display under the cursor at PTT-down (multi-display)
+- [x] New `/capture` route — drag-to-ellipse via `screenX/screenY`, no window-offset math; Esc cancels; click-without-drag or rect <8px = cancel
+- [x] Highlight behavior: `rgba(0,0,0,0.18)` outside-scrim, 2px accent stroke, crosshair cursor while dragging
+- [x] 250ms accent flash on the captured rect + numbered badge lingering ~2s per capture
+- [x] Island capture counter badge (1..5) so the user can track captures while looking at the screen
+- [x] Per-hold 5-capture cap; 6th drag shows a "limit reached" toast and does not capture
+- [ ] Fallback key-up source on the capture window in case `focusable:false` ever fails to hold — **not implemented**; `focusable:false` has held so far, so the risk has never actually fired
+
+### Phase B — Capture service (`electron/capture.ts`)
+- [x] `captureRegion(displayId, rect)` using `desktopCapturer.getSources({ types: ["screen"], thumbnailSize: bounds × scaleFactor })`
+- [x] Source match by `display_id` **plus a fallback** (name/index) — `display_id` may be `""`
+- [x] `thumbnail.isEmpty()` → typed "grant Screen Recording" error
+- [x] Retina-correct crop scale `thumbnail.getSize() / display.bounds`, clamped rect
+- [x] `thumbnail.crop(...).toPNG()` → downscale long edge to 1568px
+- [x] Overlay hide → capture → show ordering, awaited
+- [x] Permission pre-check via `getMediaAccessStatus("screen")` **plus** a live `desktopCapturer.getSources` probe. When not granted the overlay still opens and **explains why**, and selection is refused — dictation is never blocked. (Changed from the original "skip capture silently", which caused the reported bug: no overlay, no captures, no explanation.)
+- [x] Write PNGs to `userData/screenshots/staging/<holdId>/<n>.png`
+
+### Phase C — Multimodal chat pipeline (also fixes the discarded file-picker attachments)
+- [x] New `ChatAttachment` type; `ChatMessage` gains `attachments: ChatAttachment[]`
+- [x] `chat:send` signature → `(text, sessionId, attachments)`; validate count / `mediaType` allowlist / per-file byte cap; **main derives disk paths from the attachment id**
+- [x] `insertMessage(..., attachments?)` → message row + one `chat_attachments` row each
+- [x] Send path builds **`FilePart`** content — `{ type:"file", mediaType, filename, data:{ type:"data", data } }`. **Do NOT use `ImagePart`** (deprecated in `ai@7`)
+- [x] `loadHistory` stays **text-only by design** (decision 3) — no attachment join, no image re-hydration
+- [x] `renderer/app/chat/page.tsx` — `submit({ text, files })` stops discarding `files`
+- [x] `use-chat.ts` — `send(text, sessionId, attachments)`; `normalizeMessages` carries attachments instead of dropping them
+- [x] `preload.ts` + `renderer/electron.d.ts` — thread the new type through both
+- [x] Captures reach the composer as ordinary `File` objects via `attachments.add([file])`, reusing the existing preview/remove UI — **no new components**
+- [x] Allow send with attachments and empty text (`PromptInputSubmit` is currently `disabled={!draft.trim() || sending}`)
+
+### Phase D — Dictation → composer staging
+- [x] Per-hold `dictationHoldId` in main (created on PTT-down, cleared on send / cancel / next PTT-down) so an abandoned hold can't leak images into the next message
+- [x] Widen `chat:initial-text` from `string` → `{ text, holdId }` (covers both the cold-open `pendingChatText` path and the already-open `webContents.send` path)
+- [x] Chat window on receipt: seed draft + `File`s, then focus the input (works because of the F3 Enter/focus fix)
+- [x] `capture:state` wired to the island counter badge
+
+### Phase E — Persistence
+- [x] `chat_attachments` table — `id` PK, `message_id`, `session_id`, `media_type`, `file_name`, `path`, `width`, `height`, `byte_size`, `created_at`, index on `message_id`
+- [x] `db/schema.ts` → `npm run db:generate` → commit migration under `electron/drizzle/`
+- [x] On send, move PNGs out of `staging/` into `userData/screenshots/`
+- [x] `sessions.ts` session-delete must remove attachment **rows and files**
+- [x] Prune stale `staging/` directories on app start
+- [x] Thumbnails render in chat history (persisted, but never re-sent to the model)
+
+### Phase F — Validation
+- [x] `tsc -b` + lint + build green in both packages (34-problem pre-existing lint baseline expected in untouched files)
+- [ ] Headless smoke: seeded attachment → assert the in-flight message emits a `FilePart[]` content array and that `loadHistory` returns **text only** — **not run**; the staging smoke harness was killed (`SIGTERM`) under the headless shell, so the `FilePart[]` shape is verified by types only
+- [x] Manual: Alt+D → circle ×2 → release → both staged in composer → remove one → Enter → reply references the images
+- [x] Manual: Screen Recording denied → dictation still works, actionable error shown, no capture attempted
+- [ ] Manual: secondary display — capture on the non-primary screen
+- [ ] Manual: Retina crop accuracy — verify the captured rect aligns with the drawn ellipse on the 2560×1600 display
+
+---
+
+## Open Questions — Feature 4
+- Can the two judgment calls above stand, or should each Alt+D hold reset the composer to a fresh slate?
+- Should a "limit reached" toast be silent (just ignore the drag) instead? Currently it is visible — a silent no-op is confusing mid-dictation.
+- Should the capture overlay dim the underlying app more strongly (e.g. `0.35`) for maximum contrast, or is `0.18` the right "mild" level?
+- Packaging: add `NSScreenCaptureUsageDescription` via builder `extendInfo` once a packaging config exists (blocked on the same gap as F2 Phase 0).
+- Future: an explicit "attach this previous screenshot again" affordance, enabled by decision 3 leaving the files on disk.
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - Local command execution ("draft a reply").

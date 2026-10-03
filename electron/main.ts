@@ -1,8 +1,15 @@
-import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, nativeTheme, screen } from "electron"
+import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, nativeTheme, screen, shell, type Rectangle } from "electron"
+import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { getChatHistory, onChatEvent, resetChat, sendChatMessage } from "./ai/chat.js"
+import {
+  dropStagedCaptures,
+  pruneStaging,
+  readStagedCaptures,
+  stageCapture,
+} from "./ai/attachments.js"
+import { getAttachmentData, getChatHistory, onChatEvent, resetChat, sendChatMessage } from "./ai/chat.js"
 import { listProviderModels } from "./ai/catalog.js"
 import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
 import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
@@ -13,19 +20,54 @@ import {
   listSessions,
   renameSession,
 } from "./ai/sessions.js"
+import {
+  MAX_CAPTURES_PER_HOLD,
+  captureRegion,
+  refreshScreenCapturePermission,
+  responsibleProcess,
+  screenCaptureGranted,
+  screenCaptureStatus,
+  type CaptureRect,
+} from "./capture.js"
 import { closeDb, initDb, migrateDb } from "./db/index.js"
 import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+/** What the chat window is handed when dictation ends. */
+interface ChatSeed {
+  text: string | null
+  holdId: string | null
+}
+
+/** One Alt+D press. Captures are scoped to it and to it alone. */
+interface CaptureHold {
+  id: string
+  displayId: number
+  count: number
+}
+
 let mainWindow: BrowserWindow | null = null
 let chatWindow: BrowserWindow | null = null
-let pendingChatText: string | null = null
+let captureWindow: BrowserWindow | null = null
+let pendingChatSeed: ChatSeed | null = null
+let activeHold: CaptureHold | null = null
+let lastHold: CaptureHold | null = null
+let captureBusy = false
+/** True once the overlay's page has actually finished loading. */
+let captureLoaded = false
+/** A show request that arrived while the page was still loading. */
+let captureShowPending = false
 let pendingPttDown = false
 let dragOffset: { dx: number; dy: number } | null = null
 let isRecording = false
 
 const PTT_KEY = "Alt+D"
+
+/** One message, so the overlay and the main-process refusal cannot disagree. */
+const SCREEN_PERMISSION_MESSAGE =
+  "Screen Recording is off — grant it in System Settings → Privacy & Security → " +
+  "Screen & System Audio Recording, then fully quit and reopen dummy."
 const CHAT_KEY = "Alt+C"
 
 const PAD = 12
@@ -62,6 +104,203 @@ function windowFor(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent) {
   return BrowserWindow.fromWebContents(event.sender)
 }
 
+/**
+ * The full-screen selection surface used while Alt+D is held.
+ *
+ * `focusable: false` is load-bearing, not a nicety. Alt+D's release is detected
+ * via `before-input-event` on the island's webContents, which only fires while
+ * that window holds keyboard focus. If this overlay ever became focusable it
+ * would steal the key-up and recording would run on to its 60s cap. `showInactive`
+ * is the second half of that guarantee — showing without activating.
+ */
+function createCaptureWindow() {
+  if (captureWindow && !captureWindow.isDestroyed()) return captureWindow
+
+  captureWindow = new BrowserWindow({
+    ...{ width: 800, height: 600 },
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    show: false,
+    hasShadow: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    acceptFirstMouse: true,
+    alwaysOnTop: true,
+    enableLargerThanScreen: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      sandbox: true
+    }
+  })
+
+  // The overlay is decoration, so it must never steal the shortcut's chrome or
+  // appear in the window menu.
+  captureWindow.setMenuBarVisibility(false)
+
+  captureWindow.on("closed", () => {
+    captureWindow = null
+  })
+
+  // A dev server that is down would otherwise leave an invisible full-screen
+  // window that eats every click, with no way to tell why.
+  captureWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    if (errorCode === -3) return // aborted, usually a redirect or supersede
+    console.error(`[capture] failed to load ${validatedURL}: ${errorDescription} (${errorCode})`)
+    if (captureWindow && !captureWindow.isDestroyed()) captureWindow.destroy()
+    captureWindow = null
+  })
+
+  captureLoaded = false
+  captureWindow.webContents.on("did-finish-load", () => {
+    captureLoaded = true
+    console.log("[capture] overlay page loaded")
+    // Showing a window whose page has not finished loading paints nothing, which
+    // on a cold dev server (first request compiles the route) is indistinguishable
+    // from a broken feature. Hold the show until there is something to see.
+    if (captureShowPending) {
+      captureShowPending = false
+      showCaptureWindow()
+    }
+  })
+
+  captureWindow.loadURL("http://localhost:3000/capture")
+  return captureWindow
+}
+
+function captureInfoFor(hold: CaptureHold): {
+  holdId: string
+  displayId: number
+  x: number
+  y: number
+  width: number
+  height: number
+  count: number
+  max: number
+  granted: boolean
+  permissionMessage: string
+} {
+  const display = screen.getAllDisplays().find((candidate) => candidate.id === hold.displayId)
+  const bounds = display?.bounds ?? { x: 0, y: 0, width: 0, height: 0 }
+  return {
+    // The overlay keys its own state off this: the count resets to zero on a
+    // new hold, so without an id it could not tell "fresh hold" from "back to
+    // zero captures".
+    holdId: hold.id,
+    // Checked per hold rather than cached: the user may have granted Screen
+    // Recording while the app was running, and without this the overlay could
+    // only ever report a verdict from startup.
+    granted: screenCaptureGranted(),
+    permissionMessage: SCREEN_PERMISSION_MESSAGE,
+    displayId: hold.displayId,
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    count: hold.count,
+    max: MAX_CAPTURES_PER_HOLD,
+  }
+}
+
+function showCaptureWindow() {
+  if (!activeHold || !captureWindow || captureWindow.isDestroyed()) return
+  if (!captureLoaded) {
+    captureShowPending = true
+    return
+  }
+  captureWindow.showInactive()
+  console.log(`[capture] overlay shown (count=${activeHold.count})`)
+  captureWindow.webContents.send("capture:show", captureInfoFor(activeHold))
+}
+
+function hideCaptureWindow() {
+  if (captureWindow && !captureWindow.isDestroyed()) captureWindow.hide()
+}
+
+/**
+ * Opens the selection surface for a fresh Alt+D press.
+ *
+ * The surface opens even when Screen Recording has not been granted, so that
+ * the overlay can say so. Returning early here made a missing permission
+ * indistinguishable from a broken feature: nothing appeared, nothing was
+ * captured, and the transcript went out with no images and no explanation.
+ */
+function beginCaptureHold() {
+  if (activeHold) return
+
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  const hold: CaptureHold = { id: randomUUID(), displayId: display.id, count: 0 }
+  activeHold = hold
+  lastHold = hold
+
+  const win = createCaptureWindow()
+  win.setBounds(display.bounds)
+  showCaptureWindow()
+  // Announced at zero so a listener can tell "this hold has taken nothing"
+  // apart from "this hold has not started yet" and drop the previous hold's
+  // count.
+  announceStaged(hold, false)
+}
+
+function endCaptureHold() {
+  const hold = activeHold
+  activeHold = null
+  hideCaptureWindow()
+  if (hold) console.log(`[capture] hold end id=${hold.id.slice(0, 8)} captured=${hold.count}`)
+  // A hold that captured nothing should leave nothing behind.
+  if (hold && hold.count === 0) void dropStagedCaptures(hold.id)
+}
+
+function announceStaged(hold: CaptureHold, limitReached: boolean) {
+  const payload = { holdId: hold.id, count: hold.count, limitReached }
+  for (const win of [mainWindow, chatWindow]) {
+    if (win && !win.isDestroyed()) win.webContents.send("capture:staged", payload)
+  }
+}
+
+/**
+ * Hides the overlay, grabs the region, puts the overlay back.
+ *
+ * The hide is not optional: `desktopCapturer` frames the whole display, so a
+ * visible overlay would end up inside every screenshot it takes. Serialized on
+ * `captureBusy` so two rapid drags cannot interleave a hide and a show and
+ * leave the overlay permanently visible or permanently hidden.
+ */
+async function captureAndStage(hold: CaptureHold, rect: CaptureRect) {
+  if (captureBusy) return
+  captureBusy = true
+  hideCaptureWindow()
+  try {
+    const region = await captureRegion(hold.displayId, rect)
+    await stageCapture(hold.id, region.png, region.width, region.height)
+    hold.count += 1
+    console.log(
+      `[capture] stored ${region.width}x${region.height} ${region.png.byteLength}B ` +
+        `(hold total ${hold.count})`,
+    )
+    showCaptureWindow()
+    announceStaged(hold, false)
+  } catch (err) {
+    showCaptureWindow()
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[capture] capture failed: ${message}`)
+    if (captureWindow && !captureWindow.isDestroyed()) {
+      captureWindow.webContents.send("capture:error", message)
+    }
+    // A capture the user cannot see succeed would desync the counter, so only
+    // count what actually landed.
+    announceStaged(hold, false)
+  } finally {
+    captureBusy = false
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow ({
     width: ISLAND_WIDTH + PAD * 2,
@@ -96,6 +335,9 @@ function createWindow() {
     if (input.type !== "keyUp" || !isRecording) return
     const key = input.key.toLowerCase()
     if (key === "d" || key === "alt" || key === "option") {
+      // Same release closes the selection surface, so the overlay cannot outlive
+      // the hold it belongs to.
+      endCaptureHold()
       mainWindow?.webContents.send("global-shortcut:up")
     }
   })
@@ -149,7 +391,7 @@ function createChatWindow() {
 
   chatWindow.on("closed", () => {
     chatWindow = null
-    pendingChatText = null
+    pendingChatSeed = null
   })
 
   // Created hidden so the first paint isn't a white flash. `ready-to-show` can
@@ -192,17 +434,35 @@ function createChatWindow() {
   )
 }
 
-function openChatWindow(text: string) {
+/**
+ * Attaches the most recent hold's screenshots to a transcript, if that hold
+ * actually captured something. A dictation with no captures keeps the old
+ * clipboard-first behaviour, so nothing about the plain flow changes.
+ */
+function seedFor(text: string): ChatSeed {
+  const transcript = text.trim()
+  const seed = {
+    text: transcript || null,
+    holdId: lastHold && lastHold.count > 0 ? lastHold.id : null,
+  }
+  console.log(
+    `[capture] chat seed holdId=${seed.holdId ? seed.holdId.slice(0, 8) : "none"} ` +
+      `(${lastHold?.count ?? 0} capture(s) from the last hold)`,
+  )
+  return seed
+}
+
+function openChatWindow(seed: ChatSeed) {
   if (!chatWindow || chatWindow.isDestroyed()) {
-    pendingChatText = text || null
+    pendingChatSeed = seed.text || seed.holdId ? seed : null
     createChatWindow()
     return
   }
   chatWindow.show()
   chatWindow.focus()
-  // The renderer is already mounted, so hand the text over as an event rather
+  // The renderer is already mounted, so hand the seed over as an event rather
   // than waiting for a fresh mount to pull it.
-  if (text) chatWindow.webContents.send("chat:initial-text", text)
+  if (seed.text || seed.holdId) chatWindow.webContents.send("chat:initial-text", seed)
 }
 
 function registerIpcHandlers() {
@@ -262,19 +522,99 @@ function registerIpcHandlers() {
     }
   })
 
+  // --- Circle-capture selection surface -----------------------------------
+  // macOS has no system dialog for Screen Recording — `askForMediaAccess`
+  // only covers microphone and camera, and Electron's `openPrivacySettings` is
+  // not in this version. So "ask the user" has to mean: detect at startup and
+  // send them to the exact System Settings pane ourselves.
+  ipcMain.handle("capture:permission", async () => {
+    const { granted, status } = await refreshScreenCapturePermission()
+    const responsible = responsibleProcess()
+    console.log(
+      `[capture] permission check: tcc=${status} granted=${granted} ` +
+        `responsible=${responsible}`,
+    )
+    return { granted, status, responsible, message: SCREEN_PERMISSION_MESSAGE }
+  })
+
+  ipcMain.handle("capture:open-settings", () => {
+    void shell.openExternal(
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    )
+  })
+
+  ipcMain.handle("capture:info", (event) => {
+    if (windowFor(event) !== captureWindow) return null
+    return activeHold ? captureInfoFor(activeHold) : null
+  })
+
+  ipcMain.on("capture:select", (event, rect: unknown) => {
+    if (windowFor(event) !== captureWindow) return
+    const hold = activeHold
+    if (!hold) return
+    const selection = rect as Partial<CaptureRect> | null
+    const numbers = [selection?.x, selection?.y, selection?.width, selection?.height]
+    if (numbers.some((value) => typeof value !== "number" || !Number.isFinite(value))) return
+    // Enforced here as well as in the overlay, so the check does not depend on
+    // one particular renderer having rendered.
+    console.log(`[capture] select received ${JSON.stringify(selection)}`)
+    if (!screenCaptureGranted()) {
+      console.warn("[capture] refused: Screen Recording not granted")
+      if (captureWindow && !captureWindow.isDestroyed()) {
+        captureWindow.webContents.send("capture:error", SCREEN_PERMISSION_MESSAGE)
+      }
+      return
+    }
+    if (hold.count >= MAX_CAPTURES_PER_HOLD) {
+      // Refuse loudly: a drag that silently does nothing reads as a broken app.
+      announceStaged(hold, true)
+      return
+    }
+    void captureAndStage(hold, {
+      x: selection!.x!,
+      y: selection!.y!,
+      width: selection!.width!,
+      height: selection!.height!,
+    })
+  })
+
+  ipcMain.on("capture:cancel", (event) => {
+    if (windowFor(event) !== captureWindow) return
+    endCaptureHold()
+  })
+
+  /**
+   * Hands a hold's captures to the chat window exactly once. Staging is deleted
+   * on read, so a repeated seed (HMR, a second `Send to chat`) cannot attach the
+   * same screenshots twice.
+   */
+  ipcMain.handle("capture:consume", async (event, holdId: unknown) => {
+    if (windowFor(event) !== chatWindow) return []
+    if (typeof holdId !== "string" || holdId.length > 64) return []
+    const captures = await readStagedCaptures(holdId)
+    await dropStagedCaptures(holdId)
+    if (lastHold?.id === holdId) lastHold.count = 0
+    return captures
+  })
+
   // Session ids are minted by the renderer, so validate before they reach SQL.
   const validSessionId = (value: unknown): value is string =>
     typeof value === "string" && value.length > 0 && value.length <= 64
   const badSession = { ok: false as const, error: "Invalid chat session id." }
 
-  ipcMain.handle("chat:send", (_event, text: string, sessionId: unknown) =>
-    validSessionId(sessionId) ? sendChatMessage(text, sessionId) : badSession,
+  ipcMain.handle("chat:send", (_event, text: string, sessionId: unknown, attachments: unknown) =>
+    validSessionId(sessionId) ? sendChatMessage(text, sessionId, attachments) : badSession,
   )
   ipcMain.handle("chat:history", (_event, sessionId: unknown) =>
     validSessionId(sessionId) ? getChatHistory(sessionId) : badSession,
   )
   ipcMain.handle("chat:reset", (_event, sessionId: unknown) =>
     validSessionId(sessionId) ? resetChat(sessionId) : badSession,
+  )
+  ipcMain.handle("chat:attachment-data", (_event, attachmentId: unknown) =>
+    typeof attachmentId === "string" && attachmentId.length <= 128
+      ? getAttachmentData(attachmentId)
+      : { ok: false as const, error: "Invalid attachment id." },
   )
 
   ipcMain.handle("chat:list-sessions", () => listSessions())
@@ -288,18 +628,18 @@ function registerIpcHandlers() {
   ipcMain.handle("chat:delete-session", (_event, sessionId: unknown) =>
     validSessionId(sessionId) ? deleteSession(sessionId) : badSession,
   )
-  ipcMain.on("chat:open", (_event, text: string) => openChatWindow(text))
-  // Pulled by the chat renderer on mount. The text is NOT cleared on read: the
+  ipcMain.on("chat:open", (_event, text: string) => openChatWindow(seedFor(text)))
+  // Pulled by the chat renderer on mount. The seed is NOT cleared on read: the
   // renderer may unmount/remount (HMR, reload) between the invoke and the state
   // update, and clearing here destroyed the transcript with nothing to show for
   // it. The renderer acks once it has actually taken ownership.
   ipcMain.handle("chat:take-initial-text", (event) => {
     if (windowFor(event) !== chatWindow) return null
-    return pendingChatText
+    return pendingChatSeed
   })
   ipcMain.handle("chat:ack-initial-text", (event) => {
     if (windowFor(event) !== chatWindow) return false
-    pendingChatText = null
+    pendingChatSeed = null
     return true
   })
 
@@ -405,13 +745,17 @@ function registerGlobalShortcut() {
     if (!mainWindow || mainWindow.isDestroyed()) {
       pendingPttDown = true
       isRecording = true
+      beginCaptureHold()
       createWindow()
       return
     }
     isRecording = true
+    // The island is focused first: the overlay must never be the focused window,
+    // because the Alt+D release is read from the island's webContents.
     mainWindow.show()
     mainWindow.focus()
     mainWindow.webContents.send("global-shortcut:down")
+    beginCaptureHold()
   })
   if (!ok) {
     console.warn(`Failed to register global shortcut: ${PTT_KEY}`)
@@ -437,9 +781,28 @@ function registerGlobalShortcut() {
 app.whenReady().then(async () => {
   initDb()
   await migrateDb()
+  // Screenshots staged by a hold that never finished (crash, force quit) are
+  // unreachable by construction — no hold id will ask for them again.
+  void pruneStaging()
   registerIpcHandlers()
   createWindow()
   registerGlobalShortcut()
+
+  // Load the overlay route up front. On a cold dev server the first request for
+  // a route is compiled on demand, which can take seconds — long enough that a
+  // hold opened onto a still-loading page looks exactly like no feature at all.
+  // Loading now, hidden, pays that cost before the user ever presses Alt+D.
+  createCaptureWindow().hide()
+
+  // Every Electron dev build shares the bundle id `com.github.Electron`, so the
+  // Screen Recording list can show several identical "Electron" rows. Printing
+  // the binary we are actually running as makes the right one identifiable.
+  const responsible = responsibleProcess()
+  console.log(
+    `[capture] screen capture tcc=${screenCaptureStatus()} ` +
+      `responsible=${responsible}\n[capture] macOS grants Screen Recording to the ` +
+      `responsible process above, not to Electron.app.`,
+  )
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -448,6 +811,7 @@ app.whenReady().then(async () => {
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll()
+  hideCaptureWindow()
   closeDb()
 })
 

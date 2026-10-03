@@ -35,4 +35,35 @@ export const chatMessages = sqliteTable(
   (table) => [index("chat_messages_session_idx").on(table.sessionId)],
 )
 
-export const schema = { settings, providerKeys, chatSessions, chatMessages }
+/**
+ * Screenshots and picked files sent alongside a message.
+ *
+ * `session_id` is denormalised alongside `message_id` so a session can be
+ * cleaned up (rows *and* files) with a single predicate instead of a join, which
+ * matters because deleting the session has to delete the PNGs too.
+ *
+ * `path` is always written by this process — the renderer never supplies one —
+ * so there is no path-traversal surface on the way in.
+ */
+export const chatAttachments = sqliteTable(
+  "chat_attachments",
+  {
+    id: text("id").primaryKey(),
+    messageId: integer("message_id").notNull(),
+    position: integer("position").notNull(),
+    sessionId: text("session_id").notNull(),
+    mediaType: text("media_type").notNull(),
+    fileName: text("file_name").notNull(),
+    path: text("path").notNull(),
+    width: integer("width").notNull(),
+    height: integer("height").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    index("chat_attachments_message_idx").on(table.messageId),
+    index("chat_attachments_session_idx").on(table.sessionId),
+  ],
+)
+
+export const schema = { settings, providerKeys, chatSessions, chatMessages, chatAttachments }

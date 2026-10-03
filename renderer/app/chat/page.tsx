@@ -37,9 +37,24 @@ import { AppSidebar, type ChatSession } from "@/components/app-sidebar"
 import AIVoice from "@/components/kokonutui/ai-voice"
 import { ProviderIcon, providerLabel } from "@/components/provider-icon"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
-import { useChat, type ChatMessage } from "@/hooks/use-chat"
+import {
+  useAttachmentSrc,
+  useChat,
+  type ChatAttachmentUpload,
+  type ChatAttachmentView,
+  type ChatMessage,
+} from "@/hooks/use-chat"
 import { useDictation } from "@/hooks/use-dictation"
 import { cn } from "@/lib/utils"
+
+/**
+ * A transcript handed over by main when dictation ends. Declared locally rather
+ * than shared, matching how the rest of this tree treats bridge types.
+ */
+type ChatSeed = { text: string | null; holdId: string | null }
+
+/** What `capture.consume` returns. Only the bytes matter to the composer. */
+type StagedCapture = { mediaType: string; fileName: string; dataBase64: string }
 
 /**
  * Streamdown ships its vertical rhythm as `space-y-4` plus `my-4` on the code
@@ -224,38 +239,63 @@ export default function ChatWindowPage() {
     setJob({ id: jobIdRef.current, text })
   }, [])
 
-  // `takeInitialText` is non-destructive: main keeps the transcript until we ack
-  // it, so an effect torn down mid-flight (HMR, reload) can't lose it.
+  /**
+   * Screenshots waiting to be dropped into the composer.
+   *
+   * A hold that captured something stages instead of auto-sending: the whole
+   * point of reviewing a screenshot before it reaches the model is that you get
+   * to decide it. A hold that captured nothing keeps the old auto-send, so
+   * plain dictation is unchanged.
+   */
+  const [staged, setStaged] = useState<StagedCapture[]>([])
+
+  const applySeed = useCallback(
+    (seed: ChatSeed) => {
+      if (seed.holdId) {
+        if (seed.text) setDraft(seed.text)
+        void window.electronAPI?.capture.consume(seed.holdId).then((captures) => {
+          if (captures.length > 0) setStaged(captures)
+        })
+        return
+      }
+      if (seed.text) enqueue(seed.text)
+    },
+    [enqueue]
+  )
+
+  // `takeInitialText` is non-destructive: main keeps the seed until we ack it,
+  // so an effect torn down mid-flight (HMR, reload) can't lose it.
   useEffect(() => {
     let cancelled = false
     void window.electronAPI?.chat
       .takeInitialText()
-      .then((text) => {
-        if (cancelled || !text) return
-        enqueue(text)
+      .then((seed) => {
+        if (cancelled || !seed) return
+        applySeed(seed)
         void window.electronAPI?.chat.ackInitialText()
       })
       .catch(() => undefined)
     return () => {
       cancelled = true
     }
-  }, [enqueue])
+  }, [applySeed])
 
   useEffect(() => {
-    return window.electronAPI?.chat.onInitialText((text) => enqueue(text))
-  }, [enqueue])
+    return window.electronAPI?.chat.onInitialText((seed) => applySeed(seed))
+  }, [applySeed])
 
   /** Sends into `activeId`, minting an id when this is a brand-new thread. */
   const dispatch = useCallback(
-    async (text: string) => {
+    async (text: string, uploads: readonly ChatAttachmentUpload[] = []) => {
       const trimmed = text.trim()
-      if (!trimmed || sending) return
+      // Images with no caption are a valid message; nothing at all is not.
+      if ((!trimmed && uploads.length === 0) || sending) return
       const target = activeId ?? crypto.randomUUID()
       if (!activeId) setActiveId(target)
       // `send` appends the prompt to the transcript, so the box can be emptied
       // immediately instead of holding a stale copy that Enter would resend.
       setDraft("")
-      await send(trimmed, target)
+      await send(trimmed, target, uploads)
     },
     [activeId, send, sending]
   )
@@ -270,12 +310,33 @@ export default function ChatWindowPage() {
   useEffect(() => {
     if (!job || job.id === handledJobRef.current) return
     handledJobRef.current = job.id
+    // Auto-sent dictation never carries screenshots — a hold with captures
+    // stages for review instead, so `uploads` is always empty on this path.
     void dispatch(job.text)
   }, [job, dispatch])
 
+  /**
+   * `PromptInput` strips each part's `id` when it converts blob URLs to data
+   * URLs before calling this, so a fresh correlation id is minted here. It only
+   * has to be unique within the message being sent.
+   */
   const submit = useCallback(
-    ({ text }: PromptInputMessage) => {
-      void dispatch(text)
+    async ({ text, files }: PromptInputMessage) => {
+      const uploads: ChatAttachmentUpload[] = []
+      for (const part of files ?? []) {
+        // Data URLs are what the component hands over; a blob URL that failed to
+        // convert cannot be sent, so it is dropped rather than sent as garbage.
+        const comma = part.url?.indexOf(",") ?? -1
+        const dataBase64 = comma >= 0 ? part.url.slice(comma + 1) : ""
+        if (!dataBase64) continue
+        uploads.push({
+          id: crypto.randomUUID().replace(/-/g, ""),
+          mediaType: part.mediaType,
+          fileName: part.filename || "image.png",
+          dataBase64,
+        })
+      }
+      await dispatch(text, uploads)
     },
     [dispatch]
   )
@@ -415,6 +476,7 @@ export default function ChatWindowPage() {
               voiceError={voiceState === "error" ? voiceError : ""}
               onStopVoice={stopVoice}
             />
+            <StagedCaptureInbox captures={staged} onConsumed={() => setStaged([])} />
             <PromptInputTextarea
               ref={inputRef}
               value={draft}
@@ -438,10 +500,7 @@ export default function ChatWindowPage() {
                   onToggle={toggleVoice}
                 />
               </PromptInputTools>
-              <PromptInputSubmit
-                status={showThinking ? "submitted" : "ready"}
-                disabled={!draft.trim() || sending}
-              />
+              <ComposerSubmit thinking={showThinking} sending={sending} hasText={Boolean(draft.trim())} />
             </PromptInputFooter>
           </PromptInput>
         </footer>
@@ -556,6 +615,80 @@ function PromptAttachments() {
   )
 }
 
+/**
+ * Moves screenshots staged in main into the composer.
+ *
+ * They arrive as base64 over IPC, so they are rebuilt as `File`s and handed to
+ * the same `add()` the file picker uses — staged captures and picked images then
+ * share one preview, one remove control and one submit path. There is no
+ * second-class screenshot type anywhere downstream.
+ *
+ * Renders nothing; it exists only to live inside `PromptInput`'s attachment
+ * context.
+ */
+function StagedCaptureInbox({
+  captures,
+  onConsumed,
+}: {
+  captures: StagedCapture[]
+  onConsumed: () => void
+}) {
+  const { add } = usePromptInputAttachments()
+  // Effects run twice in development StrictMode, and adding the same batch twice
+  // would duplicate every attachment, so the batch is keyed and remembered.
+  const addedKey = useRef("")
+
+  useEffect(() => {
+    const key = captures.map((capture) => capture.fileName).join("|")
+    if (!key || key === addedKey.current) return
+    addedKey.current = key
+    add(
+      captures.map(
+        (capture) =>
+          new File([base64ToBytes(capture.dataBase64)], capture.fileName, {
+            type: capture.mediaType,
+          })
+      )
+    )
+    onConsumed()
+  }, [captures, add, onConsumed])
+
+  return null
+}
+
+/**
+ * The send button lives inside `PromptInput` so it can see the attachment
+ * context — without that, a message of nothing but screenshots would have no
+ * enabled way out of the composer.
+ */
+function ComposerSubmit({
+  thinking,
+  sending,
+  hasText,
+}: {
+  thinking: boolean
+  sending: boolean
+  hasText: boolean
+}) {
+  const { files } = usePromptInputAttachments()
+  return (
+    <PromptInputSubmit
+      status={thinking ? "submitted" : "ready"}
+      disabled={sending || (!hasText && files.length === 0)}
+    />
+  )
+}
+
+/** `Uint8Array<ArrayBuffer>` rather than the default `ArrayBufferLike`, which `Blob` rejects. */
+function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
+
 function AddAttachmentsButton() {
   const attachments = usePromptInputAttachments()
   return (
@@ -572,6 +705,8 @@ function AddAttachmentsButton() {
 }
 
 function ChatRow({ message }: { message: ChatMessage }) {
+  const hasText = message.text.trim().length > 0
+  const { attachments } = message
   return (
     <Message from={message.role} className="max-w-full gap-1.5">
       <MessageContent
@@ -580,9 +715,18 @@ function ChatRow({ message }: { message: ChatMessage }) {
           message.role === "user" ? USER_BUBBLE : ASSISTANT_BUBBLE
         )}
       >
-        <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating={false}>
-          {message.text}
-        </MessageResponse>
+        {attachments.length > 0 ? (
+          <div className={cn("flex flex-wrap gap-2", hasText && "mb-2")}>
+            {attachments.map((attachment) => (
+              <MessageThumbnail key={attachment.id} attachment={attachment} />
+            ))}
+          </div>
+        ) : null}
+        {hasText ? (
+          <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating={false}>
+            {message.text}
+          </MessageResponse>
+        ) : null}
       </MessageContent>
       {message.role === "assistant" ? (
         <MessageActions className="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -590,6 +734,30 @@ function ChatRow({ message }: { message: ChatMessage }) {
         </MessageActions>
       ) : null}
     </Message>
+  )
+}
+
+/**
+ * A sent screenshot. History carries metadata only, so the bytes are fetched
+ * on demand — a conversation with a dozen screenshots would otherwise ship
+ * megabytes to draw 200px previews. Just-sent attachments already hold their
+ * own data URL and never hit the bridge.
+ */
+function MessageThumbnail({ attachment }: { attachment: ChatAttachmentView }) {
+  const src = useAttachmentSrc(attachment)
+  if (!src) {
+    return <div className="h-32 w-48 animate-pulse rounded-md bg-black/10" aria-hidden="true" />
+  }
+  return (
+    // Data URLs from the bridge have no filesystem path and no intrinsic size
+    // for the image optimizer to work from, so next/image cannot be used here.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={src}
+      alt={attachment.fileName || "Screenshot"}
+      className="h-auto max-h-64 rounded-md border border-black/10 object-contain"
+      loading="lazy"
+    />
   )
 }
 

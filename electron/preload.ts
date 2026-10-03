@@ -33,9 +33,27 @@ type AiCatalogResult = {
 }
 type AiModelsResult = { ok: true; models: ModelInfo[] } | { ok: false; error: string; models?: ModelInfo[] }
 
+interface ChatAttachment {
+  id: string
+  mediaType: string
+  fileName: string
+  width: number
+  height: number
+  byteSize: number
+}
+
 interface ChatMessage {
   role: "user" | "assistant"
   text: string
+  attachments: ChatAttachment[]
+}
+
+/** An attachment on its way to the model. */
+interface ChatAttachmentUpload {
+  id: string
+  mediaType: string
+  fileName: string
+  dataBase64: string
 }
 
 type ChatEvent =
@@ -51,18 +69,53 @@ type ChatSession = {
   updatedAt: number
 }
 
+/**
+ * What the chat window is handed when dictation ends: the transcript (if any)
+ * and the id of the hold whose captures belong with it. `holdId` is null when
+ * the dictation produced no screenshots.
+ */
+type ChatSeed = { text: string | null; holdId: string | null }
+
 type ChatSendResult = { ok: true } | { ok: false; error: string }
 type ChatHistoryResult =
   | { ok: true; messages: ChatMessage[] }
   | { ok: false; error: string }
 type ChatSessionsResult = { ok: true; sessions: ChatSession[] } | { ok: false; error: string }
 type ChatSessionResult = { ok: true; session: ChatSession } | { ok: false; error: string }
+type ChatAttachmentDataResult =
+  | { ok: true; mediaType: string; dataBase64: string }
+  | { ok: false; error: string }
+
+/** Geometry of the display the capture overlay covers, in absolute DIPs. */
+type CaptureInfo = {
+  holdId: string
+  displayId: number
+  x: number
+  y: number
+  width: number
+  height: number
+  count: number
+  max: number
+  granted: boolean
+  permissionMessage: string
+}
+
+/** One screenshot, as the renderer needs it to stage a preview. */
+type StagedCapture = ChatAttachment & { dataBase64: string }
+
+type CaptureRectPayload = { x: number; y: number; width: number; height: number }
+
+type CaptureStagedEvent = { holdId: string; count: number; limitReached: boolean }
 
 const electronAPI = {
   platform: process.platform,
-  // The island and the chat window load the same bundle; the route tells the
-  // renderer which chrome to render.
-  windowRole: location.pathname.startsWith("/chat") ? ("chat" as const) : ("island" as const),
+  // The island, the chat window and the capture overlay load the same bundle;
+  // the route tells the renderer which surface to render.
+  windowRole: location.pathname.startsWith("/capture")
+    ? ("capture" as const)
+    : location.pathname.startsWith("/chat")
+      ? ("chat" as const)
+      : ("island" as const),
   window: {
     startDrag: () => ipcRenderer.invoke("window:start-drag"),
     moveDrag: () => ipcRenderer.send("window:drag-move"),
@@ -78,6 +131,31 @@ const electronAPI = {
       const handler = (_event: unknown, status: DictationStatus) => callback(status)
       ipcRenderer.on("dictation:status", handler)
       return () => ipcRenderer.removeListener("dictation:status", handler)
+    }
+  },
+  capture: {
+    info: () => ipcRenderer.invoke("capture:info") as Promise<CaptureInfo | null>,
+    select: (rect: CaptureRectPayload) => ipcRenderer.send("capture:select", rect),
+    cancel: () => ipcRenderer.send("capture:cancel"),
+    permission: () =>
+      ipcRenderer.invoke("capture:permission") as Promise<{
+        granted: boolean
+        status: string
+        responsible: string
+        message: string
+      }>,
+    openSettings: () => ipcRenderer.invoke("capture:open-settings") as Promise<void>,
+    consume: (holdId: string) =>
+      ipcRenderer.invoke("capture:consume", holdId) as Promise<StagedCapture[]>,
+    onShow: (callback: (info: CaptureInfo) => void) => {
+      const handler = (_event: unknown, info: CaptureInfo) => callback(info)
+      ipcRenderer.on("capture:show", handler)
+      return () => ipcRenderer.removeListener("capture:show", handler)
+    },
+    onStaged: (callback: (event: CaptureStagedEvent) => void) => {
+      const handler = (_event: unknown, payload: CaptureStagedEvent) => callback(payload)
+      ipcRenderer.on("capture:staged", handler)
+      return () => ipcRenderer.removeListener("capture:staged", handler)
     }
   },
   onGlobalShortcut: (callback: (phase: "down" | "up") => void) => {
@@ -97,15 +175,16 @@ const electronAPI = {
         ipcRenderer.invoke("ai:list-models", provider) as Promise<AiModelsResult>,
       setProvider: (provider: string) =>
         ipcRenderer.invoke("ai:set-provider", provider) as Promise<AiConfigResult>,
-      setModel: (model: string) => ipcRenderer.invoke("ai:set-model", model) as Promise<AiConfigResult>,
+      setModel: (model: string) =>
+        ipcRenderer.invoke("ai:set-model", model) as Promise<AiConfigResult>,
       setKey: (provider: string, key: string) =>
         ipcRenderer.invoke("ai:set-key", provider, key) as Promise<AiConfigResult>,
       clearKey: (provider: string) =>
         ipcRenderer.invoke("ai:clear-key", provider) as Promise<AiConfigResult>,
     },
     chat: {
-      send: (text: string, sessionId: string) =>
-        ipcRenderer.invoke("chat:send", text, sessionId) as Promise<ChatSendResult>,
+      send: (text: string, sessionId: string, attachments?: ChatAttachmentUpload[]) =>
+        ipcRenderer.invoke("chat:send", text, sessionId, attachments) as Promise<ChatSendResult>,
       history: (sessionId: string) =>
         ipcRenderer.invoke("chat:history", sessionId) as Promise<ChatHistoryResult>,
       reset: (sessionId: string) =>
@@ -118,11 +197,13 @@ const electronAPI = {
         ipcRenderer.invoke("chat:rename-session", sessionId, title) as Promise<ChatSessionResult>,
       deleteSession: (sessionId: string) =>
         ipcRenderer.invoke("chat:delete-session", sessionId) as Promise<ChatSendResult>,
+      attachmentData: (attachmentId: string) =>
+        ipcRenderer.invoke("chat:attachment-data", attachmentId) as Promise<ChatAttachmentDataResult>,
       open: (text: string) => ipcRenderer.send("chat:open", text),
-      takeInitialText: () => ipcRenderer.invoke("chat:take-initial-text") as Promise<string | null>,
+      takeInitialText: () => ipcRenderer.invoke("chat:take-initial-text") as Promise<ChatSeed | null>,
       ackInitialText: () => ipcRenderer.invoke("chat:ack-initial-text") as Promise<boolean>,
-      onInitialText: (callback: (text: string) => void) => {
-        const handler = (_event: unknown, text: string) => callback(text)
+      onInitialText: (callback: (seed: ChatSeed) => void) => {
+        const handler = (_event: unknown, seed: ChatSeed) => callback(seed)
         ipcRenderer.on("chat:initial-text", handler)
         return () => ipcRenderer.removeListener("chat:initial-text", handler)
       },
@@ -138,4 +219,20 @@ const electronAPI = {
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
 
 export type ElectronAPI = typeof electronAPI
-export type { AiCatalogResult, AiConfig, AiConfigResult, ChatEvent, ChatMessage, ChatSession, DictationStatus, ModelInfo, ProviderInfo }
+export type {
+  AiCatalogResult,
+  AiConfig,
+  AiConfigResult,
+  CaptureInfo,
+  ChatAttachment,
+  ChatAttachmentDataResult,
+  ChatAttachmentUpload,
+  ChatEvent,
+  ChatMessage,
+  ChatSeed,
+  ChatSession,
+  DictationStatus,
+  ModelInfo,
+  ProviderInfo,
+  StagedCapture
+}

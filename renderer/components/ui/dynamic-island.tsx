@@ -27,6 +27,7 @@ type SizePresets =
   | "massive"
   | "panel"
   | "panelError"
+  | "panelPermission"
   | "minimalLeading"
   | "minimalTrailing"
   | "settings"
@@ -51,6 +52,7 @@ const PRESETS: Record<SizePresets, Preset> = {
   massive:          { width: 380, height: 280 },
   panel:            { width: 180, height: 64 },
   panelError:       { width: 300, height: 80 },
+  panelPermission:  { width: 340, height: 152 },
   minimalLeading:   { width: 48,  height: 48 },
   minimalTrailing:  { width: 48,  height: 48 },
   settings:         { width: 360, height: 330 },

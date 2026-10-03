@@ -1,7 +1,8 @@
 import { and, desc, eq, sql } from "drizzle-orm"
 
 import { getDb } from "../db/index.js"
-import { chatMessages, chatSessions } from "../db/schema.js"
+import { chatAttachments, chatMessages, chatSessions } from "../db/schema.js"
+import { deleteAttachmentFiles } from "./attachments.js"
 
 export interface ChatSession {
   id: string
@@ -103,6 +104,7 @@ export async function renameSession(id: string, title: string): Promise<SessionR
 
 export async function deleteSession(id: string): Promise<OkResult> {
   try {
+    await dropSessionAttachments(id)
     const db = getDb()
     await db.delete(chatMessages).where(eq(chatMessages.sessionId, id)).run()
     await db.delete(chatSessions).where(eq(chatSessions.id, id)).run()
@@ -114,10 +116,29 @@ export async function deleteSession(id: string): Promise<OkResult> {
 
 export async function clearSessionMessages(id: string): Promise<OkResult> {
   try {
+    await dropSessionAttachments(id)
     await getDb().delete(chatMessages).where(eq(chatMessages.sessionId, id)).run()
     return { ok: true }
   } catch (err) {
     return { ok: false, error: errMessage(err, "clear session") }
+  }
+}
+
+/**
+ * Removes a session's attachment rows *and* the PNGs behind them. Leaving the
+ * files would leak a screenshot per message forever, since nothing else ever
+ * walks the screenshots directory.
+ */
+async function dropSessionAttachments(id: string): Promise<void> {
+  const db = getDb()
+  const rows = await db
+    .select({ path: chatAttachments.path })
+    .from(chatAttachments)
+    .where(eq(chatAttachments.sessionId, id))
+    .all()
+  if (rows.length > 0) {
+    await db.delete(chatAttachments).where(eq(chatAttachments.sessionId, id)).run()
+    await deleteAttachmentFiles(rows.map((row) => row.path))
   }
 }
 

@@ -2,9 +2,36 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 
+/** Attachment metadata exactly as main stores it. No bytes, no filesystem path. */
+export interface ChatAttachment {
+  id: string
+  mediaType: string
+  fileName: string
+  width: number
+  height: number
+  byteSize: number
+}
+
+/**
+ * An attachment as the UI needs it. `localSrc` is present only on the
+ * optimistic copy of a just-sent message: the renderer still holds those bytes
+ * as a data URL, so there is nothing to fetch. Once the message comes back from
+ * history the field is gone and the thumbnail is fetched by id instead.
+ */
+export type ChatAttachmentView = ChatAttachment & { localSrc?: string }
+
+/** An attachment on its way to main. */
+export interface ChatAttachmentUpload {
+  id: string
+  mediaType: string
+  fileName: string
+  dataBase64: string
+}
+
 export interface ChatMessage {
   role: "user" | "assistant"
   text: string
+  attachments: ChatAttachmentView[]
 }
 
 type ChatEvent =
@@ -15,15 +42,44 @@ type ChatEvent =
 
 // The preload cast cannot guarantee the shape of a payload from another
 // process, so coerce before it reaches state that the panel maps over.
+function normalizeAttachments(value: unknown): ChatAttachment[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return []
+    const raw = entry as Partial<ChatAttachment>
+    if (typeof raw.id !== "string" || !raw.id) return []
+    if (typeof raw.mediaType !== "string" || !raw.mediaType) return []
+    return [
+      {
+        id: raw.id,
+        mediaType: raw.mediaType,
+        fileName: typeof raw.fileName === "string" ? raw.fileName : "",
+        width: typeof raw.width === "number" ? raw.width : 0,
+        height: typeof raw.height === "number" ? raw.height : 0,
+        byteSize: typeof raw.byteSize === "number" ? raw.byteSize : 0,
+      },
+    ]
+  })
+}
+
 function normalizeMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value)) return []
   return value.flatMap((entry) => {
     if (typeof entry !== "object" || entry === null) return []
     const raw = entry as Partial<ChatMessage>
-    if (typeof raw.text !== "string" || !raw.text) return []
     const role = raw.role === "assistant" ? "assistant" : "user"
-    return [{ role, text: raw.text }]
+    const text = typeof raw.text === "string" ? raw.text : ""
+    const attachments = normalizeAttachments(raw.attachments)
+    // A message can be images with no caption, so empty text alone is not a
+    // reason to drop a row — that would silently discard attachment-only turns.
+    if (!text && attachments.length === 0) return []
+    return [{ role, text, attachments }]
   })
+}
+
+function base64ByteSize(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0
+  return Math.max(0, Math.round((base64.length * 3) / 4) - padding)
 }
 
 /**
@@ -60,7 +116,7 @@ export function useChat(sessionId: string | null) {
     setStreamingText("")
     setStreaming(false)
     if (text) {
-      setMessages((prev) => [...prev, { role: "assistant", text }])
+      setMessages((prev) => [...prev, { role: "assistant", text, attachments: [] }])
     }
   }, [])
 
@@ -125,17 +181,36 @@ export function useChat(sessionId: string | null) {
   // The session id is passed in rather than read from the closure so the first
   // message of a brand-new thread can mint its own id and send immediately.
   const send = useCallback(
-    async (text: string, targetSessionId: string) => {
+    async (text: string, targetSessionId: string, uploads?: readonly ChatAttachmentUpload[]) => {
       const trimmed = text.trim()
-      if (!trimmed || sending || !targetSessionId) return
+      const files = uploads ?? []
+      // Images with no caption are a valid message; nothing at all is not.
+      if ((!trimmed && files.length === 0) || sending || !targetSessionId) return
       // Deltas can arrive before React re-renders with the new id, so point the
       // filter at the session we are actually sending to.
       sessionIdRef.current = targetSessionId
       setError("")
       hasLocalActivityRef.current = true
-      setMessages((prev) => [...prev, { role: "user", text: trimmed }])
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "user",
+          text: trimmed,
+          // Shown from the bytes the renderer already holds, so the message
+          // renders with its thumbnails immediately rather than after a reload.
+          attachments: files.map((file) => ({
+            id: file.id,
+            mediaType: file.mediaType,
+            fileName: file.fileName,
+            width: 0,
+            height: 0,
+            byteSize: base64ByteSize(file.dataBase64),
+            localSrc: `data:${file.mediaType};base64,${file.dataBase64}`,
+          })),
+        },
+      ])
       setSending(true)
-      const result = await window.electronAPI?.chat.send(trimmed, targetSessionId)
+      const result = await window.electronAPI?.chat.send(trimmed, targetSessionId, files as ChatAttachmentUpload[])
       if (result && !result.ok) {
         setError(typeof result.error === "string" ? result.error : "The chat request failed.")
         setSending(false)
@@ -177,4 +252,35 @@ export function useChat(sessionId: string | null) {
   }, [sessionId])
 
   return { messages, streamingText, streaming, sending, error, send, history, reset, clearLocal }
+}
+
+/**
+ * Lazily resolves attachment bytes for a history thumbnail.
+ *
+ * History carries metadata only, so a conversation with a dozen screenshots
+ * would otherwise ship megabytes to draw a 200px preview. Attachments that came
+ * from the current composer already carry a `localSrc` and never hit this.
+ */
+export function useAttachmentSrc(attachment: ChatAttachmentView | undefined): string {
+  const localSrc = attachment?.localSrc
+  const id = attachment?.id
+  // The result is stored keyed by id rather than cleared on change, so the
+  // effect never has to reset state synchronously — a stale entry simply fails
+  // the `fetched.id === id` check and reads as "not loaded yet".
+  const [fetched, setFetched] = useState<{ id: string; src: string } | null>(null)
+
+  useEffect(() => {
+    if (localSrc || !id) return
+    let cancelled = false
+    void window.electronAPI?.chat.attachmentData(id).then((result) => {
+      if (cancelled || !result?.ok) return
+      setFetched({ id, src: `data:${result.mediaType};base64,${result.dataBase64}` })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [id, localSrc])
+
+  if (localSrc) return localSrc
+  return fetched && fetched.id === id ? fetched.src : ""
 }
