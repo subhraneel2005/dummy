@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { CheckIcon, CopyIcon, MicIcon, PlusIcon } from "lucide-react"
+import { CheckIcon, CopyIcon, FileTextIcon, MicIcon, PlusIcon } from "lucide-react"
 
 import {
   Conversation,
@@ -89,6 +89,18 @@ const MARKDOWN_LISTS = [
 /** Shared measure for the transcript, the hero and the composer. */
 const CHAT_COLUMN = "mx-auto w-full max-w-3xl"
 
+/**
+ * Matches the largest cap in main's attachment registry (`MAX_PDF_BYTES`).
+ *
+ * The composer reads each picked file into a base64 data URL before main ever
+ * sees it, so an unbounded 500MB file would exhaust the renderer first. This is
+ * deliberately the loosest per-type cap rather than a per-type check: main has
+ * the filename and owns the real decision, and `File.type` is empty often enough
+ * that filtering here by type would silently drop files the user picked. Main
+ * still reports the specific per-type limit when it rejects one.
+ */
+const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024
+
 // Filled bubbles rather than bare text. The prompt is the action, so it gets the
 // `primary` surface; the reply gets the quieter `secondary` one.
 //
@@ -111,6 +123,10 @@ export default function ChatWindowPage() {
   const [job, setJob] = useState<{ id: number; text: string } | null>(null)
   const jobIdRef = useRef(0)
   const [draft, setDraft] = useState("")
+  // A rejected pick (too large, too many files). Cleared as soon as the
+  // attachment list changes so the warning tracks the thing it describes.
+  const [attachmentError, setAttachmentError] = useState("")
+  const clearAttachmentError = useCallback(() => setAttachmentError(""), [])
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const [config, setConfig] = useState<{ provider: string | null; model: string | null }>({
     provider: null,
@@ -332,11 +348,15 @@ export default function ChatWindowPage() {
         uploads.push({
           id: crypto.randomUUID().replace(/-/g, ""),
           mediaType: part.mediaType,
-          fileName: part.filename || "image.png",
+          // A named default is a lie about the type — `image.png` would send a
+          // document down the image path. Main resolves an extensionless name
+          // as unsupported, which is the honest answer.
+          fileName: part.filename || "attachment",
           dataBase64,
         })
       }
       await dispatch(text, uploads)
+      setAttachmentError("")
     },
     [dispatch]
   )
@@ -468,12 +488,16 @@ export default function ChatWindowPage() {
               `border-input` (white/15%) is heavier than the hairline asked for. */}
           <PromptInput
             onSubmit={submit}
+            maxFileSize={MAX_ATTACHMENT_FILE_BYTES}
+            onError={(err) => setAttachmentError(err.message)}
             className="w-full shadow-none [&_[data-slot=input-group]]:gap-1 [&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border-border"
           >
             <ComposerHeader
               voiceActive={voiceBusy}
               voiceListening={voiceListening}
               voiceError={voiceState === "error" ? voiceError : ""}
+              attachmentError={attachmentError}
+              onClearAttachmentError={clearAttachmentError}
               onStopVoice={stopVoice}
             />
             <StagedCaptureInbox captures={staged} onConsumed={() => setStaged([])} />
@@ -547,16 +571,32 @@ function ComposerHeader({
   voiceActive,
   voiceListening,
   voiceError,
+  attachmentError,
+  onClearAttachmentError,
   onStopVoice,
 }: {
   voiceActive: boolean
   voiceListening: boolean
   voiceError: string
+  attachmentError: string
+  onClearAttachmentError: () => void
   onStopVoice: () => void
 }) {
   const attachments = usePromptInputAttachments()
   const hasFiles = attachments.files.length > 0
-  if (!voiceActive && !voiceError && !hasFiles) return null
+  const fileCount = attachments.files.length
+  const error = attachmentError || voiceError
+  // The warning describes a rejected pick, so it stops applying the moment the
+  // list it was about changes. Keyed on the count because that is the only
+  // thing a pick alters, and re-renders alone must not clear it.
+  const seenCount = useRef(fileCount)
+  useEffect(() => {
+    if (seenCount.current !== fileCount) {
+      seenCount.current = fileCount
+      onClearAttachmentError()
+    }
+  }, [fileCount, onClearAttachmentError])
+  if (!voiceActive && !error && !hasFiles) return null
 
   return (
     <PromptInputHeader>
@@ -577,12 +617,12 @@ function ComposerHeader({
         />
       ) : null}
 
-      {voiceError ? (
+      {error ? (
         <p
           role="alert"
           className="px-1 py-1.5 text-sm leading-relaxed text-destructive"
         >
-          {voiceError}
+          {error}
         </p>
       ) : null}
 
@@ -737,14 +777,42 @@ function ChatRow({ message }: { message: ChatMessage }) {
   )
 }
 
+/** Compact file size for the attachment tile. Only ever shows one decimal. */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return ""
+  if (bytes < 1024) return `${bytes} B`
+  const kb = bytes / 1024
+  if (kb < 1024) return `${Math.round(kb)} KB`
+  return `${(kb / 1024).toFixed(1)} MB`
+}
+
 /**
- * A sent screenshot. History carries metadata only, so the bytes are fetched
- * on demand — a conversation with a dozen screenshots would otherwise ship
- * megabytes to draw 200px previews. Just-sent attachments already hold their
- * own data URL and never hit the bridge.
+ * A sent attachment: a thumbnail for images, a file tile for documents.
+ *
+ * History carries metadata only, so image bytes are fetched on demand — a
+ * conversation with a dozen screenshots would otherwise ship megabytes to draw
+ * 200px previews. Just-sent images already hold their own data URL and never hit
+ * the bridge.
  */
 function MessageThumbnail({ attachment }: { attachment: ChatAttachmentView }) {
+  const isImage = attachment.mediaType.toLowerCase().startsWith("image/")
   const src = useAttachmentSrc(attachment)
+
+  if (!isImage) {
+    const size = formatBytes(attachment.byteSize)
+    return (
+      <div className="flex max-w-64 items-center gap-2.5 rounded-md border border-black/10 bg-black/[0.02] px-3 py-2">
+        <FileTextIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <div className="min-w-0">
+          <div className="truncate text-sm font-medium">
+            {attachment.fileName || "Attachment"}
+          </div>
+          {size ? <div className="text-xs text-muted-foreground">{size}</div> : null}
+        </div>
+      </div>
+    )
+  }
+
   if (!src) {
     return <div className="h-32 w-48 animate-pulse rounded-md bg-black/10" aria-hidden="true" />
   }

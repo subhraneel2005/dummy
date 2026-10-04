@@ -32,9 +32,80 @@ export interface StoredAttachment {
 }
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10
-export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
-const ALLOWED_MEDIA_TYPES = new Set(["image/png", "image/jpeg"])
+/**
+ * Byte ceilings are per category rather than one global number. 8MB is generous
+ * for a screenshot and stingy for a document, so documents get room to be
+ * documents; text is inlined into the request body, so it is held to a cap that
+ * keeps one pasted file from swamping the prompt.
+ */
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+export const MAX_PDF_BYTES = 20 * 1024 * 1024
+export const MAX_TEXTUAL_BYTES = 1024 * 1024
+
+/**
+ * What an accepted media type implies about handling.
+ *
+ * - `image` and `pdf` are sent to the model as a `FilePart` with these bytes.
+ * - `textual` is *not* a file part. It is decoded to text and inlined at
+ *   `buildUserContent`, because that is the only encoding every provider here
+ *   accepts (see `WORD_UNSUPPORTED` for why the list cannot just be widened).
+ */
+export type AttachmentKind = "image" | "pdf" | "textual"
+
+const MEDIA_TYPES = new Map<string, { kind: AttachmentKind; ext: string }>([
+  ["image/png", { kind: "image", ext: "png" }],
+  ["image/jpeg", { kind: "image", ext: "jpg" }],
+  ["application/pdf", { kind: "pdf", ext: "pdf" }],
+  ["text/markdown", { kind: "textual", ext: "md" }],
+  ["text/plain", { kind: "textual", ext: "txt" }],
+  ["text/csv", { kind: "textual", ext: "csv" }],
+])
+
+const MAX_BYTES: Record<AttachmentKind, number> = {
+  image: MAX_IMAGE_BYTES,
+  pdf: MAX_PDF_BYTES,
+  textual: MAX_TEXTUAL_BYTES,
+}
+
+/**
+ * `File.type` is empty for plenty of files picked off a disk, so the extension
+ * is the fallback that keeps `.md` and `.csv` attachable at all.
+ */
+const EXTENSION_MEDIA_TYPES = new Map<string, string>([
+  ["png", "image/png"],
+  ["jpg", "image/jpeg"],
+  ["jpeg", "image/jpeg"],
+  ["pdf", "application/pdf"],
+  ["md", "text/markdown"],
+  ["markdown", "text/markdown"],
+  ["txt", "text/plain"],
+  ["csv", "text/csv"],
+])
+
+/**
+ * Word and OpenDocument are recognised only so they can be refused by name.
+ *
+ * They cannot be widened into `MEDIA_TYPES`: OpenAI and xAI throw
+ * `UnsupportedFunctionalityError` on any inline file part that is not
+ * `application/pdf`, and Anthropic accepts only `application/pdf` and
+ * `text/plain` — Word reaches Anthropic exclusively through its Files API, which
+ * the AI SDK's prompt conversion does not use. Sending the bytes anyway would
+ * surface that provider error to the user verbatim, so it is refused here with
+ * something they can act on.
+ */
+const WORD_MEDIA_TYPES = new Set([
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-word.document.macroenabled.12",
+  "application/vnd.oasis.opendocument.text",
+])
+
+const WORD_EXTENSIONS = new Set(["doc", "docx", "odt"])
+
+const WORD_UNSUPPORTED =
+  "Word and OpenDocument files can't be attached — no AI provider here accepts " +
+  "them as a file. Export the document to PDF, or paste the text into the message."
 
 /** Zero-padded so a lexicographic sort is the capture order. */
 const SEQ_PREFIX = /^(\d{3})-/
@@ -52,8 +123,51 @@ function assertSafeId(value: string, label: string): string {
   return value
 }
 
-function extensionFor(mediaType: string): string {
-  return mediaType === "image/jpeg" ? "jpg" : "png"
+function extensionOf(fileName: string): string {
+  const match = /\.([A-Za-z0-9]+)$/.exec(fileName.trim())
+  return match?.[1]?.toLowerCase() ?? ""
+}
+
+/**
+ * The single place a media type is decided.
+ *
+ * Both storing and decoding go through this so a file cannot be accepted under
+ * one type and later written under another. A claimed type the registry knows
+ * wins; otherwise the extension decides; Word is refused on either signal.
+ */
+export function resolveMediaType(mediaType: string, fileName: string): string {
+  const claimed = (mediaType ?? "").trim().toLowerCase()
+  const ext = extensionOf(fileName)
+  if (WORD_MEDIA_TYPES.has(claimed) || WORD_EXTENSIONS.has(ext)) {
+    throw new Error(WORD_UNSUPPORTED)
+  }
+  if (MEDIA_TYPES.has(claimed)) return claimed
+  const fromExt = EXTENSION_MEDIA_TYPES.get(ext)
+  if (fromExt) return fromExt
+  throw new Error(`Unsupported attachment type: ${claimed || fileName || "unknown"}`)
+}
+
+function entryFor(mediaType: string): { kind: AttachmentKind; ext: string } {
+  const entry = MEDIA_TYPES.get(mediaType)
+  if (!entry) throw new Error(`Unsupported attachment type: ${mediaType}`)
+  return entry
+}
+
+export function attachmentKind(mediaType: string): AttachmentKind {
+  return entryFor(mediaType).kind
+}
+
+export function isImageMediaType(mediaType: string): boolean {
+  return MEDIA_TYPES.get(mediaType)?.kind === "image"
+}
+
+/** The cap a given type is held to, phrased for an error message. */
+export function maxBytesFor(mediaType: string): number {
+  return MAX_BYTES[entryFor(mediaType).kind]
+}
+
+function maxMb(bytes: number): string {
+  return `${Math.round(bytes / 1024 / 1024)}MB`
 }
 
 /** Keeps a readable name without letting the renderer shape the path. */
@@ -63,7 +177,7 @@ function safeFileName(name: string, mediaType: string): string {
     .replace(/\.[^.]*$/, "")
     .replace(/[^\w.-]/g, "_")
     .slice(0, 80)
-  return `${stem || "image"}.${extensionFor(mediaType)}`
+  return `${stem || "attachment"}.${entryFor(mediaType).ext}`
 }
 
 /** Decoded pixel size, or 0x0 if the bytes are not a readable image. */
@@ -84,8 +198,13 @@ function stagingRoot(): string {
   return path.join(screenshotsDir(), "staging")
 }
 
-export function isAllowedMediaType(mediaType: string): boolean {
-  return ALLOWED_MEDIA_TYPES.has(mediaType)
+export function isAllowedMediaType(mediaType: string, fileName = ""): boolean {
+  try {
+    resolveMediaType(mediaType, fileName)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -202,25 +321,32 @@ export async function storeAttachment(
   fileName: string,
 ): Promise<StoredAttachment> {
   assertSafeId(rendererId, "attachment id")
-  if (!isAllowedMediaType(mediaType)) {
-    throw new Error(`Unsupported attachment type: ${mediaType}`)
+  const resolved = resolveMediaType(mediaType, fileName)
+  const limit = maxBytesFor(resolved)
+  if (bytes.byteLength > limit) {
+    throw new Error(`Attachment is larger than ${maxMb(limit)}.`)
   }
   const dir = screenshotsDir()
   await fs.mkdir(dir, { recursive: true })
 
   const id = randomUUID()
-  const storedName = safeFileName(fileName, mediaType)
-  const filePath = path.join(dir, `${id}.${extensionFor(mediaType)}`)
+  const storedName = safeFileName(fileName, resolved)
+  const filePath = path.join(dir, `${id}.${entryFor(resolved).ext}`)
   await fs.writeFile(filePath, bytes)
 
-  const { width, height } = imageSize(bytes)
+  // Dimensions only mean something for images. Documents and text are stored as
+  // 0x0 rather than a nullable column, because nothing reads width/height for
+  // layout and a migration would buy nothing.
+  const size = isImageMediaType(resolved)
+    ? imageSize(bytes)
+    : { width: 0, height: 0 }
   return {
     id,
-    mediaType,
+    mediaType: resolved,
     fileName: storedName,
     path: filePath,
-    width,
-    height,
+    width: size.width,
+    height: size.height,
     byteSize: bytes.byteLength,
   }
 }
@@ -231,37 +357,45 @@ export function decodeAttachment(
   mediaType: string,
   fileName: string,
   dataBase64: string,
-): { bytes: Buffer; width: number; height: number } {
+): { bytes: Buffer; mediaType: string; width: number; height: number } {
   assertSafeId(id, "attachment id")
-  if (!isAllowedMediaType(mediaType)) {
-    throw new Error(`Unsupported attachment type: ${mediaType}`)
-  }
+  const resolved = resolveMediaType(mediaType, fileName)
   if (typeof dataBase64 !== "string" || dataBase64.length === 0) {
     throw new Error("Attachment is empty.")
   }
+  const limit = maxBytesFor(resolved)
   // Base64 expands by 4/3, so an oversized payload is rejected from its encoded
   // length instead of being decoded into memory first.
-  const maxEncoded = Math.ceil((MAX_ATTACHMENT_BYTES * 4) / 3) + 4
+  const maxEncoded = Math.ceil((limit * 4) / 3) + 4
   if (dataBase64.length > maxEncoded) {
-    throw new Error(
-      `Attachment is larger than ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB.`,
-    )
+    throw new Error(`Attachment is larger than ${maxMb(limit)}.`)
   }
 
   const bytes = Buffer.from(dataBase64, "base64")
   if (bytes.byteLength === 0) throw new Error("Attachment is empty.")
-  if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
-    throw new Error(
-      `Attachment is larger than ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB.`,
-    )
+  if (bytes.byteLength > limit) {
+    throw new Error(`Attachment is larger than ${maxMb(limit)}.`)
   }
 
-  // Also rejects non-image bytes that happen to be under the size cap: the model
-  // would reject them later with a far less specific error.
-  const { width, height } = imageSize(bytes)
-  if (width === 0 || height === 0) throw new Error("Attachment is not a readable image.")
+  if (isImageMediaType(resolved)) {
+    // Rejects bytes that are not actually an image: the model would otherwise
+    // reject them later with a far less specific error.
+    const size = imageSize(bytes)
+    if (size.width === 0 || size.height === 0) throw new Error("Attachment is not a readable image.")
+    return { bytes, mediaType: resolved, width: size.width, height: size.height }
+  }
 
-  return { bytes, width, height }
+  if (attachmentKind(resolved) === "pdf" && bytes.subarray(0, 5).toString("latin1") !== "%PDF-") {
+    throw new Error("Attachment is not a readable PDF.")
+  }
+
+  // Text is inlined into the prompt, so binary masquerading as `.txt` would put
+  // mojibake in front of the model. A NUL in the first chunk is enough to tell.
+  if (attachmentKind(resolved) === "textual" && bytes.subarray(0, 2048).includes(0)) {
+    throw new Error("Attachment is not a readable text file.")
+  }
+
+  return { bytes, mediaType: resolved, width: 0, height: 0 }
 }
 
 /** Removes files for deleted messages/sessions. Missing files are not an error. */

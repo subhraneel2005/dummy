@@ -83,6 +83,15 @@ function base64ByteSize(base64: string): number {
 }
 
 /**
+ * Mirrors the image rule in main's attachment registry. Kept as a prefix test
+ * rather than an allowlist so a new image type shows a preview instead of
+ * silently rendering as a document.
+ */
+function isImageType(mediaType: string): boolean {
+  return mediaType.toLowerCase().startsWith("image/")
+}
+
+/**
  * Chat state for a single session. Changing `sessionId` swaps the whole
  * conversation: the stream tail is dropped and the new session's history loads.
  */
@@ -205,7 +214,12 @@ export function useChat(sessionId: string | null) {
             width: 0,
             height: 0,
             byteSize: base64ByteSize(file.dataBase64),
-            localSrc: `data:${file.mediaType};base64,${file.dataBase64}`,
+            // Only images are previewed, so only images need a data URL. Handing
+            // a document's bytes to the UI as well would build a base64 string
+            // the size of the file for an icon that never reads it.
+            ...(isImageType(file.mediaType)
+              ? { localSrc: `data:${file.mediaType};base64,${file.dataBase64}` }
+              : {}),
           })),
         },
       ])
@@ -260,17 +274,21 @@ export function useChat(sessionId: string | null) {
  * History carries metadata only, so a conversation with a dozen screenshots
  * would otherwise ship megabytes to draw a 200px preview. Attachments that came
  * from the current composer already carry a `localSrc` and never hit this.
+ *
+ * Non-image attachments are skipped outright: they render as a file icon, so
+ * fetching a PDF's bytes to display a glyph would be pure waste.
  */
 export function useAttachmentSrc(attachment: ChatAttachmentView | undefined): string {
   const localSrc = attachment?.localSrc
   const id = attachment?.id
+  const fetchable = attachment ? isImageType(attachment.mediaType) : false
   // The result is stored keyed by id rather than cleared on change, so the
   // effect never has to reset state synchronously — a stale entry simply fails
   // the `fetched.id === id` check and reads as "not loaded yet".
   const [fetched, setFetched] = useState<{ id: string; src: string } | null>(null)
 
   useEffect(() => {
-    if (localSrc || !id) return
+    if (localSrc || !id || !fetchable) return
     let cancelled = false
     void window.electronAPI?.chat.attachmentData(id).then((result) => {
       if (cancelled || !result?.ok) return
@@ -279,7 +297,7 @@ export function useAttachmentSrc(attachment: ChatAttachmentView | undefined): st
     return () => {
       cancelled = true
     }
-  }, [id, localSrc])
+  }, [id, localSrc, fetchable])
 
   if (localSrc) return localSrc
   return fetched && fetched.id === id ? fetched.src : ""

@@ -7,12 +7,15 @@ import { getDb, type Db } from "../db/index.js"
 import { chatAttachments, chatMessages } from "../db/schema.js"
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
+  attachmentKind,
   decodeAttachment,
   deleteAttachmentFiles,
+  resolveMediaType,
   storeAttachment,
   type StoredAttachment,
 } from "./attachments.js"
-import { resolveModel } from "./provider.js"
+import { resolveModelWithProvider, supportsInlineDocuments } from "./provider.js"
+import { PROVIDER_INFO, type ProviderId } from "./models.js"
 import { autoTitleSession, clearSessionMessages, ensureSession, touchSession } from "./sessions.js"
 
 /**
@@ -188,6 +191,21 @@ async function loadHistory(sessionId: string): Promise<ModelMessage[]> {
   return (await loadRows(sessionId)).map((row) => ({ role: row.role, content: row.text }))
 }
 
+/**
+ * Text attachments become a `TextPart`, never a `FilePart`.
+ *
+ * Every provider accepts text parts, but they disagree sharply about file parts:
+ * OpenAI takes only `application/pdf`, Anthropic only `application/pdf` and
+ * `text/plain`, Google passes the media type through, and xAI refuses any inline
+ * non-image file. One encoding that works on all of them is a text part, so that
+ * is what a `.md` becomes — the only variant a user can attach to any provider.
+ * `scripts/provider-compat.mjs` asserts this matrix against the installed
+ * adapters, since a provider upgrade can change it without touching this file.
+ *
+ * Inlining also suits how this app stores history: as plain text. A document read
+ * this way stays in context on later turns, where a re-read file part would have
+ * to be re-sent every time.
+ */
 async function buildUserContent(
   text: string,
   attachments: readonly StoredAttachment[],
@@ -195,6 +213,14 @@ async function buildUserContent(
   if (attachments.length === 0) return text
   const parts: Array<TextPart | FilePart> = []
   for (const attachment of attachments) {
+    if (attachmentKind(attachment.mediaType) === "textual") {
+      const body = (await readFile(attachment.path)).toString("utf8")
+      parts.push({
+        type: "text",
+        text: `--- ${attachment.fileName} ---\n${body}\n--- end of ${attachment.fileName} ---`,
+      })
+      continue
+    }
     parts.push({
       type: "file",
       mediaType: attachment.mediaType,
@@ -251,7 +277,11 @@ function validateAttachments(raw: unknown): IncomingAttachment[] {
     if (typeof item.dataBase64 !== "string") throw new Error("Attachment is missing its data.")
     return {
       id: item.id,
-      mediaType: item.mediaType,
+      // Resolved here, before anything is written, so an unsupported type is
+      // refused with its own message rather than behind a "Failed to save
+      // message" prefix — and so the capability check below sees a real type
+      // instead of the renderer's possibly-empty `File.type`.
+      mediaType: resolveMediaType(item.mediaType, item.fileName),
       fileName: item.fileName,
       dataBase64: item.dataBase64,
     }
@@ -277,11 +307,27 @@ export async function sendChatMessage(
   if (!trimmed && attachments.length === 0) return { ok: false, error: "Message is empty." }
 
   let agent: ToolLoopAgent
+  let provider: ProviderId
   try {
-    agent = new ToolLoopAgent({ model: await resolveModel(), instructions: CHAT_INSTRUCTIONS })
+    const resolved = await resolveModelWithProvider()
+    provider = resolved.provider
+    agent = new ToolLoopAgent({ model: resolved.model, instructions: CHAT_INSTRUCTIONS })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { ok: false, error: message }
+  }
+
+  // Checked before the transaction rather than after: persisting the message and
+  // its attachment rows and then refusing would leave a stored turn the model
+  // never answered.
+  if (!supportsInlineDocuments(provider)) {
+    const document = attachments.find((a) => attachmentKind(a.mediaType) === "pdf")
+    if (document) {
+      return {
+        ok: false,
+        error: `${PROVIDER_INFO[provider].label} cannot read PDF attachments. Paste the text, or attach an image of the page.`,
+      }
+    }
   }
 
   let messages: ModelMessage[]
@@ -302,7 +348,10 @@ export async function sendChatMessage(
       const messageId = await insertMessage(tx, sessionId, "user", trimmed)
       const records: StoredAttachment[] = []
       for (const [index, attachment] of attachments.entries()) {
-        const { bytes } = decodeAttachment(
+        // The resolved type is what gets persisted, so a file the renderer
+        // reported with an empty or wrong `File.type` is stored — and later sent
+        // to the model — as the type its bytes actually are.
+        const { bytes, mediaType } = decodeAttachment(
           attachment.id,
           attachment.mediaType,
           attachment.fileName,
@@ -313,7 +362,7 @@ export async function sendChatMessage(
         const record = await storeAttachment(
           attachment.id,
           bytes,
-          attachment.mediaType,
+          mediaType,
           attachment.fileName,
         )
         writtenPaths.push(record.path)

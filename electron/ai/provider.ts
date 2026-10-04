@@ -36,11 +36,31 @@ function createProviderModel(provider: ProviderId, apiKey: string, modelId: stri
 }
 
 /**
+ * Whether a provider can read a PDF sent as an inline file part.
+ *
+ * Verified against the installed adapters: OpenAI (`input_file`), Anthropic
+ * (`document`) and Google (`inlineData`) all serialize one, and xAI's Responses
+ * API accepts only a URL or a Files API reference for non-image files, throwing
+ * `UnsupportedFunctionalityError` on inline bytes. Neither alternative is wired
+ * up here, so the caller refuses a PDF for xAI rather than surfacing that error
+ * mid-stream. Images and inlined text work on every provider.
+ */
+export function supportsInlineDocuments(provider: ProviderId): boolean {
+  return provider !== "xai"
+}
+
+/** The live model plus which provider it came from, for capability checks. */
+export interface ResolvedModel {
+  model: LanguageModel
+  provider: ProviderId
+}
+
+/**
  * Builds a live model instance from the persisted provider/model/key. The key is
  * decrypted here and handed straight to the provider factory; it is never
  * returned, logged, or sent over IPC.
  */
-export async function resolveModel(): Promise<LanguageModel> {
+export async function resolveModelWithProvider(): Promise<ResolvedModel> {
   const provider = await getProvider()
   if (!provider || !isProviderId(provider)) throw new NoProviderConfiguredError()
 
@@ -50,5 +70,9 @@ export async function resolveModel(): Promise<LanguageModel> {
   const apiKey = await getProviderKey(provider)
   if (!apiKey) throw new MissingApiKeyError(provider)
 
-  return createProviderModel(provider, apiKey, modelId)
+  return { model: createProviderModel(provider, apiKey, modelId), provider }
+}
+
+export async function resolveModel(): Promise<LanguageModel> {
+  return (await resolveModelWithProvider()).model
 }

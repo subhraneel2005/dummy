@@ -8,7 +8,8 @@
     "dev": "sh scripts/dev.sh",
     "dev:electron": "npm run build && electron .",
     "setup:whisper": "sh scripts/setup-whisper.sh",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "test:providers": "node scripts/provider-compat.mjs"
   },
   "keywords": [],
   "author": "",
