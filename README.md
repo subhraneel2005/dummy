@@ -1,6 +1,12 @@
 <div align="center">
 
+<div style="display:inline-flex; align-items:center; gap:.6rem">
+
+<img src="renderer/public/bloub-nuage-excite-bleu-anime.svg" width="150" height="150" alt="dummy logo" />
+
 # dummy
+
+</div>
 
 A local-first AI assistant for macOS — push-to-talk dictation, circle-capture screenshots, and a tool-using chat with an embedded browser, all running on your own machine with your own API keys.
 
