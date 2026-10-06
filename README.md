@@ -8,13 +8,15 @@
 
 </div>
 
-A local-first AI assistant for macOS — push-to-talk dictation, circle-capture screenshots, and a tool-using chat with an embedded browser, all running on your own machine with your own API keys.
+A local-first AI assistant for macOS, Linux & Windows — push-to-talk dictation, circle-capture screenshots, and a tool-using chat with an embedded browser, all running on your own machine with your own API keys.
 
 </div>
 
 <div align="center">
 
-![macOS](https://img.shields.io/badge/platform-macOS-333333?logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
 ![Electron 44](https://img.shields.io/badge/Electron-44.3.0-47848F?logo=electron&logoColor=white)
 ![AI SDK 7](https://img.shields.io/badge/AI%20SDK-7.0.114-000000?logo=vercel&logoColor=white)
 ![Next.js 16](https://img.shields.io/badge/Next.js-16.3.5-000000?logo=nextdotjs&logoColor=white)
@@ -29,9 +31,9 @@ A local-first AI assistant for macOS — push-to-talk dictation, circle-capture 
 
 ## What this is
 
-**dummy** is a local desktop AI companion for macOS. Hit **Alt+D**, hold the key, and speak — the audio is transcribed **locally** with whisper.cpp, cleaned up by your chosen model, and copied to your clipboard. Drag a rectangle over anything on screen to attach it as an image. Drop the transcript into a persistent chat that can also **open an embedded browser and act on websites for you** — reading, clicking, typing, and saving PDFs, with an approve/deny prompt only for actions that leave the page behind.
+**dummy** is a local desktop AI companion for macOS, Linux & Windows. Hit **Alt+D**, hold the key, and speak — the audio is transcribed **locally** with whisper.cpp, cleaned up by your chosen model, and copied to your clipboard. Drag a rectangle over anything on screen to attach it as an image. Drop the transcript into a persistent chat that can also **open an embedded browser and act on websites for you** — reading, clicking, typing, and saving PDFs, with an approve/deny prompt only for actions that leave the page behind.
 
-Everything is local-first: your API keys are encrypted with the macOS keychain (`safeStorage`), and your chat history, attachments, and settings live in a local SQLite database. No cloud account, no telemetry, no child servers.
+Everything is local-first: your API keys are encrypted with the **OS keychain** (`safeStorage` — Keychain on macOS, DPAPI on Windows, libsecret on Linux), and your chat history, attachments, and settings live in a local SQLite database. No cloud account, no telemetry, no child servers.
 
 ## Key features
 
@@ -88,9 +90,10 @@ Everything is local-first: your API keys are encrypted with the macOS keychain (
 
 ### Prerequisites
 
-- macOS (Apple Silicon recommended — dev target)
+- **macOS**, **Linux**, or **Windows** (macOS and Linux are the actively developed targets; Windows builds whisper.cpp from source)
 - Node.js 24+ (Electron 44 bundles Node 24.20)
-- Xcode Command Line Tools, `cmake`, `git` (for the whisper.cpp build)
+- `cmake` + `git`
+- A C++ toolchain for the whisper.cpp build — macOS: Xcode Command Line Tools; Linux: `build-essential` (GCC/clang); Windows: Visual Studio C++ Build Tools or WSL
 - Google Chrome installed only if you intend to use the planned deep-task lane
 
 ### Install & run
@@ -101,6 +104,7 @@ Everything is local-first: your API keys are encrypted with the macOS keychain (
 (cd renderer  && npm install)
 
 # 2. Local whisper (one-time; builds whisper.cpp + downloads base.en)
+#    Windows: run the same command from Git Bash, or build whisper-cli yourself
 (cd electron && npm run setup:whisper)
 
 # 3. Run — builds main + preload, launches Electron with the renderer
