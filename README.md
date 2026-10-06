@@ -1,8 +1,8 @@
 <div align="center">
 
-<div style="display:inline-flex; align-items:center; gap:.6rem">
+<div style="display:inline-flex; align-items:center;">
 
-<img src="renderer/public/bloub-nuage-excite-bleu-anime.svg" width="150" height="150" alt="dummy logo" />
+<img src="renderer/public/bloub-nuage-excite-bleu-anime.svg" width="70" height="70" alt="dummy logo" />
 
 # dummy
 
