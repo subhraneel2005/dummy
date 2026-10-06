@@ -649,7 +649,7 @@ island  (Alt+D down/up, holds focus)
 | **changed** | `ChatMessage` | `+ attachments: ChatAttachment[]` |
 
 ### Security note
-- `chat:send` validates attachment count, a `mediaType` allowlist (`image/png`, `image/jpeg`), and a per-file byte cap.
+- `chat:send` validates attachment count, a `mediaType` allowlist, and a per-file byte cap. (Originally `image/png` + `image/jpeg` — **superseded by Feature 4.5**, which adds PDF, Markdown, plain text, and CSV with per-category caps, content sniffing, and Word refusal.)
 - **Main derives the on-disk path itself from the attachment id** — the renderer never supplies a filesystem path ⇒ no path-traversal surface.
 - Captured screenshots can contain anything on screen (passwords, tokens, private messages). They are stored unencrypted in `userData`, same class of trust as the unencrypted `chat_messages` body. Stated explicitly so it is a conscious choice, not an oversight.
 
@@ -733,6 +733,52 @@ island  (Alt+D down/up, holds focus)
 - Should the capture overlay dim the underlying app more strongly (e.g. `0.35`) for maximum contrast, or is `0.18` the right "mild" level?
 - Packaging: add `NSScreenCaptureUsageDescription` via builder `extendInfo` once a packaging config exists (blocked on the same gap as F2 Phase 0).
 - Future: an explicit "attach this previous screenshot again" affordance, enabled by decision 3 leaving the files on disk.
+
+---
+
+## Feature 4.5 — Document & Text Attachments (PDF, Markdown, plain text, CSV)
+
+> **Status: shipped** (commit `654cc9c`). Extends the F4 multimodal send path from images-only to the full category set. Not planned in the original F4 doc — F4 shipped with a `mediaType` allowlist of `image/png` + `image/jpeg`; this feature widened it and documents the resulting provider matrix.
+
+### Goal
+Attach **PDF, Markdown, plain text, or CSV** to any chat message alongside images. Attachments are split into three categories, each with its own byte cap and its own path to the model.
+
+### Categories (`electron/ai/attachments.ts`)
+- **`image`** (`image/png`, `image/jpeg`) → `FilePart` with the raw bytes (F4 path). Cap **8 MB**.
+- **`pdf`** (`application/pdf`) → `FilePart` with the raw bytes. Cap **20 MB**.
+- **`textual`** (`text/markdown`, `text/plain`, `text/csv`) → **`TextPart`, never a `FilePart`** — decoded to UTF-8 and inlined as `--- file ---\n<body>\n--- end of file ---` at `buildUserContent` (`chat.ts:569`). Cap **1 MB**.
+
+### Why text is inlined instead of sent as a file part (verified against the installed adapters — NOT from memory)
+The providers disagree sharply about inline non-image file parts:
+| Provider | Inline file parts |
+|---|---|
+| OpenAI | `application/pdf` only |
+| Anthropic | `application/pdf` and `text/plain` only |
+| Google | passes the media type through |
+| xAI | refuses any inline non-image file |
+
+Therefore:
+- **Text is always a `TextPart`** — the only encoding every provider accepts, so `.md` attaches on any provider.
+- **Word/OpenDocument are refused by name** (`application/msword`, `docx`, `odt`, …) with an actionable error ("Export the document to PDF, or paste the text into the message"). Sending the bytes anyway would surface the provider's own `UnsupportedFunctionalityError` verbatim; Anthropic only reaches Word through its Files API, which the AI SDK's prompt conversion does not use — so the list cannot just be widened.
+- **PDF is refused pre-flight for xAI** — `supportsInlineDocuments(provider)` in `ai/provider.ts:48` gates `sendChatMessage` before the transaction writes anything, so the user gets `"xAI cannot read PDF attachments. Paste the text, or attach an image of the page."` instead of a mid-stream provider error.
+- **`scripts/provider-compat.mjs` asserts this matrix** against the installed adapters (`pdf file part: { openai: true, anthropic: true, google: true, xai: false }`), so a provider upgrade that changes its file-part support fails the test suite before it breaks the app.
+
+### Hardening (the file never reaches the model until it has been checked)
+- **Content sniffing** at `decodeAttachment` (`attachments.ts:355`): claims must be *readable*, not just claimed — images must decode (`nativeImage`), PDFs must start with the `%PDF-` magic, and text must have no NUL in the first 2 KiB (a binary masquerading as `.txt` would otherwise put mojibake in the prompt).
+- **Byte caps are per category** and enforced twice — on the base64 length *before* decoding (base64 expands 4/3, so an oversized payload is rejected without being decoded into memory first) and on the decoded bytes after.
+- **Extension fallback** for empty `File.type` (`EXTENSION_MEDIA_TYPES`, `attachments.ts:75`) — picking a `.md`/`.csv` off disk yields `File.type === ""` in Chromium, so the extension decides. `resolveMediaType` remains the single place a type is decided, so a file cannot be accepted under one type and stored under another.
+- **`MAX_ATTACHMENTS_PER_MESSAGE = 10`** (was 5 in the F4 plan; raised with the widened category set) and the same id-validation / main-derived-path rules as F4 — the renderer never supplies a filesystem path.
+
+### History note
+Inlining has a pay-off beyond portability: history is stored as plain text, so a document read this way **stays in the model's context on later turns** — a re-sent `FilePart` would have to be re-fetched every time. This is the mirror of F4 decision 3, and here it works *with* the history design instead of against it.
+
+### Reused, not rewritten
+- `storeAttachment` / `deleteAttachmentFiles` / `getAttachmentData` (thumbnail path) — unchanged, generalize across categories; non-image rows store `width/height = 0x0` (nothing reads them for layout), avoiding a nullable-column migration.
+- F4's `FilePart` construction, `chat_attachments` table, and the `AttachmentsProvider` UI — unchanged.
+
+### Validation
+- Committed with: per-category caps + sniffing covered by the `provider-compat.mjs` matrix run (`npm run test:providers`) and by the send-path refusal tests; `tsc -b` + preload + renderer typecheck green.
+- [ ] Manual: attach a PDF + let the model read a markdown file + confirm Word is refused with the friendly message (needs a real provider key)
 
 ---
 
@@ -955,6 +1001,7 @@ Realistically: usable, but expect macOS to swap during heavy pages. Do not let t
 - [x] `npm run test:browser` (`electron/scripts/browser-smoke.mjs`) green — covers CDP attach, snapshot, refs, navigation, inputs, screenshot, PDF, **and the panel rectangle / collapse / resize contract**; run repeatedly to catch the frame-timing flake it originally had
 - [x] `npm run test:providers` green
 - [x] Headless smoke (`npm run test:approvals`, `electron/scripts/approval-smoke.mjs`): approval parks with nothing executed → approve → tool executes → model answers; deny → tool never runs → model is told and still answers; automatic approval leaves the user no decision. Offline, mocked at `fetch` like `provider-compat.mjs`.
+- [x] **Resume-shape regression assertions** in `approval-smoke.mjs`: the resumed request must still open with the original user turn, and a `tool-approval-response` must never reach the provider. Proven non-vacuous — reverting the resume to the old replace-shape fails both assertions with `first message role is assistant`.
 - [ ] Headless smoke: abort while parked → no hang, no orphaned approval — needs `ai/chat.ts` to be importable outside Electron, which it is not yet
 - [x] `npm test` chains all three suites (providers, approvals, browser panel)
 - [ ] Manual: "open example.com and tell me the heading" — end to end with a real key
@@ -968,6 +1015,7 @@ Realistically: usable, but expect macOS to swap during heavy pages. Do not let t
 - **Scrolling is done in JS, not `DOM.scrollIntoViewIfNeeded`.** The CDP call blocks on a compositor frame; in a collapsed panel there may never be one, which turned every click into a five-second stall before it was dispatched at stale coordinates.
 - **An auto-approved tool still emits an approval request.** It carries `isAutomatic` and is answered by the SDK before the stream moves on. The loop must skip those, because parking on one waits forever for a decision no card will ever ask for.
 - **Reads and clicks are auto-approved; only writes are gated.** `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_screenshot`, `browser_click` and `browser_go` never prompt. `browser_type` (it can submit a form) and `browser_save_pdf` (it writes a file) do.
+- **The approval resume must EXTEND the running message list, never replace it.** `StreamTextResult.responseMessages` contains only what the call *produced* (its steps plus tool messages derived from approvals in its input) — the input messages are not part of it. The original resume did `[...await result.responseMessages, approvalMsg]`, which dropped the user turn and history; the next request then opened with an assistant function call and **Gemini 400'd** ("Please ensure that function call turn comes immediately after a user turn or after a function response turn"). OpenAI tolerates an assistant-first prompt, so the bug was invisible until a provider that validates turn order was used and invisible to the then-current smoke test, which had replicated the same shape. Fixed by appending: `[...workingMessages, ...(await result.responseMessages), approvalMsg]`, and pinned by the resume-shape assertions above.
 
 ---
 
@@ -1126,3 +1174,4 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 - Local command execution ("draft a reply").
 - Chat-scoped dictation (mic for follow-ups).
 - Multiple chat sessions in the UI (the `chat_messages.session_id` column is already there).
+- **Compact tool-trace summary with the final reply.** Today the live tool timeline for the F5 browser (and any future tool) clears when the final response arrives; keep the traces but collapse them into a one-line-per-tool strip beside the final LLM answer so "what the assistant did" survives the turn without filling the thread.
