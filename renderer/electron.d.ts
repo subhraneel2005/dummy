@@ -29,6 +29,21 @@ type AiModelsResult =
   | { ok: true; models: ModelInfo[] }
   | { ok: false; error: string; models?: ModelInfo[] }
 
+interface AiWipeCounts {
+  messages: number
+  sessions: number
+  attachments: number
+  attachmentsBytes: number
+  toolCalls: number
+  savedKeys: number
+}
+type AiWipeResult =
+  | { ok: true; counts: AiWipeCounts; freedBytes: number }
+  | { ok: false; error: string }
+type AiImagesDeleteResult =
+  | { ok: true; deleted: number; freedBytes: number }
+  | { ok: false; error: string }
+
 interface ChatAttachment {
   id: string
   mediaType: string
@@ -211,6 +226,8 @@ declare global {
         setModel: (model: string) => Promise<AiConfigResult>
         setKey: (provider: string, key: string) => Promise<AiConfigResult>
         clearKey: (provider: string) => Promise<AiConfigResult>
+        wipeAllData: () => Promise<AiWipeResult>
+        deleteAllImages: () => Promise<AiImagesDeleteResult>
       }
       chat: {
         send: (

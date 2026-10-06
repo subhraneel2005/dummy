@@ -33,6 +33,21 @@ type AiCatalogResult = {
 }
 type AiModelsResult = { ok: true; models: ModelInfo[] } | { ok: false; error: string; models?: ModelInfo[] }
 
+interface AiWipeCounts {
+  messages: number
+  sessions: number
+  attachments: number
+  attachmentsBytes: number
+  toolCalls: number
+  savedKeys: number
+}
+type AiWipeResult =
+  | { ok: true; counts: AiWipeCounts; freedBytes: number }
+  | { ok: false; error: string }
+type AiImagesDeleteResult =
+  | { ok: true; deleted: number; freedBytes: number }
+  | { ok: false; error: string }
+
 interface ChatAttachment {
   id: string
   mediaType: string
@@ -237,6 +252,9 @@ const electronAPI = {
         ipcRenderer.invoke("ai:set-key", provider, key) as Promise<AiConfigResult>,
       clearKey: (provider: string) =>
         ipcRenderer.invoke("ai:clear-key", provider) as Promise<AiConfigResult>,
+      wipeAllData: () => ipcRenderer.invoke("ai:delete-all-data") as Promise<AiWipeResult>,
+      deleteAllImages: () =>
+        ipcRenderer.invoke("ai:delete-all-attachments") as Promise<AiImagesDeleteResult>,
     },
     chat: {
       send: (text: string, sessionId: string, attachments?: ChatAttachmentUpload[]) =>
@@ -302,6 +320,9 @@ export type {
   AiCatalogResult,
   AiConfig,
   AiConfigResult,
+  AiImagesDeleteResult,
+  AiWipeCounts,
+  AiWipeResult,
   CaptureInfo,
   ChatAttachment,
   ChatAttachmentDataResult,

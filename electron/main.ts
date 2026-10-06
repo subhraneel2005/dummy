@@ -31,6 +31,7 @@ import {
 } from "./ai/chat.js"
 import { listProviderModels } from "./ai/catalog.js"
 import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
+import { deleteAllAttachments, deleteAllData } from "./ai/data.js"
 import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
 import { polishTranscript } from "./ai/polish.js"
 import {
@@ -787,6 +788,35 @@ function registerIpcHandlers() {
       return Promise.resolve({ ok: false as const, error: `Unknown provider: ${provider}` })
     }
     return listProviderModels(provider)
+  })
+
+  // Destructive. A wipe frees the local DB *and* the bytes behind it, so the
+  // in-flight turn and the embedded page are torn down first, then every row
+  // goes in one transaction and the screenshots/deep-task directories are
+  // removed. The renderer reloads after a successful wipe (see
+  // `use-ai-settings`), which is what drops the now-stale sessions and history
+  // from its state.
+  const errText = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+  ipcMain.handle("ai:delete-all-attachments", async () => {
+    try {
+      stopActiveStream()
+      const result = await deleteAllAttachments()
+      return { ok: true as const, ...result }
+    } catch (err) {
+      return { ok: false as const, error: errText(err) }
+    }
+  })
+
+  ipcMain.handle("ai:delete-all-data", async () => {
+    try {
+      stopActiveStream()
+      closeBrowser()
+      const result = await deleteAllData()
+      return { ok: true as const, ...result }
+    } catch (err) {
+      return { ok: false as const, error: errText(err) }
+    }
   })
 
   ipcMain.on("dictation:audio", async (event, wav: ArrayBuffer) => {

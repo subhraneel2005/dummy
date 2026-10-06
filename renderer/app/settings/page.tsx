@@ -1,16 +1,28 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useEffect, useId } from "react"
+import { useEffect, useId, useState } from "react"
 import {
   ArrowLeftIcon,
   CircleAlert,
   CircleCheck,
   ExternalLink,
+  ImageOff,
   KeyRound,
+  Trash2,
 } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
@@ -51,6 +63,10 @@ export default function SettingsPage() {
     selectModel,
     saveKey,
     clearKey,
+    dataBusy,
+    dataNote,
+    deleteAllData,
+    deleteAllImages,
   } = useAiSettings()
 
   useEffect(() => {
@@ -63,6 +79,10 @@ export default function SettingsPage() {
   const modelOptions = liveModels.length
     ? liveModels
     : (models[config.provider ?? ""] ?? [])
+
+  // Which destructive action is awaiting confirmation, if any. Opening the
+  // modal puts its answer here; confirming runs the action, cancel clears it.
+  const [pendingDelete, setPendingDelete] = useState<"all" | "images" | null>(null)
 
   return (
     <div className="min-h-dvh bg-background">
@@ -80,7 +100,7 @@ export default function SettingsPage() {
             Back to chat
           </Button>
           <h1 className="text-2xl font-bold tracking-tight text-balance">
-            AI Settings
+            Settings
           </h1>
           <p className="mt-1 text-sm text-pretty text-muted-foreground">
             Choose a provider, pick a model, and store the API key on this
@@ -284,6 +304,82 @@ export default function SettingsPage() {
                 </p>
               )}
             </section>
+
+            <Separator />
+
+            <section aria-labelledby="data-heading" className="space-y-3">
+              <h2 id="data-heading" className="text-sm font-medium tracking-tight">
+                Data &amp; privacy
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Everything here stays on this device: chat history, uploaded
+                images and saved API keys live in a local database and a
+                screenshots folder. Deleting removes both the rows and the files
+                and frees the space — it can&rsquo;t be undone.
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  type="button"
+                  variant="destructive"
+                  disabled={busy || dataBusy !== null}
+                  onClick={() => setPendingDelete("images")}
+                >
+                  {dataBusy === "images" ? (
+                    <Spinner />
+                  ) : (
+                    <ImageOff aria-hidden="true" />
+                  )}
+                  {dataBusy === "images" ? "Deleting…" : "Delete uploaded images"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  disabled={busy || dataBusy !== null}
+                  onClick={() => setPendingDelete("all")}
+                >
+                  {dataBusy === "all" ? <Spinner /> : <Trash2 aria-hidden="true" />}
+                  {dataBusy === "all" ? "Deleting…" : "Delete all my data"}
+                </Button>
+              </div>
+              <p aria-live="polite" className="text-xs text-muted-foreground">
+                {dataNote}
+              </p>
+            </section>
+
+            <AlertDialog
+              open={pendingDelete !== null}
+              onOpenChange={(open) => {
+                if (!open) setPendingDelete(null)
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    {pendingDelete === "all"
+                      ? "Delete all my data?"
+                      : "Delete all uploaded images?"}
+                  </AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {pendingDelete === "all"
+                      ? "Your chat history, uploaded images, saved API keys and settings are removed from this device and the space freed. This can’t be undone."
+                      : "Every uploaded image and screenshot across all chats is removed from this device and the space freed. This can’t be undone."}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={() => {
+                      if (pendingDelete === "all") deleteAllData()
+                      else if (pendingDelete === "images") deleteAllImages()
+                      setPendingDelete(null)
+                    }}
+                  >
+                    {pendingDelete === "all" ? "Delete everything" : "Delete images"}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         )}
       </main>

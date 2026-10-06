@@ -143,12 +143,13 @@ Keys never leave the main process: `safeStorage`-encrypted in SQLite, decrypted 
 - **No remote debugging port** — CDP runs in-process over `webContents.debugger`, so nothing is exposed on the network.
 - **Writes require approval** — `browser_type` and `browser_save_pdf` prompt; reads and clicks run visibly in the panel.
 - **Attachment safety** — per-category byte caps, content sniffing (real images, `%PDF-` magic, no binary-in-text), main derives all on-disk paths; the renderer can never inject a filesystem path.
+- **Local data wipe** — Settings → Data & privacy deletes rows *and* files (including staging/orphans) in one transaction, so a reset frees real bytes, not just database rows.
 
 ## Feature status
 
 | | |
 |---|---|
-| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation |
+| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation · local data wipe & image deletion |
 | 🔜 Planned | Deep-task lane (`browser-use-pi`) — design locked, see `docs/feat_plans_todos.md` → Feature 6 |
 | 📋 Backlog | Streaming/VAD dictation · local command execution · chat-scoped dictation · compact tool-trace summaries in chat |
 

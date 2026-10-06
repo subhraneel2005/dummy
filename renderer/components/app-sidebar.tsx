@@ -173,7 +173,7 @@ export function AppSidebar({
                     onClick={() => router.push("/settings")}
                   >
                     <SettingsIcon aria-hidden="true" />
-                    <span>AI Settings</span>
+                    <span>Settings</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               </SidebarMenu>

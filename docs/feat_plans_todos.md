@@ -1169,6 +1169,31 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 
 ---
 
+## Feature 7 — Delete My Data (Settings)
+
+> **Status: shipped** (uncommitted). Adds two destructive actions to the AI Settings page: **Delete uploaded images** and **Delete all my data** (a full factory reset of the on-device store plus the bytes behind it).
+
+### Why the wipe is two halves that move together
+- A wipe must free the **rows** *and* the **files**. Deleting `chat_attachments` rows without the files leaks a screenshot per message forever (nothing else ever walks the screenshots directory); deleting files without the rows leaves ghost rows whose thumbnail reads 404.
+- **Delete all data** (`electron/ai/data.ts` → `deleteAllData`) runs all six tables (`chat_tool_calls`, `chat_attachments`, `chat_messages`, `chat_sessions`, `provider_keys`, `settings`) in **one transaction** so a mid-wipe failure cannot leave history without its keys or a key without a provider. Files are removed only after the commit.
+- The **screenshots directory is removed wholesale** (`fs.rm(…, { recursive, force })`) rather than walking the rows, because it also holds `staging/` leftovers and orphaned bytes no row points at — "free the space" frees all of it. `/deep-tasks` (Feature 6 workspace root) is removed the same way; it doesn't exist yet, `force: true` keeps it free.
+
+### Teardown + hygiene
+- Both IPC handlers (`ai:delete-all-data`, `ai:delete-all-attachments` in `main.ts`) call `stopActiveStream()` first (and `closeBrowser()` for the full wipe) so an in-flight stream or an embedded page can't write back rows/files mid-delete.
+- The renderer **reloads the window ~1.2 s after a successful wipe** (`use-ai-settings.ts`): the transcript, sessions list, staged captures and preview blobs all live in memory, so they're stale the moment the wipe commits. `message` carries failures to the page's error banner; `dataNote` carries the success summary (item counts + bytes freed) while the reload timer runs.
+- Confirmation is a **shadcn `AlertDialog` modal** (the same controlled `open`/`onOpenChange` pattern the sidebar's "Delete this chat?" uses): the destructive button opens a dialog that states exactly what gets removed, **Cancel** closes it untouched, and the confirm action runs the wipe. No armed-button foot-guns, and one dialog serves both actions with per-action copy.
+
+### Result shapes (preload → renderer)
+- `wipeAllData` → `{ ok; counts: { messages, sessions, attachments, attachmentsBytes, toolCalls, savedKeys }; freedBytes }`.
+- `deleteAllImages` → `{ ok; deleted; freedBytes }`.
+- `freedBytes` is summed from `chat_attachments.byteSize` (staging/orphan files are removed but not byte-metered).
+
+### Validation
+- ✅ `npm run test:providers`, `npm run test:approvals`, `npm run test:browser`, `tsc -b` + preload typecheck green; renderer `tsc --noEmit` and eslint on touched files green.
+- [ ] Manual: seed a chat with images → Settings → Delete uploaded images → Cancel keeps everything, confirm removes the files + chat reloads clean; repeat → Delete all my data → confirm → keys/settings/history all absent, empty app state after reload.
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - Local command execution ("draft a reply").
