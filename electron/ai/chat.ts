@@ -778,9 +778,18 @@ export async function sendChatMessage(
     // Every tool call this turn made, recorded so the activity timeline survives
     // a reload instead of living only in the renderer's memory.
     const toolCalls: RecordedToolCall[] = []
-    // Grows across approvals: each resumed call carries the previous step's
-    // response plus this turn's tool message, so the model keeps its context
+    // Grows across approvals: each resumed call appends what the previous call
+    // produced plus this turn's tool message, so the model keeps its context
     // through however many approvals the task needs.
+    //
+    // `responseMessages` holds only what a call *produced* (its steps, plus
+    // tool messages for approvals its input already carried) — never the input
+    // itself. The resume must therefore EXTEND this list. Replacing it drops
+    // the user message and history, and the next request opens with an
+    // assistant function call, which Gemini rejects with a 400 ("function call
+    // turn comes immediately after a user turn or after a function response
+    // turn"). OpenAI tolerates an assistant-first prompt, so the bug only
+    // surfaced on the provider that validates turn order.
     let workingMessages = messages
 
     try {
@@ -928,9 +937,11 @@ export async function sendChatMessage(
         }
         turn.denyPending = null
 
-        // Resume the loop: the SDK hands back every message produced so far,
-        // which we extend with this step's decisions and pass back in.
+        // Resume the loop: the SDK hands back every message *produced* by this
+        // call, which extends the running list — the input messages it was
+        // built from are not part of it and must be kept.
         workingMessages = [
+          ...workingMessages,
           ...(await result.responseMessages),
           {
             role: "tool",

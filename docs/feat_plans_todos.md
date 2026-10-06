@@ -980,6 +980,147 @@ Realistically: usable, but expect macOS to swap during heavy pages. Do not let t
 
 ---
 
+## Feature 6 — Deep-Task Lane (`@browser_use/pi` autonomous agent)
+
+### Goal
+For long autonomous web tasks ("find the top 5 X and save a list to a file"), add an **optional second lane**: a one-shot `browser_deep_task` tool that hands the task to **browser-use-pi** (Browser Use's pure-TypeScript Pi agent, `@browser_use/pi`), which runs its **own** agent loop in a forked worker and drives **its own external Chrome window**. The embedded F5 panel, its 8 tools, and the `ToolLoopAgent` approval loop stay exactly as they are — this extends chat, it does not replace it.
+
+> **Status: planned only.** Evaluation of https://github.com/browser-use/browser-use-pi is complete (read-only source/docs review); all three design decisions below are locked with the user; nothing is implemented. Realization of the backlog-shaped question "should we adopt browser-use-pi?" — verdict: **not as-is for the embedded panel, yes as a hybrid lane.**
+
+### Non-goals (v1)
+- Not replacing or wrapping the F5 embedded tools — the deep lane is a *separate* tool on the same `ToolLoopAgent`.
+- **No CDP bridge** to the embedded `WebContentsView` (rejected — see constraint below).
+- No shell / `researchTools`, no per-cell approvals, no headless + screenshot mode (deferred; all listed as open questions).
+- No settings UI (model is derived from the chat provider), no DB migration, no `bu-pi-server`, no their session/history UI.
+- Not reusing their session persistence — result comes back as one tool output.
+
+### Locked decisions (confirmed with user)
+1. **Approvals — upfront only + live feed.** The existing `toolApproval` expression already gates every non-read tool, so `browser_deep_task` gets one approval card before anything starts (it can browse, run JS, and save files — the card is the capability grant). While running, every JS cell streams live into the activity timeline; the existing stop button cancels. `researchTools` (shell) stays **off**. Per-cell gating was rejected: their primitive is an opaque REPL cell (arbitrary JS with fs + network), `beforeToolCall` can only block *whole cells*, and read-vs-write cannot be classified inside arbitrary code — so per-cell means "ask about everything" or a fragile LLM classifier.
+2. **Headed external Chrome.** `Browser.chromium({ headless: false, profileDir })` spawns the installed Chrome with an isolated persistent profile (`userData/deep-chrome`), so logins survive and the user can watch/take over. It cannot be embedded in the panel (constraint below). Headless-with-screenshots is deferred.
+3. **Reuse existing provider keys.** Read the chat's provider key from `db/keys.ts` (`safeStorage`), set the matching env var (their transports read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / …), and pick a vision-capable entry from `builtinModels()` for that provider. No OpenRouter account, no second key to enter, no `streamFn` bridge. A settings override can come later if the auto-pick is ever wrong.
+
+### The hard constraint: the embedded view can never be their target
+Their client connects to a **browser-level CDP WebSocket**: `Target.*` with flatten sessions (`sessionId` routing), tab create/close, plus `Fetch` interception installed by their policy layer. Electron gives us only `webContents.debugger` — page-level, no WS endpoint, no Target domain, no sessions. The four options, evaluated:
+
+| Option | Verdict |
+|---|---|
+| CDP WS bridge emulating Target/flatten over `webContents.debugger` | **Rejected** — large fragile protocol emulation (new tabs = new `WebContentsView`s, faked sessionIds, Fetch policy passthrough), breaks on upstream changes, and revives the F5 no-remote-debugging stance |
+| `--remote-debugging-port` on our own app | **Rejected in F5** — unauthenticated hole that would expose our chat renderers |
+| Attach to the user's real Chrome (`Browser.chrome()`) | **Rejected** — needs `chrome://inspect` consent or macOS Accessibility automation of Chrome's dialog; also touches the user's signed-in session |
+| Let it spawn its own Chrome (`Browser.chromium()`) | **Chosen** (decision 2) |
+
+Consequence: the deep lane's page lives in a **separate OS window**; the panel remains the F5 interactive surface. That is the whole trade.
+
+### Why this works inside our Electron app (verified, not assumed)
+- `electron/` is `"type": "module"`, tsconfig `module: nodenext`, plain `tsc` build (no bundler) → an ESM-only dep loads directly; dynamic `import()` keeps it off the startup path. `skipLibCheck` is already on.
+- Their worker is `fork(process.execPath, …, { env: {} })`. Electron's patched Node **auto-sets `ELECTRON_RUN_AS_NODE=1`** on fork, so the child is plain Node, not a second GUI app — and `env: {}` therefore carries only that flag (no PATH/HOME in the child; harmless, it gets workspace + CDP endpoint over IPC).
+- Verified locally: **Electron 44.3.0 bundles Node 24.20.0** ≥ their `engines.node >=22.19`.
+- Caveat for packaging: the `runAsNode` fuse must stay default-on, or their `fork` breaks (Electron documents this exact coupling).
+
+### Evaluation facts (read from source/docs, 2026-10 — do not re-research from memory)
+| Fact | Detail |
+|---|---|
+| Package | `@browser_use/pi` v0.1.0, MIT, pure TS; deps `@earendil-works/{pi-agent-core,pi-ai,pi-coding-agent}`, `devtools-protocol`, `typebox` — **no Python, no Playwright** |
+| Their loop | Own agent loop (not `ai@7`): one `javascript` tool = persistent Node REPL + raw CDP (`cellTimeoutMs` 30s), `finish`/`finish_from_js` with TypeBox schema validation, optional `researchTools` shell |
+| Browser options | `Browser.cloud` (paid), `Browser.chromium({profileDir, headless})` → spawns installed Chrome with `--remote-debugging-port=0` + temp/persistent profile (headless **by default**), `Browser.chrome()` attach, `{cdpUrl}` / `pending()` + `connectBrowser()` |
+| Hooks | async `beforeToolCall`/`afterToolCall` → `{ block, reason, terminate? }`, wrapped in `bounded(..., hookTimeoutMs)` (default 30s) — blocking is possible but cell-granular |
+| Worker | forked child: `node:inspector` + `node:vm`, `chdir(workspace)`, grants `process`/`Buffer`/`fetch`/`require` → **full fs + network, unsandboxed by design** (README: "use an isolated machine for untrusted tasks") |
+| Budgets | `maxSteps` 40, `timeoutMs` 300s default, `maxCostUsd` checked between turns (can overshoot by one response), `operationTimeoutMs` 15s |
+| Telemetry | **on by default** → must pass `telemetry: false` (or `DO_NOT_TRACK=1`) |
+| Concurrency | profile lock `.bu-pi.lock` (wx) — one run per profile, hard error on second |
+| Events | `onEvent` subscription over their agent events → basis of the live cell feed; `formatEvent` exported |
+| API | `BrowserUse.create(opts)` → `run(task, { schema })` / `followUp` / `close()`; `builtinModels()` exported; `result.status: 'completed' \| 'partial' \| …` |
+| Model plumbing | `model: 'provider/id'` from their catalog; transports read provider env vars; custom `models` catalog / `streamFn` exist but are **not needed** under decision 3 |
+
+### Architecture Overview
+```
+renderer (chat window)                 electron/main (Node, ESM)
+----------------------                 -------------------------
+approval card ── invoke ──────────────►  toolApproval: isReadOnlyTool() is false
+   ▲                                      → user-approval card (existing machinery)
+   │                                      approve → deep-task.ts
+timeline cells ◄─ browser:deep ────────     resolve provider → getProviderKey()
+   │                                        → set env var → builtinModels() pick
+stop button ── chat:stop ─────────────►     dynamic import("@browser_use/pi")
+                  stopActiveStream()        BrowserUse.create({
+                  → abortDeepTask()           model, telemetry: false,
+   ▲                                          browser: Browser.chromium({
+   │                                            headless: false,
+   │                                            profileDir: userData/deep-chrome }),
+   │                                          workspace: userData/deep-tasks/<id>,
+   │                                          researchTools: false,
+   │                                          timeoutMs: 600_000, maxCostUsd: 1 })
+   │                                        onEvent ──► browser:deep ──────────┘
+   │                                        run(task, schema) → {summary, files[]}
+   ▼
+external Chrome (their process: installed Chrome, own profile, visible window)
++ their worker (our Electron binary running as Node 24 via ELECTRON_RUN_AS_NODE)
+```
+
+### UX contract
+- Model asks → `browser_deep_task { task }` → approval card with capability-grant wording ("opens an external Chrome window; runs code and saves files until you stop it").
+- Running: one `chat_tool_calls` row (running) + live cells nested under it (code line, status, duration); the turn occupies chat until done or stopped.
+- Result: TypeBox schema `{ summary, files[], workspace }` → tool output → model weaves it into the reply; files live in the per-run workspace under `userData/deep-tasks/`.
+- One deep task at a time (their profile lock makes concurrent runs impossible anyway).
+
+### Risks
+1. **Chrome must be installed** (`/Applications/Google Chrome.app` on macOS) — surface their "Chrome not found" error verbatim instead of a generic failure.
+2. **Upfront-only is a capability grant** — cells read/write (workspace) and hit the network with no further prompts. Deliberate (decision 1); shell-off narrows it. Escape hatch if it ever feels wrong: `beforeToolCall` gating, at the cost of noisy cards.
+3. **Two loops, two meters** — their steps/cost run against the same user key as chat. `maxCostUsd` cap (plan $1) + `timeoutMs` 600s are the guards.
+4. **Memory** — another Chromium on the 8 GB machine (~100–300 MB + page). Don't habitually run a heavy F5 page and a deep task at once.
+5. **Fuse/packaging** — `ELECTRON_RUN_AS_NODE` must stay enabled when a packaged build ever exists.
+6. **v0.1.0 upstream** — pin the version; upgrades must re-verify fork behavior, catalog ids, and hook semantics.
+7. **Catalog model ≠ chat model** — auto-pick is per provider; screenshot interpretation needs a vision-capable entry, so the pick must be validated per provider against real `builtinModels()` output (Phase 0), not guessed.
+
+---
+
+## Todos — Feature 6
+
+> **Status: planned only — research complete, decisions locked, zero code.** Phase 0 is a spike and must run first; everything after it assumes Phase 0's findings.
+
+### Phase 0 — Spike (blocks everything)
+- [ ] `npm i @browser_use/pi` in `electron/` (pin exact version); `tsc -b` accepts its types
+- [ ] Dump `builtinModels()` at runtime: entries + env-var names + vision flags for openai/anthropic/google/xai — record the chosen default per provider **here**, not from memory
+- [ ] One trivial real-key `BrowserUse.run()` under Electron — proves the worker fork, `ELECTRON_RUN_AS_NODE` path, telemetry off, Chrome launch (headed)
+- [ ] Confirm `.bu-pi.lock` behavior (second run rejected cleanly)
+
+### Phase G1 — Deep-task service (`electron/browser/deep-task.ts`)
+- [ ] `resolveDeepModel()`: provider from the chat config → `getProviderKey()` → set matching env var just-in-time → vision-capable `builtinModels()` pick; typed error when no key / no catalog entry
+- [ ] `runDeepTask({ task, sessionId, signal, onEvent })` — dynamic import (off startup path), `BrowserUse.create({ telemetry:false, researchTools:false, headless:false, profileDir, workspace, timeoutMs: 600_000, maxCostUsd: 1 })`, `run()`, `close()` in `finally`
+- [ ] `abortDeepTask()` export + module-level single-flight guard
+- [ ] Per-run workspace dir `userData/deep-tasks/<sessionId>-<ts>/` + persistent Chrome profile dir
+- [ ] Chrome-missing / lock-held / no-key errors surfaced as plain actionable tool-error text
+
+### Phase G2 — Tool + wiring
+- [ ] `browser_deep_task { task }` in `browser/tools.ts`, **not** in `READ_ONLY` → existing one-expression `toolApproval` in `ai/chat.ts` gates it (no approval-policy change needed)
+- [ ] `stopActiveStream()` also calls `abortDeepTask()` so stop mid-run cancels the child + Chrome
+- [ ] `chat_tool_calls` row: input = task, output = summary + files + workspace path (row writing is already generic)
+- [ ] Approval-card copy for this tool (capability-grant wording, decision 1)
+- [ ] CHAT_INSTRUCTIONS note: when to prefer the embedded panel vs a deep task
+
+### Phase G3 — Live feed UI
+- [ ] main forwards their `onEvent` stream → `browser:deep` IPC; preload + `renderer/electron.d.ts` types (mirror the `chat:event` pattern)
+- [ ] `browser-activity.tsx` / `page.tsx` / `use-chat.ts`: deep row + nested live cells (code line, status, duration) — **read `node_modules/next/dist/docs/` first, per `renderer/AGENTS.md`** (this Next version is not the one you know)
+- [ ] Stop button verified end to end: click → abort → cells settle → row closes as `stopped`
+
+### Phase G4 — Validation + docs
+- [ ] `approval-smoke.mjs` extended: `browser_deep_task` parks → approve → executes (mocked) → deny → never runs
+- [ ] Full gate green: `npm test`, `tsc -b` (electron), preload + renderer typecheck, eslint on touched files
+- [ ] Manual: real key + installed Chrome → sample task → external window moves, cells stream, stop cancels, result lands in chat, workspace files exist
+- [ ] Manual: no Chrome / no key paths show the actionable errors
+- [ ] Update this section with outcomes and traps found
+
+---
+
+## Open Questions — Feature 6
+- Model override in settings if the auto-pick picks wrong (or user wants a cheaper/deeper model than chat)?
+- Persist the cell transcript into `chat_tool_calls.output` (JSON) so the timeline survives reload, or live-only v1?
+- Headless mode + screenshots into the panel as a toggle, for watching without a second window?
+- Block deep tasks while a heavy F5 page is open (memory), or leave it to the user?
+- Should the deep lane ever be allowed to target the *embedded* panel (i.e. revisit the CDP bridge), or is the external window permanent?
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - Local command execution ("draft a reply").

@@ -3,9 +3,16 @@
  *
  * The loop in `ai/chat.ts` is thin but it rests on an SDK contract that has
  * never been exercised: park on `tool-approval-request`, take
- * `responseMessages`, append a `tool-approval-response` tool message, and
- * re-stream. If that shape were wrong the app would hang on the first Approve —
- * with no test, and only after a real key and a real page were involved.
+ * `responseMessages`, extend the running message list with it plus a
+ * `tool-approval-response` tool message, and re-stream. If that shape were
+ * wrong the first Approve would either hang the turn or hand the provider a
+ * malformed resume — and neither is visible until a real key is involved.
+ *
+ * `responseMessages` carries only what the call *produced*, never its input,
+ * so the resume must APPEND to the previous messages. Replacing them drops the
+ * user turn and the resumed request opens with an assistant function call —
+ * invisible to the OpenAI-shaped mock below, but a hard 400 from Gemini, which
+ * validates turn order. The `messages[0]` assertions are what pin that down.
  *
  * The provider transport is mocked at `fetch`, exactly as
  * `scripts/provider-compat.mjs` does, so this runs offline. The approval policy
@@ -103,8 +110,9 @@ function makeAgent(run, approval) {
 }
 
 /** The exact resume shape `ai/chat.ts` builds after the user decides. */
-async function resume(result, approvalId, approved) {
+async function resume(previousMessages, result, approvalId, approved) {
   return [
+    ...previousMessages,
     ...(await result.responseMessages),
     {
       role: "tool",
@@ -118,7 +126,8 @@ async function runTurn(approved) {
   const run = { executed: 0, requests: [] }
   const agent = makeAgent(run, () => "user-approval")
 
-  const first = await agent.stream({ messages: [{ role: "user", content: "type hello" }] })
+  const input = [{ role: "user", content: "type hello" }]
+  const first = await agent.stream({ messages: input })
   const approvals = []
   let text = ""
   for await (const part of first.stream) {
@@ -126,20 +135,20 @@ async function runTurn(approved) {
     if (part.type === "text-delta") text += part.text
   }
 
-  if (approvals.length === 0) return { run, approvals, text, resumedText: "", executedWhileParked: run.executed }
+  if (approvals.length === 0) return { run, approvals, text, resumedText: "", executedWhileParked: run.executed, input }
 
   // Sampled here, not after the resume: the point is that nothing ran *between*
   // the request arriving and the decision being made.
   const executedWhileParked = run.executed
 
   const second = await agent.stream({
-    messages: await resume(first, approvals[0].approvalId, approved),
+    messages: await resume(input, first, approvals[0].approvalId, approved),
   })
   let resumedText = ""
   for await (const part of second.stream) {
     if (part.type === "text-delta") resumedText += part.text
   }
-  return { run, approvals, text, resumedText, executedWhileParked }
+  return { run, approvals, text, resumedText, executedWhileParked, input }
 }
 
 console.log("\napproval loop")
@@ -155,6 +164,20 @@ console.log("\napproval loop")
   check("approving resumes the loop and runs the tool", run.executed === 1, `ran ${run.executed} times`)
   check("the model sees the result and answers", resumedText === FIRST_TEXT, `got "${resumedText}"`)
   check("one provider round trip per step", run.requests.length === 2, `${run.requests.length} requests`)
+
+  // Gemini rejects a resumed request that opens with an assistant function
+  // call — no user turn before it. The resume must extend the input, not
+  // replace it, and the approval itself must never leave the client.
+  const resumed = run.requests[1]?.messages ?? []
+  check(
+    "the resumed request still opens with the original user turn",
+    resumed[0]?.role === "user",
+    `first message role is ${resumed[0]?.role}`,
+  )
+  check(
+    "the approval response never reaches the provider",
+    !JSON.stringify(resumed).includes("tool-approval-response"),
+  )
 }
 
 {
@@ -162,6 +185,12 @@ console.log("\napproval loop")
   check("denial resumes rather than hanging", approvals.length === 1 && run.requests.length === 2, `${run.requests.length} requests`)
   check("a denied tool never executes", run.executed === 0, `ran ${run.executed} times`)
   check("the model is told and still answers", resumedText === FIRST_TEXT, `got "${resumedText}"`)
+  const resumed = run.requests[1]?.messages ?? []
+  check(
+    "a denied resume still opens with the original user turn",
+    resumed[0]?.role === "user",
+    `first message role is ${resumed[0]?.role}`,
+  )
 }
 
 {
