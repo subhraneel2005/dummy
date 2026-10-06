@@ -1,7 +1,7 @@
 import { and, desc, eq, sql } from "drizzle-orm"
 
 import { getDb } from "../db/index.js"
-import { chatAttachments, chatMessages, chatSessions } from "../db/schema.js"
+import { chatAttachments, chatMessages, chatSessions, chatToolCalls } from "../db/schema.js"
 import { deleteAttachmentFiles } from "./attachments.js"
 
 export interface ChatSession {
@@ -117,6 +117,10 @@ export async function deleteSession(id: string): Promise<OkResult> {
 export async function clearSessionMessages(id: string): Promise<OkResult> {
   try {
     await dropSessionAttachments(id)
+    // Tool calls go with the messages they hang off. No files to delete — they
+    // are all JSON — but leaving them would resurrect timeline rows for
+    // messages that no longer exist.
+    await getDb().delete(chatToolCalls).where(eq(chatToolCalls.sessionId, id)).run()
     await getDb().delete(chatMessages).where(eq(chatMessages.sessionId, id)).run()
     return { ok: true }
   } catch (err) {

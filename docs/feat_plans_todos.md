@@ -736,8 +736,252 @@ island  (Alt+D down/up, holds focus)
 
 ---
 
+## Feature 5 — Browser Automation (embedded Chromium + `ToolLoopAgent` tools)
+
+### Goal
+The user can ask the assistant to visit a website and act on it. A real Chromium page opens **inside the chat window as a collapsible panel**; the assistant drives it through raw CDP (accessibility tree for structure, real mouse/keyboard input for actions). Reading and clicking happen as you watch; the two actions that change something outside the panel pause for an explicit approve/deny.
+
+> **Status: implemented, headless-validated, not yet manually exercised.** The panel, tools, approval loop and persisted tool history are built, typechecked, and covered by two offline smokes; what remains is the manual end-to-end pass with a real key. Realization of the backlog item "enable agent tools via `ToolLoopAgent`".
+
+### Non-goals (v1)
+- No Playwright / Puppeteer / downloaded browser, and no remote-debugging port.
+- No multi-tab, no downloads, no file upload, no recorded/replayed scripts.
+- No vision — see the hard constraint below.
+- No domain allowlist; no per-site trust store.
+
+### Locked decisions (confirmed with user)
+1. **Delivery** — an embedded page managed by main, not a real Chrome attach or a headless fetch. Originally scoped as its own `BrowserWindow`; implemented as a `WebContentsView` hosted in the chat window so it lives **inside** the layout, collapsible, without a second OS window.
+2. **Mechanism** — raw CDP via `webContents.debugger`. Zero new runtime dependencies.
+3. **Where tools live** — registered on the **existing** `ToolLoopAgent` in `ai/chat.ts`, not a second agent or a rewrite of the chat service.
+4. **Approval** — **reads and clicks auto-approve; writes require the user.** The user initially chose "confirm everything", then downgraded to read-only because a 6-step task under strict mode means 6 interruptions; a later pass added `browser_click` and `browser_go` to the auto set (watching the panel makes them self-evident) and left `browser_type` and `browser_save_pdf` gated, because those are the two that leave the page behind.
+5. **Network scope** — **open internet**, no allowlist. The UI always shows the current URL so navigation is never invisible.
+6. **Perception** — the accessibility tree is the primary sense. A screenshot is a *user-facing artifact*, not something the model sees.
+
+### Why embedded costs almost nothing here
+Electron already bundles Chromium, and `webContents.debugger` exposes **raw CDP**. The entire vocabulary the `browser-use` skill depends on — `Accessibility.getFullAXTree`, `DOM.getBoxModel`, `Input.dispatchMouseEvent`, `Input.insertText`, `Page.captureScreenshot`, `Page.printToPDF` — is already available. No browser binary to download, no `--remote-debugging-port` to expose (which would be an unauthenticated hole), no extra process to supervise.
+
+**`browser-use` is NOT a dependency of this feature.** The load-bearing fact is that `webContents.debugger` is not a wrapper around a CDP library — it *is* a CDP client, built into Electron — so `sendCommand("Accessibility.getFullAXTree")` needs no npm package, no WebSocket client, and no `chrome-remote-interface`. CDP is a wire format, and `browser-use` is one *alternative* implementation of a browser controller (Python + Playwright + **its own AI agent loop**) rather than a component we would assemble. Adopting it would mean replacing the F3 `ToolLoopAgent`, the user's provider/model selection, chat history, and the approval loop — it would become the chat, not extend it. Zero-install is a consequence of the design, not an oversight.
+
+Separately, the `~/.agents/skills/browser-use` skill is **agent tooling for development**, letting the coding agent drive a browser while testing this feature. It is never shipped in the app and never runs when dummy runs.
+
+### The hard constraint that shapes the whole design
+Verified in the installed `@ai-sdk/provider-utils`: **`ToolResultOutput` is `{type:'text'} | {type:'json'}` only.** A tool result **cannot carry an image**, and `PrepareStepResult` exposes **no `messages` hook**. So the assistant cannot look at a screenshot mid-loop.
+
+Consequences, both accepted:
+- `browser_snapshot` (AX tree) is the primary perception tool. It is also more token-efficient and more reliable than vision for UI structure.
+- `browser_screenshot` persists the PNG through the **existing** `storeAttachment` / `downscale` plumbing, so the *user* sees it in the chat timeline and it becomes model-visible on the **next turn** via the F4 `FilePart` path.
+
+This is not a workaround to revisit later — it is the reason the tool list is shaped the way it is.
+
+### Platform API names (verified against the installed `ai@7.0.114` source — NOT from memory)
+| Fact | Detail |
+|---|---|
+| `toolApproval` | Agent-level. Either a **generic function** or a per-tool map. Replaces the deprecated `needsApproval`. |
+| Generic function signature | `({ toolCall, tools, toolsContext, runtimeContext, messages }) => MaybePromiseLike<ToolApprovalStatus>` |
+| `ToolApprovalStatus` | `undefined \| 'not-applicable' \| 'approved' \| 'denied' \| 'user-approval' \| { type: 'approved', ... }` |
+| `tool-approval-request` stream part | `{ approvalId, toolCall, reason?, isAutomatic?, signature? }` — carries the **full parsed `toolCall`**, so the approval card can render name + input with no extra schema lookup |
+| `tool-approval-response` | `{ approvalId, toolCall, approved, reason? }` |
+| Resume after approval | `StreamTextResult` **does** expose `readonly responseMessages: PromiseLike<Array<ResponseMessage>>`, so the loop is viable while streaming |
+| `stopWhen` export name | `stepCountIs` (`isStepCount as stepCountIs`) — set explicitly, never rely on the default |
+| `experimental_toolApprovalSecret` | Optional HMAC binding of an approval request to its tool call |
+| Tool schema key | `inputSchema` (never `parameters`) |
+
+### The trap: we do not use `@ai-sdk/react`'s `useChat`
+Per the F3 decision, `use-chat.ts` is a **hand-rolled IPC protocol**. That means `addToolApprovalResponse` / `addToolOutput` **do not exist for us**, and the usual one-liner resume is unavailable. Main must drive the approval loop itself.
+
+```
+renderer                                electron/main (ai/chat.ts)
+--------                                ---------------------------
+use-chat.ts (hand-rolled)               const result = await agent.stream({ messages })
+  | chat:send ───────────────────────►   for await (const part of result.stream)
+  |                                        case 'tool-approval-request':
+  |                                          park { messages, await result.responseMessages }
+  |                                          forward to renderer, AWAIT user decision
+  | chat:approval-response ─────────────►   messages.push(...await result.responseMessages)
+  |                                        messages.push({ role:'tool', content:[
+  |                                          { type:'tool-approval-response', approvalId, approved } ]})
+  |                                        → re-call agent.stream({ messages })   ← must be a LOOP
+  | chat:delta / chat:done / tool-* ◄────
+```
+
+Three consequences that are easy to get wrong:
+1. **It must be a loop**, not a one-shot. One user turn can request several approvals sequentially.
+2. **Stop/abort must auto-deny** a parked approval. `activeStream` (`ai/chat.ts:75`) is a single module-global that currently only covers streaming; it must extend to the parked state, or `chat:stop` leaves the turn hung forever.
+3. **Add the SDK's own advice to `CHAT_INSTRUCTIONS`** (`ai/chat.ts:66`): *"If an action is denied, do not retry it."* Otherwise the model re-requests the same denied call in a loop.
+
+### Architecture Overview
+```
+renderer (Next.js, sandboxed)         electron/main (Node, ESM)
+----------------------------         -------------------------
+chat page                              ai/chat.ts
+  | approval card ── invoke ──────────►   ToolLoopAgent({ model, instructions,
+  | tool timeline <── chat:event ──────     tools: browserTools, toolApproval })
+  | status pill   <── browser:status      │
+  │                                      ▼
+  │                                 browser/
+  │                                   window.ts  BrowserWindow + partition + policy
+  │                                   cdp.ts     webContents.debugger wrapper
+  │                                   refs.ts    ref -> backendNodeId, cleared per nav
+  │                                   tools.ts   the 8 tool definitions
+  │                                   approvals.ts  pending-approval registry
+  ▼
+BrowserWindow (own partition, no preload, sandbox:true)
+```
+
+### Tool catalogue
+`READ_ONLY` auto-approves; the two that change something prompt.
+
+| Tool | Input | Returns | Approval |
+|---|---|---|---|
+| `browser_navigate` | `{ url }` | final URL, title | auto |
+| `browser_snapshot` | — | numbered interactive elements + `ref`s | auto |
+| `browser_read` | — | visible text, length-capped | auto |
+| `browser_screenshot` | — | attachment id, URL, title | auto |
+| `browser_click` | `{ ref }` | resulting URL/title | auto |
+| `browser_go` | `{ direction: 'back'\|'forward'\|'reload' }` | URL | auto |
+| `browser_type` | `{ ref, text, submit? }` | confirmation | **prompt** — it can submit a form |
+| `browser_save_pdf` | — | saved path | **prompt** — it writes a file |
+
+The split is *writes*, not *side effects*. Reading and clicking are things the user watches happen in the panel in real time, and prompting for each one would make the assistant unusable; typing text into a field and writing a file are the two that leave the panel behind.
+
+Because navigation auto-approves, **the status line is load-bearing, not cosmetic** — it is the only continuous signal of where the agent has gone.
+
+### Security model
+The embedded page is treated as hostile-by-default:
+- **No preload**, `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`.
+- Own partition `persist:dummy-browser` (survives restarts, never touches `defaultSession`).
+- Hard-deny non-`http(s)` schemes in `will-navigate` (`file:`, `javascript:`, `data:`) — an open-URL tool plus `file:` is arbitrary local file read.
+- `setWindowOpenHandler` folds popups into the same view instead of spawning uncontrolled ones.
+- `setPermissionRequestHandler` denies camera / mic / geolocation / notifications.
+- The panel rectangle can only be moved by the window that hosts the page, so no other renderer can park it over the transcript.
+
+### Reused, not rewritten
+- `ai/attachments.ts:317` `storeAttachment` + `capture.ts:227` `downscale` (1568px long edge) — the screenshot path.
+- `renderer/components/ai-elements/tool.tsx` was **not** used: the timeline needed statuses the component does not model (`denied`, `stopped`, running-with-approval), so `browser-activity.tsx` was written for it.
+- F4's `FilePart` send path — how a screenshot becomes model-visible next turn.
+
+### Known gaps in the current chat service (must be fixed, not worked around)
+- `ai/chat.ts:314` constructs the agent with **no `tools` and no `stopWhen`**. The default step limit is easy to burn without noticing on a click→wait→observe loop.
+- `ai/chat.ts:409` persists **only** assistant text, and `loadHistory` (`ai/chat.ts:190`) replays text only. Without a durable record, a later turn has **zero memory the browser was ever used** — so Phase D exists.
+- `normalizeMessages` (`renderer/hooks/use-chat.ts:65`) strips anything non-`{role,text}`; tool events need an explicit branch or they vanish in the UI.
+- The sidebar entry already exists, disabled, at `renderer/components/app-sidebar.tsx:141-143`.
+
+### Risks
+1. **Tool-calling support varies by provider/model** — *resolved by Phase 0*: all four providers complete a tool-call round trip.
+2. **One global browser session** means two chat sessions racing would invalidate each other's element `ref`s — *resolved*: a single `Mutex` wraps every page operation.
+3. **Canvas-heavy sites** (Gmail, Figma, most SPAs with virtualized DOM) expose a poor AX tree. Worth setting expectations before the user tries it there.
+4. **`zod` was only installed as a transitive peer of `ai`** — *resolved*: declared directly in `electron/package.json`.
+
+### Memory budget — the shell is cheap, the *page* is not
+The panel itself is a `WebContentsView` inside the chat window, so there is no second OS window to pay for — no extra `BrowserWindow` shell, no extra frame. The genuine marginal cost is still **one renderer process plus whatever page it loads**:
+
+| | Marginal cost |
+|---|---|
+| Empty second window | ~40–80 MB |
+| Light page (docs, blog, HN) | ~30–60 MB more |
+| Gmail / Google Docs | ~150–300 MB |
+| Figma / YouTube / Notion | ~400 MB – 1 GB |
+
+The 8 GB budget already carries macOS, whisper `base.en` (~388 MB when active), the Next dev server, and Electron (~150–250 MB baseline). A heavy web page inside dummy can cost **more than the `small.en` model that F1 deliberately rejected**, so this is a real constraint, not a theoretical one. Mitigations, all load-bearing and now implemented:
+- **Lazy creation** — no page until the first browser tool call.
+- **Idle release** — after a run, navigate to `about:blank` so page memory is reclaimed while the partition and its cookies survive.
+- **Exactly one page, ever** — reused across turns, never one per session.
+- **Collapse instead of close** — collapsing the panel keeps the page alive (hiding it and zeroing its bounds) so the user can go back to chat; only `browser:close` blanks it.
+
+Realistically: usable, but expect macOS to swap during heavy pages. Do not let the agent leave a Figma tab open unattended.
+
+---
+
+## Todos — Feature 5
+
+> **Status: implemented; validation incomplete.** Phases 0–E are built and typecheck. What is still open is Phase F, the two persistence items that were never started, and the decisions recorded below.
+
+### Phase 0 — De-risk provider tool-calling (do this first)
+- [x] Extended `electron/scripts/provider-compat.mjs` (`npm run test:providers`) with a **tool-call round trip** per provider — asserts three legs independently: the tool definition was serialized into the request, the parsed tool call actually executed, and the tool result went back on a follow-up request
+- [x] Verified the guard is not vacuous: flipping an expectation fails loudly with exit code 1, and removing the execute hook makes all four report `ToolNotExecuted`
+- [x] Recorded the verdict: **all four providers (OpenAI, Anthropic, Google, xAI) complete the round trip.** No provider blocks Feature 5, so no provider needs blocking, warning, or special-casing in settings
+- [x] Used the SDK's bundled `jsonSchema` in the guard deliberately — it probes *provider capability*, which is independent of schema syntax; the browser tools themselves use zod
+
+### Phase A — Page + CDP core
+- [x] `browser/window.ts` — **one `WebContentsView`, reused**, never one per session. Not a `BrowserWindow`: the page is hosted in the chat window's `contentView` and positioned by `setBounds()`, so it lives inside the chat layout as a collapsible panel (see Open Questions)
+- [x] `session.fromPartition('persist:dummy-browser')` — isolated from `defaultSession`
+- [x] Security policy: no preload, `contextIsolation`, `sandbox`, `http:`/`https:` plus exactly `about:blank`, permission handlers returning a flat no
+- [x] `browser/cdp.ts` — attach/detach `webContents.debugger`; wrappers for `Accessibility`, `DOM.getBoxModel`, `Input.*`, `printToPDF`, `Runtime.evaluate`; **`Page.setWebLifecycleState` + focus emulation** so the embedded page is not frozen while the panel is collapsed
+- [x] `browser/refs.ts` — `ref → backendNodeId` map, cleared on every navigation
+- [x] `browser:status` event (URL + title) on every navigation, plus `browser:show` / `browser:hide` / `browser:set-bounds` / `browser:close`
+- [x] **Idle release** — `scheduleIdleRelease()` navigates to `about:blank` after a run, cancelled whenever the user opens the panel
+- [x] **Lazy creation** — no page exists until the first tool call
+- [x] Handle: no page yet, debugger already attached, CDP command failure — surfaced as `BrowserNotReadyError` ("The browser page is not open yet")
+- [x] `dropDeadView()` — a view whose contents Electron already tore down is dropped and rebuilt instead of throwing a bare `TypeError`
+
+### Phase B — Tools + registry
+- [x] `browser/tools.ts` — all 8 tools with `inputSchema`, zod
+- [x] Registered on the agent with `stopWhen: stepCountIs(BROWSER_STEP_LIMIT)` set explicitly
+- [x] Single `Mutex` around every page operation (navigate/click/type/screenshot/PDF)
+- [x] Browser guidance in `CHAT_INSTRUCTIONS`: snapshot-before-act, refs die on navigation, prefer `browser_read`, "if the user denies an action, do not retry it"
+- [x] `browser_save_pdf` writes a timestamped file and returns the path — **lands in `app.getPath("downloads")`, not `userData`** as originally planned
+- [x] Typed "no page" / "navigation failed" errors rather than silent empty results
+
+### Phase C — Approval loop
+- [x] `ChatStreamEvent` extended with `tool-approval-request`, `tool-approval-response`, `tool-call`, `tool-result`
+- [x] `READ_ONLY` set → auto-approved; everything else → user approval, through `isReadOnlyTool()` feeding `toolApproval`
+- [x] Main-side resume loop: park `messages`, await `result.responseMessages`, append the `tool-approval-response` tool message, re-stream
+- [x] Pending registry — **inlined in `ai/chat.ts`** rather than a separate `browser/approvals.ts`; keyed by `approvalId`, scoped by turn token, rejects unknown/expired ids
+- [x] `chat:approval-response` IPC + preload + `electron.d.ts`
+- [x] Stop/abort auto-denies every parked approval for that turn (`denyApprovalsFor(token)`)
+- [x] All parked promises are registered **before** the first one is awaited, so a card is answerable the instant it appears even when a batch of approvals arrives together
+- [x] `experimental_toolApprovalSecret` HMAC verification
+- [x] **Auto-approval is skipped, not parked.** The SDK emits a `tool-approval-request` for *every* tool in the policy, including ones it approved itself (`isAutomatic`), and answers them within the same step. Parking on one would wait for a decision nobody is ever asked to make — the turn would hang on the first auto-approved read, with a phantom "Waiting for you" card on screen. Caught by `approval-smoke.mjs`, not by reading the docs.
+- [x] Denial path: a denied tool never runs, and the model receives the denial and still answers (verified headless)
+
+### Phase D — Persistence
+- [x] `chat_tool_calls` table with migration under `electron/drizzle/`
+- [x] Every call is logged, including auto-approved reads (buffered per turn, then written with the assistant message)
+- [x] Failure to write still leaves the timeline honest: approval denials mark `denied`, result-less calls are closed as `stopped`
+- [x] Session delete removes tool rows (`clearSessionMessages`)
+- [ ] Feed a browser-usage summary into the *model's* `loadHistory` — persisted rows reach the renderer for rehydration, but turn 2 still cannot see that a browser was used
+- [ ] `browser_enabled` settings key
+
+### Phase E — UI
+- [x] Approval card — tool name, parsed input, reason, Approve / Deny, denial surfaced as a row
+- [x] Live tool timeline (`browser-activity.tsx`), rehydrated from `chat_tool_calls` on load
+- [x] Status line — URL + title in the panel header, which doubles as the pill the plan called for
+- [x] Sidebar browser item toggles the panel instead of opening a separate window
+- [x] `normalizeMessages` branch for tool events, with a `toolActivityRef` mirror so nested `setState` is avoided
+- [x] Stop-while-pending: `settleUnfinishedTools()` closes running rows as `stopped` on `stopped`
+
+### Phase F — Validation
+- [x] `tsc -b` + `tsc -p tsconfig.preload.json` green in `electron`; `tsc --noEmit` green in `renderer`
+- [x] `npm run test:browser` (`electron/scripts/browser-smoke.mjs`) green — covers CDP attach, snapshot, refs, navigation, inputs, screenshot, PDF, **and the panel rectangle / collapse / resize contract**; run repeatedly to catch the frame-timing flake it originally had
+- [x] `npm run test:providers` green
+- [x] Headless smoke (`npm run test:approvals`, `electron/scripts/approval-smoke.mjs`): approval parks with nothing executed → approve → tool executes → model answers; deny → tool never runs → model is told and still answers; automatic approval leaves the user no decision. Offline, mocked at `fetch` like `provider-compat.mjs`.
+- [ ] Headless smoke: abort while parked → no hang, no orphaned approval — needs `ai/chat.ts` to be importable outside Electron, which it is not yet
+- [x] `npm test` chains all three suites (providers, approvals, browser panel)
+- [ ] Manual: "open example.com and tell me the heading" — end to end with a real key
+- [ ] Manual: a click task — confirm the prompt appears, the action happens only after approval, and the status line tracks the URL
+- [ ] Manual: verify the page cannot reach `file://` even when the model asks
+- [ ] Manual: collapse the panel mid-run, switch to chat, expand again — the page must still be there and responsive
+
+### Decisions worth keeping
+- **The page is not its own window.** `WebContentsView` is parented into the chat window's `contentView`; the renderer reports the panel rectangle and main parks the view in it. Collapsing sends `null` bounds and hides the view while the page stays loaded, so the model keeps working while the user is back in chat.
+- **`backgroundThrottling: false`** on the view is load-bearing — an occluded page stops producing frames, and a click then stalls waiting for one.
+- **Scrolling is done in JS, not `DOM.scrollIntoViewIfNeeded`.** The CDP call blocks on a compositor frame; in a collapsed panel there may never be one, which turned every click into a five-second stall before it was dispatched at stale coordinates.
+- **An auto-approved tool still emits an approval request.** It carries `isAutomatic` and is answered by the SDK before the stream moves on. The loop must skip those, because parking on one waits forever for a decision no card will ever ask for.
+- **Reads and clicks are auto-approved; only writes are gated.** `browser_navigate`, `browser_snapshot`, `browser_read`, `browser_screenshot`, `browser_click` and `browser_go` never prompt. `browser_type` (it can submit a form) and `browser_save_pdf` (it writes a file) do.
+
+---
+
+## Open Questions — Feature 5
+- Where does the browser window live — a separate OS window, or docked into the chat layout? **Resolved — docked.** It is a `WebContentsView` inside the chat window, reported by the renderer as a rectangle and parked there by main. Collapsing keeps the page alive with zero bounds; "embedded" (vs driving a real Chrome) was a separate axis and stays rejected.
+- Should the auto-approved set extend to `browser_save_pdf`? **Resolved — no.** It writes a file outside the app, so it prompts, same as `browser_type`.
+- Should a completed run be replayable — i.e. re-run the same task with a different approval answer, from the tool timeline?
+- Multi-window/`defaultSession` cookie sharing: **resolved — deliberately isolated.** `persist:dummy-browser` starts empty, so the accepted cost is one login per site. In exchange, a mis-click by the model cannot touch the user's real signed-in Gmail/GitHub, and `sandbox: true` + no-preload stays enforceable. This is the core reason we rejected driving the real Chrome via `browser-use` (which would also have cost an extra Chrome process, a Python daemon, macOS Accessibility TCC, and Chrome's per-attach remote-debugging consent — all while *raising* memory on an 8 GB machine). If login friction becomes the actual complaint, the fix is a sign-in affordance or cookie import — not swapping the tool layer to a Python child process.
+- Should the `stepCountIs(n)` limit be a per-tool budget (e.g. max 20 clicks per turn) rather than a flat step cap?
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - Local command execution ("draft a reply").
-- Chat panel: enable agent tools via `ToolLoopAgent` (schema key `inputSchema`), chat-scoped dictation (mic for follow-ups).
+- Chat-scoped dictation (mic for follow-ups).
 - Multiple chat sessions in the UI (the `chat_messages.session_id` column is already there).

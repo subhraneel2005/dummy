@@ -34,6 +34,8 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input"
 import { AppSidebar, type ChatSession } from "@/components/app-sidebar"
+import { BrowserActivity } from "@/components/browser-activity"
+import { BrowserPanel } from "@/components/browser-panel"
 import AIVoice from "@/components/kokonutui/ai-voice"
 import { ProviderIcon, providerLabel } from "@/components/provider-icon"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
@@ -119,7 +121,32 @@ const ASSISTANT_BUBBLE =
 export default function ChatWindowPage() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<ChatSession[]>([])
-  const { messages, streamingText, sending, error, send, clearLocal } = useChat(activeId)
+  const {
+    messages,
+    streamingText,
+    sending,
+    error,
+    toolActivity,
+    approvals,
+    respondToApproval,
+    send,
+    clearLocal,
+  } = useChat(activeId)
+  // A decision must not be sent twice from a double click, so the buttons
+  // disable the moment one is chosen. The row itself stays visible: the
+  // `approval-response` event is what updates it to Allowed/Denied.
+  const [respondingTo, setRespondingTo] = useState<string | null>(null)
+  const answerApproval = useCallback(
+    async (approvalId: string, approved: boolean) => {
+      setRespondingTo(approvalId)
+      try {
+        await respondToApproval(approvalId, approved)
+      } finally {
+        setRespondingTo(null)
+      }
+    },
+    [respondToApproval],
+  )
   const [job, setJob] = useState<{ id: number; text: string } | null>(null)
   const jobIdRef = useRef(0)
   const [draft, setDraft] = useState("")
@@ -265,6 +292,22 @@ export default function ChatWindowPage() {
    */
   const [staged, setStaged] = useState<StagedCapture[]>([])
 
+  /**
+   * Whether the browser panel is expanded, and where the page behind it is.
+   *
+   * Held here rather than inside the panel because the sidebar toggles it too —
+   * one state, one owner, so the sidebar button and the panel's own collapse
+   * control can never disagree about what is on screen.
+   */
+  const [browserOpen, setBrowserOpen] = useState(false)
+  const [browserPage, setBrowserPage] = useState<{ url: string; title: string } | null>(null)
+  useEffect(() => {
+    const api = window.electronAPI?.browser
+    if (!api) return
+    void api.status().then((status) => setBrowserPage(status.page))
+    return api.onStatus((status) => setBrowserPage(status.page))
+  }, [])
+
   const applySeed = useCallback(
     (seed: ChatSeed) => {
       if (seed.holdId) {
@@ -395,8 +438,13 @@ export default function ChatWindowPage() {
     [activeId, refreshSessions, startNewChat]
   )
 
-  const showThinking = sending && !streamingText
-  const isEmpty = !messages.length && !streamingText && !showThinking
+  // "Thinking" is the absence of output, so anything the model has produced
+  // suppresses it — including a parked approval. Showing "Thinking" directly
+  // above a question the user is being asked to answer reads as if the request
+  // were ignored, when in fact it is waiting on them.
+  const showThinking = sending && !streamingText && approvals.length === 0
+  const isEmpty =
+    !messages.length && !streamingText && !showThinking && !approvals.length && !Object.keys(toolActivity).length
 
   return (
     <SidebarProvider className="h-dvh overflow-hidden bg-background">
@@ -408,6 +456,9 @@ export default function ChatWindowPage() {
         onNewChat={startNewChat}
         onRename={renameSession}
         onDelete={deleteSession}
+        browserOpen={browserOpen}
+        browserPage={browserPage}
+        onToggleBrowser={() => setBrowserOpen((value) => !value)}
       />
       <SidebarInset className="min-h-0">
         {/* No custom header: the native title bar owns the top of the window, so
@@ -436,6 +487,16 @@ export default function ChatWindowPage() {
               {messages.map((message, index) => (
                 <ChatRow key={`${message.role}-${index}`} message={message} />
               ))}
+
+              {/* Between the last message and the assistant's next words: the
+                  browser work belongs to the reply being streamed, so it must
+                  not be pushed above the turn that asked for it. */}
+              <BrowserActivity
+                toolActivity={toolActivity}
+                approvals={approvals}
+                onRespond={answerApproval}
+                responding={respondingTo !== null}
+              />
 
               {streamingText ? (
                 <Message from="assistant" className="max-w-full">
@@ -470,6 +531,15 @@ export default function ChatWindowPage() {
           </ConversationContent>
           <ConversationScrollButton className="size-7" />
         </Conversation>
+
+        {/* Between the transcript and the composer, so the browser reads as
+            part of the conversation rather than a window floating over it. */}
+        <BrowserPanel
+          open={browserOpen}
+          onOpenChange={setBrowserOpen}
+          page={browserPage}
+          className={cn(CHAT_COLUMN, "mx-auto px-6")}
+        />
 
         {/* No divider: the composer is separated from the transcript by space
             alone, which keeps the surface quiet and avoids a hard edge across
@@ -524,7 +594,7 @@ export default function ChatWindowPage() {
                   onToggle={toggleVoice}
                 />
               </PromptInputTools>
-              <ComposerSubmit thinking={showThinking} sending={sending} hasText={Boolean(draft.trim())} />
+              <ComposerSubmit busy={sending} hasText={Boolean(draft.trim())} />
             </PromptInputFooter>
           </PromptInput>
         </footer>
@@ -701,20 +771,21 @@ function StagedCaptureInbox({
  * context — without that, a message of nothing but screenshots would have no
  * enabled way out of the composer.
  */
-function ComposerSubmit({
-  thinking,
-  sending,
-  hasText,
-}: {
-  thinking: boolean
-  sending: boolean
-  hasText: boolean
-}) {
+function ComposerSubmit({ busy, hasText }: { busy: boolean; hasText: boolean }) {
   const { files } = usePromptInputAttachments()
   return (
     <PromptInputSubmit
-      status={thinking ? "submitted" : "ready"}
-      disabled={sending || (!hasText && files.length === 0)}
+      // "streaming" while a reply is arriving, "submitted" while it is being
+      // worked out — both are stoppable, so the button has to offer stop in
+      // either case rather than only after the first token.
+      status={busy ? "streaming" : "ready"}
+      // Without `onStop` the square icon would be decorative: `PromptInputSubmit`
+      // only calls it when supplied, and would otherwise submit an empty form.
+      onStop={busy ? () => void window.electronAPI?.chat.stop() : undefined}
+      // Deliberately not gated on `sending` while busy: that would disable the
+      // only button that can cancel a turn, and a turn parked on an approval is
+      // exactly the one the user needs to be able to abort.
+      disabled={busy ? false : !hasText && files.length === 0}
     />
   )
 }

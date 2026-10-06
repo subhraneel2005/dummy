@@ -9,7 +9,26 @@ import {
   readStagedCaptures,
   stageCapture,
 } from "./ai/attachments.js"
-import { getAttachmentData, getChatHistory, onChatEvent, resetChat, sendChatMessage } from "./ai/chat.js"
+import {
+  close as closeBrowser,
+  hide as hideBrowser,
+  setBounds as setBrowserBounds,
+  setHostWindow,
+  setStatusListener,
+  show as showBrowser,
+  status as browserStatus,
+} from "./browser/window.js"
+import { browserTools, isReadOnlyTool } from "./browser/tools.js"
+import {
+  cancelBrowserIdleRelease,
+  getAttachmentData,
+  getChatHistory,
+  onChatEvent,
+  resetChat,
+  respondToApproval,
+  sendChatMessage,
+  stopActiveStream,
+} from "./ai/chat.js"
 import { listProviderModels } from "./ai/catalog.js"
 import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
 import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
@@ -390,9 +409,17 @@ function createChatWindow() {
   })
 
   chatWindow.on("closed", () => {
+    // The embedded browser lives in this window's content view, so it has to be
+    // detached before the window goes away. Its logins survive in the partition.
+    setHostWindow(null)
     chatWindow = null
     pendingChatSeed = null
   })
+
+  // Parent the embedded browser into this window. Set here rather than lazily so
+  // a page the model opened while the user was on another route is already in
+  // the right window by the time the panel opens.
+  setHostWindow(chatWindow)
 
   // Created hidden so the first paint isn't a white flash. `ready-to-show` can
   // be missed entirely if the dev server never finishes painting, so a timer
@@ -616,6 +643,63 @@ function registerIpcHandlers() {
       ? getAttachmentData(attachmentId)
       : { ok: false as const, error: "Invalid attachment id." },
   )
+  // The other half of a parked `approval-request`. `respondToApproval` rejects
+  // an id it does not recognise, so a stale card cannot approve a live request.
+  ipcMain.handle("chat:approval-response", (_event, approvalId: unknown, approved: unknown) =>
+    typeof approvalId === "string" && typeof approved === "boolean"
+      ? respondToApproval(approvalId, approved)
+      : { ok: false as const, error: "Invalid approval response." },
+  )
+
+  ipcMain.handle("browser:show", () => {
+    // Looking at the page is activity: without this the idle timer from a
+    // finished turn could blank the page out from under the user.
+    cancelBrowserIdleRelease()
+    showBrowser()
+    return browserStatus()
+  })
+  ipcMain.handle("browser:status", () => browserStatus())
+  // Collapsing the panel: the page keeps running, it is just not shown. Kept
+  // separate from `browser:close` so returning to chat does not throw away the
+  // page the model is in the middle of reading.
+  ipcMain.handle("browser:hide", () => {
+    hideBrowser()
+    return browserStatus()
+  })
+  ipcMain.handle("browser:set-bounds", (event, rect: unknown) => {
+    // Only the window hosting the browser may move it. The capture overlay and
+    // the island share this process, and a panel that any renderer could
+    // reposition is a panel that could be parked over the transcript and
+    // swallowing the user's clicks.
+    const sender = windowFor(event)
+    if (!sender || sender.isDestroyed() || sender !== chatWindow) return { ok: false as const }
+    if (rect === null) {
+      setBrowserBounds(null)
+      return { ok: true as const }
+    }
+    if (typeof rect !== "object" || rect === null) return { ok: false as const }
+    const { x, y, width, height } = rect as Record<string, unknown>
+    // A bad rect is ignored rather than thrown on: it must not take the chat
+    // window down, and the renderer re-reports on every resize anyway.
+    if (
+      typeof x !== "number" ||
+      typeof y !== "number" ||
+      typeof width !== "number" ||
+      typeof height !== "number" ||
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height)
+    ) {
+      return { ok: false as const }
+    }
+    setBrowserBounds({ x, y, width: Math.max(0, width), height: Math.max(0, height) })
+    return { ok: true as const }
+  })
+  ipcMain.handle("browser:close", () => {
+    closeBrowser()
+    return browserStatus()
+  })
 
   ipcMain.handle("chat:list-sessions", () => listSessions())
   ipcMain.handle("chat:ensure-session", (_event, sessionId: unknown) =>
@@ -628,6 +712,13 @@ function registerIpcHandlers() {
   ipcMain.handle("chat:delete-session", (_event, sessionId: unknown) =>
     validSessionId(sessionId) ? deleteSession(sessionId) : badSession,
   )
+  // Aborts the in-flight turn. Stopping also denies a parked approval, so
+  // stopping while a card is up frees the turn rather than leaving it waiting
+  // on a decision the user has moved on from.
+  ipcMain.handle("chat:stop", () => {
+    stopActiveStream()
+    return { ok: true as const }
+  })
   ipcMain.on("chat:open", (_event, text: string) => openChatWindow(seedFor(text)))
   // Pulled by the chat renderer on mount. The seed is NOT cleared on read: the
   // renderer may unmount/remount (HMR, reload) between the invoke and the state
@@ -785,6 +876,17 @@ app.whenReady().then(async () => {
   // unreachable by construction — no hold id will ask for them again.
   void pruneStaging()
   registerIpcHandlers()
+  // Browser navigation events go to whichever chat window is open, and to any
+  // later one, so the status pill stays live for the whole app's life. The
+  // browser window itself is created lazily — no window until the model
+  // actually navigates somewhere, which keeps the renderer off an 8 GB machine.
+  setStatusListener((status) => {
+    // Every window, matching how `chat:event` is fanned out — the status pill
+    // must be live even in a window opened after the browser navigated.
+    for (const target of BrowserWindow.getAllWindows()) {
+      if (!target.isDestroyed()) target.webContents.send("browser:status", status)
+    }
+  })
   createWindow()
   registerGlobalShortcut()
 

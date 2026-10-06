@@ -58,6 +58,10 @@ interface AppSidebarProps {
   onRename: (id: string, title: string) => void
   onDelete: (id: string) => void
   provider: string | null
+  /** Whether the browser panel is expanded. The panel lives in the chat page. */
+  browserOpen: boolean
+  browserPage: { url: string; title: string } | null
+  onToggleBrowser: () => void
 }
 
 export function AppSidebar({
@@ -68,6 +72,9 @@ export function AppSidebar({
   onRename,
   onDelete,
   provider,
+  browserOpen,
+  browserPage,
+  onToggleBrowser,
 }: AppSidebarProps) {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null)
@@ -138,10 +145,27 @@ export function AppSidebar({
                   </SidebarMenuButton>
                 </SidebarMenuItem>
                 <SidebarMenuItem>
-                  <SidebarMenuButton tooltip="Browser automation" aria-disabled="true" disabled>
+                  <SidebarMenuButton
+                    tooltip={
+                      browserPage
+                        ? `Browser — ${browserPage.title || browserPage.url}`
+                        : "Show the browser the assistant is driving"
+                    }
+                    isActive={browserOpen}
+                    onClick={onToggleBrowser}
+                  >
                     <BotIcon aria-hidden="true" />
                     <span>Browser automation</span>
                   </SidebarMenuButton>
+                  {/* A dot rather than a label: the page is visible in the
+                      browser panel itself, and the sidebar has no room for a
+                      URL without pushing the session list down. */}
+                  {browserPage ? (
+                    <span
+                      aria-label={`On page: ${browserPage.title || browserPage.url}`}
+                      className="size-1.5 shrink-0 rounded-full bg-emerald-500"
+                    />
+                  ) : null}
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton

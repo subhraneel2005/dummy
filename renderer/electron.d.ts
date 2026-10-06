@@ -55,8 +55,69 @@ interface ChatAttachmentUpload {
 type ChatEvent =
   | { type: "delta"; sessionId: string; text: string }
   | { type: "done"; sessionId: string }
+  | { type: "stopped"; sessionId: string }
   | { type: "error"; sessionId: string; message: string }
   | { type: "load-error"; message: string }
+  // Browser tool lifecycle. `tool-call`/`tool-result` drive the live timeline;
+  // `approval-request` parks the turn until `respondToApproval` is called.
+  | {
+      type: "tool-call"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+    }
+  | {
+      type: "tool-result"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      output: unknown
+    }
+  | {
+      type: "approval-request"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+      reason?: string
+    }
+  | {
+      type: "approval-response"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      approved: boolean
+    }
+  // A page the model captured, shown to the user immediately.
+  | {
+      type: "browser-capture"
+      sessionId: string
+      attachmentId: string
+      mediaType: string
+      width: number
+      height: number
+      dataBase64: string
+    }
+
+/** Where the embedded browser currently is. */
+interface BrowserStatus {
+  page: { url: string; title: string } | null
+  open: boolean
+}
+
+/**
+ * Where the browser panel sits, in CSS pixels relative to the window viewport.
+ * `null` means the panel is collapsed — the page keeps running either way.
+ */
+interface BrowserBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 interface ChatSession {
   id: string
@@ -164,11 +225,24 @@ declare global {
         renameSession: (sessionId: string, title: string) => Promise<ChatSessionResult>
         deleteSession: (sessionId: string) => Promise<ChatSendResult>
         attachmentData: (attachmentId: string) => Promise<ChatAttachmentDataResult>
+        stop: () => Promise<{ ok: true }>
+        respondToApproval: (
+          approvalId: string,
+          approved: boolean,
+        ) => Promise<{ ok: true } | { ok: false; error: string }>
         open: (text: string) => void
         takeInitialText: () => Promise<ChatSeed | null>
         ackInitialText: () => Promise<boolean>
         onInitialText: (callback: (seed: ChatSeed) => void) => () => void
         onEvent: (callback: (event: ChatEvent) => void) => () => void
+      }
+      browser: {
+        show: () => Promise<BrowserStatus>
+        status: () => Promise<BrowserStatus>
+        hide: () => Promise<BrowserStatus>
+        setBounds: (rect: BrowserBounds | null) => Promise<{ ok: true } | { ok: false }>
+        close: () => Promise<BrowserStatus>
+        onStatus: (callback: (status: BrowserStatus) => void) => () => void
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
       ready: () => void

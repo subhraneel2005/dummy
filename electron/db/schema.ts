@@ -13,6 +13,14 @@ export const providerKeys = sqliteTable("provider_keys", {
 
 export type ChatRole = "user" | "assistant"
 
+/**
+ * How a recorded tool call ended.
+ *
+ * `denied` is distinct from `error`: the user said no, which is a normal
+ * outcome the model should see and route around, not a failure to report.
+ */
+export type ToolCallStatus = "done" | "error" | "denied" | "stopped"
+
 // A chat session is the unit the sidebar lists. `chat_messages.sessionId`
 // already points at one of these; it stays a plain text column so existing rows
 // keep working without a backfill.
@@ -66,4 +74,47 @@ export const chatAttachments = sqliteTable(
   ],
 )
 
-export const schema = { settings, providerKeys, chatSessions, chatMessages, chatAttachments }
+/**
+ * One row per browser tool call the model made, so the activity timeline is part
+ * of the conversation rather than a property of the window that happened to be
+ * open when it ran.
+ *
+ * `tool_call_id` is the SDK's id, which is unique within a turn and stable across
+ * a reload. `position` orders calls within the assistant turn they belong to,
+ * because timestamps alone tie when several tools ran in the same millisecond.
+ *
+ * `input`/`output` are JSON text rather than columns: a browser tool's shape is
+ * the tool's business, and normalising eight different argument sets into columns
+ * would buy nothing but migrations.
+ */
+export const chatToolCalls = sqliteTable(
+  "chat_tool_calls",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    sessionId: text("session_id").notNull(),
+    messageId: integer("message_id").notNull(),
+    position: integer("position").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    toolName: text("tool_name").notNull(),
+    input: text("input"),
+    output: text("output"),
+    status: text("status").$type<ToolCallStatus>().notNull(),
+    approved: integer("approved", { mode: "boolean" }),
+    durationMs: integer("duration_ms"),
+    error: text("error"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    index("chat_tool_calls_message_idx").on(table.messageId),
+    index("chat_tool_calls_session_idx").on(table.sessionId),
+  ],
+)
+
+export const schema = {
+  settings,
+  providerKeys,
+  chatSessions,
+  chatMessages,
+  chatAttachments,
+  chatToolCalls,
+}

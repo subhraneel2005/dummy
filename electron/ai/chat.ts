@@ -1,10 +1,21 @@
+import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 
 import { asc, eq } from "drizzle-orm"
-import { ToolLoopAgent, type FilePart, type ModelMessage, type TextPart, type UserContent } from "ai"
+import {
+  ToolLoopAgent,
+  stepCountIs,
+  type FilePart,
+  type ModelMessage,
+  type TextPart,
+  type UserContent,
+} from "ai"
 
 import { getDb, type Db } from "../db/index.js"
-import { chatAttachments, chatMessages } from "../db/schema.js"
+import { chatAttachments, chatMessages, chatToolCalls, type ToolCallStatus } from "../db/schema.js"
+import { abandonCaptures, beginCaptures, capturesFor, commitCaptures } from "../browser/captures.js"
+import { browserTools, isReadOnlyTool } from "../browser/tools.js"
+import { isOpen, releasePageMemory } from "../browser/window.js"
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   attachmentKind,
@@ -32,10 +43,43 @@ export interface ChatAttachmentMeta {
   byteSize: number
 }
 
+/**
+ * One browser tool call, as it is shown in the activity timeline.
+ *
+ * Recorded during the turn and written with the assistant message, which is why
+ * `messageId` is not known while the turn runs.
+ */
+export interface RecordedToolCall {
+  toolCallId: string
+  toolName: string
+  input: unknown
+  output: unknown
+  status: ToolCallStatus
+  /** Null until the user answers an approval; reads only on mutating tools. */
+  approved: boolean | null
+  durationMs: number | null
+  error: string | null
+  /** Set when the row is created, cleared once recorded. */
+  startedAt: number
+}
+
+/** A tool that reported a failure rather than throwing. */
+function failedToolOutput(output: unknown): string | null {
+  if (typeof output !== "object" || output === null) return null
+  const error = (output as { error?: unknown }).error
+  return typeof error === "string" && error.length > 0 ? error : null
+}
+
+function elapsedSince(call: RecordedToolCall): number {
+  return Math.max(0, Date.now() - call.startedAt)
+}
+
 export interface ChatMessage {
   role: "user" | "assistant"
   text: string
   attachments: ChatAttachmentMeta[]
+  /** Browser tool calls made while producing this message, in order. */
+  toolCalls: RecordedToolCall[]
 }
 
 /** An attachment as it arrives from the renderer over IPC. */
@@ -60,19 +104,115 @@ export type ChatHistoryResult = { ok: true; messages: ChatMessage[] } | AiError
 export type ChatStreamEvent =
   | { type: "delta"; sessionId: string; text: string }
   | { type: "done"; sessionId: string }
+  // A turn the user stopped. Carries no message because nothing failed — the
+  // point is only that it is terminal.
+  | { type: "stopped"; sessionId: string }
   | { type: "error"; sessionId: string; message: string }
   | { type: "load-error"; message: string }
+  // Browser tool lifecycle. `tool-call` and `tool-result` drive the live
+  // timeline; `approval-request` is what makes the user act, and it parks the
+  // turn until the matching `chat:approval-response` arrives.
+  | {
+      type: "tool-call"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+    }
+  | {
+      type: "tool-result"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      output: unknown
+    }
+  | {
+      type: "approval-request"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+      reason?: string
+    }
+  | {
+      type: "approval-response"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      approved: boolean
+    }
+  // A page the model captured. Carries the bytes so it can be shown now, and is
+  // written into the assistant's message when the turn ends.
+  | {
+      type: "browser-capture"
+      sessionId: string
+      attachmentId: string
+      mediaType: string
+      width: number
+      height: number
+      dataBase64: string
+    }
 
 const CHAT_INSTRUCTIONS =
   "You are a concise assistant embedded in a macOS dictation app. The user dictates technical " +
   "notes and sends them to you for discussion. Answer directly and prefer short, well-structured " +
   "responses. Use markdown for code blocks and lists. Screenshots may be attached to a message " +
   "as images of whatever was on the user's screen at that moment — read them when the question " +
-  "refers to them, and say so plainly if an image does not actually show what was asked about."
+  "refers to them, and say so plainly if an image does not actually show what was asked about.\n\n" +
+  "You can also drive a web browser to answer questions that need live pages. Call " +
+  "browser_snapshot before clicking or typing, because the numbered refs it returns are only valid " +
+  "for the page they came from and any navigation invalidates them. Prefer browser_read over a " +
+  "screenshot for page content: you cannot see images the browser captures. If the user denies an " +
+  "action, do not retry it — carry on without it and say what you could not do."
+
+/**
+ * Set on every agent so a click-wait-observe loop cannot burn the SDK default
+ * step budget. The flat cap is a runaway guard, not the intended limit.
+ */
+const BROWSER_STEP_LIMIT = 24
+
+/**
+ * Binds an approval response to the tool call that requested it.
+ *
+ * Fresh per launch and main-process only, so it never has to be stored: an
+ * approval cannot outlive the turn that produced it. Without it, a compromised
+ * renderer could forge an approval and let a click land without ever being
+ * shown to the user, which would defeat the entire confirm-before-acting model.
+ */
+const TOOL_APPROVAL_SECRET = randomBytes(32)
 
 const listeners = new Set<(event: ChatStreamEvent) => void>()
 
-let activeStream: AbortController | null = null
+/**
+ * In-flight turn, or null.
+ *
+ * One at a time, app-wide. A tool call can be parked waiting for the user's
+ * approve/deny, and that parked state has to be cancellable too — otherwise
+ * `chat:stop` would leave a turn that can never finish and the next send would
+ * be silently dropped.
+ */
+/** An approval the SDK asked for and the user has not answered yet. */
+type ParkedApproval = {
+  approvalId: string
+  toolCallId: string
+  toolName: string
+  input: unknown
+  reason?: string
+}
+
+type ActiveTurn = {
+  controller: AbortController
+  /** Denies every approval this turn is parked on, if any. */
+  denyPending: (() => void) | null
+  /** Identifies this turn's capture buffer, so cleanup cannot hit a later turn. */
+  token: string
+  /** Needed to emit the terminal event when the turn is stopped. */
+  sessionId: string
+}
+
+let activeTurn: ActiveTurn | null = null
 
 function emit(event: ChatStreamEvent): void {
   for (const listener of listeners) listener(event)
@@ -85,9 +225,139 @@ export function onChatEvent(listener: (event: ChatStreamEvent) => void): () => v
   }
 }
 
+/**
+ * Cancels the in-flight turn without telling the renderer.
+ *
+ * Used when a turn is being *replaced* — a new message, or a cleared chat — and
+ * the renderer is already about to render the replacement. Emitting a terminal
+ * event here would arrive after the renderer's new turn state and wipe it, so
+ * only `stopActiveStream` reports.
+ *
+ * A parked approval is denied rather than left hanging, so the turn reaches a
+ * clean end instead of waiting forever on a prompt the user has walked away
+ * from.
+ */
 export function abortActiveStream(): void {
-  activeStream?.abort()
-  activeStream = null
+  abort(false)
+}
+
+/**
+ * Cancels the in-flight turn *because the user asked to stop*.
+ *
+ * The renderer only learns about it through the emitted event: the aborted
+ * stream produces no terminal event of its own, so without this the composer
+ * would stay disabled with no way to send again.
+ */
+export function stopActiveStream(): void {
+  abort(true)
+}
+
+function abort(notify: boolean): void {
+  const turn = activeTurn
+  if (!turn) return
+  // The old turn is being stopped, so the page it was using is about to become
+  // idle again.
+  if (isOpen()) scheduleIdleRelease()
+  // Denies rather than just aborting: any card still on screen would otherwise
+  // answer into a turn that no longer exists.
+  turn.denyPending?.()
+  turn.denyPending = null
+  turn.controller.abort()
+  activeTurn = null
+  // Emitted here, not in the stream's `finally`, because that runs after an
+  // await and so can land after the *next* turn has already started.
+  if (notify) emit({ type: "stopped", sessionId: turn.sessionId })
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tool approvals                                                              */
+/* -------------------------------------------------------------------------- */
+
+/** Pending approve/deny decisions, keyed by the id the SDK minted for the request. */
+const pendingApprovals = new Map<
+  string,
+  { resolve: (approved: boolean) => void; token: string }
+>()
+
+/**
+ * Releases every approval the given turn parked.
+ *
+ * Turn-scoped, not session-scoped: a stop that lands after the next turn has
+ * already started must not reach into it, which is the same reasoning the
+ * capture buffers are token-scoped for.
+ */
+function denyApprovalsFor(token: string): void {
+  for (const [id, waiting] of pendingApprovals) {
+    if (waiting.token !== token) continue
+    pendingApprovals.delete(id)
+    waiting.resolve(false)
+  }
+}
+
+/**
+ * Records the user's answer to a parked approval.
+ *
+ * Rejects unknown or already-answered ids rather than resolving whatever happens
+ * to be parked: a stale click on a card from a previous turn must not approve
+ * whatever the model is asking about now.
+ */
+export function respondToApproval(
+  approvalId: string,
+  approved: boolean,
+): { ok: true } | AiError {
+  const pending = pendingApprovals.get(approvalId)
+  if (!pending) return { ok: false, error: "That approval is no longer waiting for a decision." }
+  pendingApprovals.delete(approvalId)
+  // The turn is live again, so a pending eviction must not fire underneath it.
+  cancelIdleRelease()
+  pending.resolve(approved)
+  return { ok: true }
+}
+
+/**
+ * Called when the user opens the browser window from the sidebar, so a pending
+ * eviction cannot blank the page out from under them.
+ */
+export function cancelBrowserIdleRelease(): void {
+  cancelIdleRelease()
+}
+
+/* -------------------------------------------------------------------------- */
+/* Idle release                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How long a browser page may sit idle before its memory is reclaimed.
+ *
+ * Five minutes is long enough that a follow-up question ("now click the second
+ * result") still hits a live page — the common case, and re-navigating would
+ * throw away the page the user was looking at. Past that, the page has served no
+ * purpose: on an 8 GB machine a heavy tab held open indefinitely is a real cost
+ * with no user-visible benefit, and logins survive in the partition regardless.
+ */
+const BROWSER_IDLE_MS = 5 * 60_000
+
+let idleTimer: NodeJS.Timeout | null = null
+
+function cancelIdleRelease(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer)
+    idleTimer = null
+  }
+}
+
+function scheduleIdleRelease(): void {
+  cancelIdleRelease()
+  // A turn in flight owns the page — evicting it mid-task would destroy the refs
+  // the model is about to click. `activeTurn` is the authority on "busy", so the
+  // timer re-checks rather than the caller remembering to cancel.
+  idleTimer = setTimeout(() => {
+    idleTimer = null
+    if (activeTurn) return
+    void releasePageMemory()
+  }, BROWSER_IDLE_MS)
+  // Nothing else should keep the event loop alive for a page nobody is using.
+  idleTimer.unref?.()
 }
 
 /** Either the database or an open transaction — both can insert. */
@@ -105,6 +375,50 @@ async function insertMessage(
     .returning({ id: chatMessages.id })
     .get()
   return inserted.id
+}
+
+/**
+ * Serialises one tool call.
+ *
+ * JSON.stringify can throw on a value the model produced (a circular structure
+ * in a tool result, say). Callers must not lose the whole turn over that, so an
+ * unserialisable input or output is stored as a short marker rather than
+ * propagated — the timeline is a record of what happened, and "could not
+ * serialise this" is an accurate record.
+ */
+function toJson(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  try {
+    return JSON.stringify(value) ?? null
+  } catch {
+    return JSON.stringify({ unserialisable: true })
+  }
+}
+
+async function insertToolCall(
+  db: Executor,
+  sessionId: string,
+  messageId: number,
+  position: number,
+  call: RecordedToolCall,
+): Promise<void> {
+  await db
+    .insert(chatToolCalls)
+    .values({
+      sessionId,
+      messageId,
+      position,
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      input: toJson(call.input),
+      output: toJson(call.output),
+      status: call.status,
+      approved: call.approved,
+      durationMs: call.durationMs,
+      error: call.error,
+      createdAt: new Date(),
+    })
+    .run()
 }
 
 async function insertAttachment(
@@ -158,9 +472,26 @@ async function loadRows(sessionId: string): Promise<ChatMessage[]> {
     .orderBy(asc(chatAttachments.messageId), asc(chatAttachments.position))
     .all()
 
-  const byMessage = new Map<number, ChatAttachmentMeta[]>()
+  const toolCallRows = await db
+    .select({
+      messageId: chatToolCalls.messageId,
+      toolCallId: chatToolCalls.toolCallId,
+      toolName: chatToolCalls.toolName,
+      input: chatToolCalls.input,
+      output: chatToolCalls.output,
+      status: chatToolCalls.status,
+      approved: chatToolCalls.approved,
+      durationMs: chatToolCalls.durationMs,
+      error: chatToolCalls.error,
+    })
+    .from(chatToolCalls)
+    .where(eq(chatToolCalls.sessionId, sessionId))
+    .orderBy(asc(chatToolCalls.messageId), asc(chatToolCalls.position))
+    .all()
+
+  const attachmentsByMessage = new Map<number, ChatAttachmentMeta[]>()
   for (const attachment of attachmentRows) {
-    const list = byMessage.get(attachment.messageId) ?? []
+    const list = attachmentsByMessage.get(attachment.messageId) ?? []
     list.push({
       id: attachment.id,
       mediaType: attachment.mediaType,
@@ -169,14 +500,43 @@ async function loadRows(sessionId: string): Promise<ChatMessage[]> {
       height: attachment.height,
       byteSize: attachment.byteSize,
     })
-    byMessage.set(attachment.messageId, list)
+    attachmentsByMessage.set(attachment.messageId, list)
+  }
+
+  const toolCallsByMessage = new Map<number, RecordedToolCall[]>()
+  for (const call of toolCallRows) {
+    const list = toolCallsByMessage.get(call.messageId) ?? []
+    list.push({
+      toolCallId: call.toolCallId,
+      toolName: call.toolName,
+      input: fromJson(call.input),
+      output: fromJson(call.output),
+      status: call.status,
+      approved: call.approved,
+      durationMs: call.durationMs,
+      error: call.error,
+      // Not persisted; only ever used while the turn is live.
+      startedAt: 0,
+    })
+    toolCallsByMessage.set(call.messageId, list)
   }
 
   return rows.map((row) => ({
     role: row.role,
     text: row.content,
-    attachments: byMessage.get(row.id) ?? [],
+    attachments: attachmentsByMessage.get(row.id) ?? [],
+    toolCalls: toolCallsByMessage.get(row.id) ?? [],
   }))
+}
+
+/** Inverse of `toJson`; a row written by an older build may not parse. */
+function fromJson(value: string | null): unknown {
+  if (value === null) return null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -311,7 +671,19 @@ export async function sendChatMessage(
   try {
     const resolved = await resolveModelWithProvider()
     provider = resolved.provider
-    agent = new ToolLoopAgent({ model: resolved.model, instructions: CHAT_INSTRUCTIONS })
+    agent = new ToolLoopAgent({
+      model: resolved.model,
+      instructions: CHAT_INSTRUCTIONS,
+      tools: browserTools,
+      stopWhen: stepCountIs(BROWSER_STEP_LIMIT),
+      // A single expression rather than a per-tool map: read-only tools run
+      // without prompting, everything that can change something waits for a
+      // decision. See `browser/tools.ts` for why prompting on reads is harmful.
+      toolApproval: ({ toolCall }) => (isReadOnlyTool(toolCall.toolName) ? "approved" : "user-approval"),
+      // Verifies that an approval response came from this app and was not
+      // forged by a compromised renderer.
+      experimental_toolApprovalSecret: TOOL_APPROVAL_SECRET,
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { ok: false, error: message }
@@ -381,41 +753,255 @@ export async function sendChatMessage(
     return { ok: false, error: `Failed to save message: ${message}` }
   }
 
-  activeStream?.abort()
+  abortActiveStream()
+  cancelIdleRelease()
   const controller = new AbortController()
-  activeStream = controller
+  const turn: ActiveTurn = { controller, denyPending: null, token: randomUUID(), sessionId }
+  activeTurn = turn
+
+  // Captures arrive with the session id because the renderer only shows one
+  // conversation at a time, exactly like the rest of these events.
+  beginCaptures(turn.token, (capture) => {
+    emit({
+      type: "browser-capture",
+      sessionId,
+      attachmentId: capture.id,
+      mediaType: capture.mediaType,
+      width: capture.width,
+      height: capture.height,
+      dataBase64: capture.dataBase64,
+    })
+  })
 
   void (async () => {
     let full = ""
+    // Every tool call this turn made, recorded so the activity timeline survives
+    // a reload instead of living only in the renderer's memory.
+    const toolCalls: RecordedToolCall[] = []
+    // Grows across approvals: each resumed call carries the previous step's
+    // response plus this turn's tool message, so the model keeps its context
+    // through however many approvals the task needs.
+    let workingMessages = messages
+
     try {
-      const result = await agent.stream({ messages, abortSignal: controller.signal })
-      // `textStream` silently drops error parts, which would turn a failed
-      // request into a bogus "done", so consume the full part stream instead.
-      for await (const part of result.stream) {
-        if (part.type === "text-delta") {
-          full += part.text
-          emit({ type: "delta", sessionId, text: part.text })
-        } else if (part.type === "error") {
-          const err = part.error
-          const message = err instanceof Error ? err.message : String(err)
-          emit({ type: "error", sessionId, message })
-          return
-        } else if (part.type === "abort") {
-          return
+      for (;;) {
+        const result = await agent.stream({ messages: workingMessages, abortSignal: controller.signal })
+
+        // Every approval this step parked on. Usually one, but the SDK can
+        // request several when the model emits parallel tool calls, and all of
+        // them have to be answered before the step can resume.
+        // `responseMessages` is only available once the stream settles.
+        const parked: ParkedApproval[] = []
+
+        for await (const part of result.stream) {
+          if (part.type === "text-delta") {
+            full += part.text
+            emit({ type: "delta", sessionId, text: part.text })
+          } else if (part.type === "tool-call") {
+            // One entry per call, mutated in place as the call progresses. The
+            // SDK can emit a `tool-call` for a call whose approval is still
+            // pending, so the row has to exist before the user answers.
+            toolCalls.push({
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              input: part.input,
+              output: null,
+              status: "done",
+              approved: null,
+              durationMs: null,
+              error: null,
+              startedAt: Date.now(),
+            })
+            emit({
+              type: "tool-call",
+              sessionId,
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              input: part.input,
+            })
+          } else if (part.type === "tool-result") {
+            const call = toolCalls.find((entry) => entry.toolCallId === part.toolCallId)
+            const failure = failedToolOutput(part.output)
+            if (call) {
+              call.output = part.output
+              call.status = failure ? "error" : "done"
+              call.error = failure
+              call.durationMs = elapsedSince(call)
+            }
+            emit({
+              type: "tool-result",
+              sessionId,
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              output: part.output,
+            })
+          } else if (part.type === "tool-approval-request") {
+            // The SDK emits a request for **every** tool that goes through the
+            // approval policy, including the ones it has already approved
+            // itself — those arrive with `isAutomatic` and are answered in the
+            // same step, before the stream moves on. Parking on one would wait
+            // for a decision nobody is ever asked to make, so the turn would
+            // hang on the very first auto-approved read. Only a request that is
+            // still waiting on the user becomes a card.
+            if (part.isAutomatic) continue
+            const { approvalId, toolCall } = part
+            emit({
+              type: "approval-request",
+              sessionId,
+              approvalId,
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              input: toolCall.input,
+              ...(part.reason ? { reason: part.reason } : {}),
+            })
+            parked.push({
+              approvalId,
+              toolCallId: toolCall.toolCallId,
+              toolName: toolCall.toolName,
+              input: toolCall.input,
+              ...(part.reason ? { reason: part.reason } : {}),
+            })
+          } else if (part.type === "error") {
+            const err = part.error
+            const message = err instanceof Error ? err.message : String(err)
+            emit({ type: "error", sessionId, message })
+            return
+          } else if (part.type === "abort") {
+            return
+          }
+        }
+
+        if (parked.length === 0) break
+
+        // Parked on all of them together. The SDK reads every
+        // `tool-approval-response` off the resumed tool message, so answering
+        // them in separate passes is not possible — one wait covering the whole
+        // batch, one message carrying every decision.
+        //
+        // Sequentially rather than in parallel so the cards are answered in the
+        // order the model asked for them, and so one decision at a time keeps
+        // the "what is this doing?" question obvious.
+        //
+        // Every promise is created before the first one is awaited, though: the
+        // cards were all emitted a moment ago, and registering them one at a
+        // time would make a fast answer to the second card come back as "no
+        // longer waiting" — the user would have to click it again. The *wait*
+        // is ordered; the *answerability* is not.
+        const answers = new Map<string, Promise<boolean>>()
+        for (const approval of parked) {
+          answers.set(
+            approval.approvalId,
+            new Promise<boolean>((resolve) => {
+              pendingApprovals.set(approval.approvalId, { resolve, token: turn.token })
+            }),
+          )
+        }
+        // A stop while parked must release every unanswered card, or the turn
+        // waits forever on a prompt nobody can answer.
+        turn.denyPending = () => denyApprovalsFor(turn.token)
+
+        const decisions: { approvalId: string; approved: boolean }[] = []
+        for (const approval of parked) {
+          const approved = await answers.get(approval.approvalId)!
+          if (controller.signal.aborted) return
+
+          const call = toolCalls.find((entry) => entry.toolCallId === approval.toolCallId)
+          if (call) {
+            call.approved = approved
+            if (!approved) {
+              // A denied call never produces a result, so it has to be closed
+              // out here or the timeline would show it as still running.
+              call.status = "denied"
+              call.durationMs = elapsedSince(call)
+            }
+          }
+
+          emit({
+            type: "approval-response",
+            sessionId,
+            approvalId: approval.approvalId,
+            toolCallId: approval.toolCallId,
+            toolName: approval.toolName,
+            approved,
+          })
+          decisions.push({ approvalId: approval.approvalId, approved })
+        }
+        turn.denyPending = null
+
+        // Resume the loop: the SDK hands back every message produced so far,
+        // which we extend with this step's decisions and pass back in.
+        workingMessages = [
+          ...(await result.responseMessages),
+          {
+            role: "tool",
+            content: decisions.map((decision) => ({
+              type: "tool-approval-response" as const,
+              approvalId: decision.approvalId,
+              approved: decision.approved,
+            })),
+          },
+        ]
+      }
+
+      const finalText = full.trim()
+      // Peeked, not taken: the buffer stays live until every attachment row
+      // exists, so a failed insert still has files to clean up.
+      const captures = capturesFor(turn.token)
+
+      // A tool call that never produced a result was still something the user
+      // watched happen, so it is recorded as stopped rather than dropped. This
+      // has to happen before the rows are written, which is why it is a loop
+      // over the mutable array rather than something done at insert time.
+      for (const call of toolCalls) {
+        if (call.status === "done" && call.output === null && call.approved !== false) {
+          call.status = "stopped"
+          call.durationMs = elapsedSince(call)
         }
       }
-      const finalText = full.trim()
-      if (finalText) {
-        await insertMessage(getDb(), sessionId, "assistant", finalText)
+
+      if (finalText || captures.length > 0 || toolCalls.length > 0) {
+        // Captures and tool calls are the assistant turn's evidence and no user
+        // message comes after them, so they hang off the assistant row. Written
+        // after the id is known because `message_id` is not nullable.
+        const messageId = await insertMessage(getDb(), sessionId, "assistant", finalText)
+        for (const [index, capture] of captures.entries()) {
+          await insertAttachment(getDb(), sessionId, messageId, index, capture)
+        }
+        for (const [index, call] of toolCalls.entries()) {
+          await insertToolCall(getDb(), sessionId, messageId, index, call)
+        }
         await touchSession(sessionId)
       }
+      // Every capture now has a row pointing at it, so the files are reachable
+      // and must survive.
+      commitCaptures(turn.token)
       emit({ type: "done", sessionId })
     } catch (err) {
       if (controller.signal.aborted) return
       const message = err instanceof Error ? err.message : String(err)
       emit({ type: "error", sessionId, message })
     } finally {
-      if (activeStream === controller) activeStream = null
+      turn.denyPending = null
+      // Token-scoped, like the captures below: an old turn's cleanup must not
+      // delete a newer turn's approvals, which would leave that turn parked on
+      // promises nobody can reach any more.
+      for (const [id, pending] of pendingApprovals) {
+        if (pending.token === turn.token) pendingApprovals.delete(id)
+      }
+      // Anything still buffered at this point never reached a message row: the
+      // turn was stopped, the stream ended in error, or an insert threw. Either
+      // way nothing points at the files, so deleting them is what stops a
+      // browser session from filling the screenshots folder.
+      //
+      // Token-scoped, so a stopped turn whose cleanup lands after the next turn
+      // started cannot delete the *new* turn's captures.
+      await abandonCaptures(turn.token)
+      if (activeTurn === turn) {
+        activeTurn = null
+        // The turn is over, so the page is now idle. A browser that was never
+        // opened needs no timer at all.
+        if (isOpen()) scheduleIdleRelease()
+      }
     }
   })()
 

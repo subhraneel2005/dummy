@@ -9,7 +9,10 @@
     "dev:electron": "npm run build && electron .",
     "setup:whisper": "sh scripts/setup-whisper.sh",
     "db:generate": "drizzle-kit generate",
-    "test:providers": "node scripts/provider-compat.mjs"
+    "test:providers": "node scripts/provider-compat.mjs",
+    "test:browser": "npm run build && electron scripts/browser-smoke.mjs",
+    "test:approvals": "node scripts/approval-smoke.mjs",
+    "test": "npm run test:providers && npm run test:approvals && npm run build && electron scripts/browser-smoke.mjs"
   },
   "keywords": [],
   "author": "",
@@ -29,6 +32,7 @@
     "@ai-sdk/xai": "^5.0.8",
     "@libsql/client": "^0.18.0",
     "ai": "^7.0.114",
-    "drizzle-orm": "^1.0.0-rc.4"
+    "drizzle-orm": "^1.0.0-rc.4",
+    "zod": "^4.6.5"
   }
 }

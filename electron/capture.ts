@@ -223,8 +223,15 @@ function pickSource(
   )
 }
 
-/** Scales a long edge down to `MAX_IMAGE_EDGE`, leaving smaller images alone. */
-function downscale(png: Buffer): CapturedRegion {
+/**
+ * Scales a long edge down to `MAX_IMAGE_EDGE`, leaving smaller images alone.
+ *
+ * Exported because the browser window produces images on a different path than
+ * the screen capture, and both have to respect the same ceiling — an image
+ * larger than this is what makes a request fail on some providers and merely
+ * slow on others.
+ */
+export function downscale(png: Buffer): CapturedRegion {
   const image = nativeImage.createFromBuffer(png)
   const { width, height } = image.getSize()
   const longEdge = Math.max(width, height)

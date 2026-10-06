@@ -7,17 +7,22 @@
  * provider adapters, not in this app, so a version bump can change them without
  * touching any code here.
  *
- * This asserts the matrix against the installed adapters with the network
- * transport mocked out, which also proves the exact `UserContent` that
- * `buildUserContent` emits is accepted. Re-run after upgrading any `@ai-sdk/*`
- * package; if it fails, the expectations below are what need updating.
+ * It also guards provider **tool-calling** support (Feature 5, Phase 0), which is
+ * the same class of risk: the browser tools ride on the `ToolLoopAgent` every chat
+ * turn already uses, so a provider that cannot carry a tool definition or parse a
+ * tool call back degrades the feature to a silent no-op for that user.
+ *
+ * Both are asserted against the installed adapters with the network transport
+ * mocked out, which also proves the exact `UserContent` that `buildUserContent`
+ * emits is accepted. Re-run after upgrading any `@ai-sdk/*` package; if it fails,
+ * the expectations below are what need updating.
  *
  *   node scripts/provider-compat.mjs
  *
  * Pass `--update` to print the observed matrix instead of asserting it, for
  * when an upgrade legitimately changes the answer.
  */
-import { generateText } from "ai"
+import { generateText, jsonSchema, stepCountIs, tool } from "ai"
 import { createAnthropic } from "@ai-sdk/anthropic"
 import { createGoogleGenerativeAI } from "@ai-sdk/google"
 import { createOpenAI } from "@ai-sdk/openai"
@@ -156,6 +161,175 @@ for (const [caseName, content] of Object.entries(CASES)) {
       `  ${verdict} ${providerName.padEnd(10)} ${result.supported ? "supported" : `refused (${result.reason})`}`,
     )
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Feature 5, Phase 0 — tool-calling round trip                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The browser tools register on the existing `ToolLoopAgent`, so what has to hold
+ * per provider is the full cycle: a tool definition is serialized into the
+ * request, the response's tool call is parsed back and executed, and the tool
+ * result is sent on a follow-up request. A provider that fails any leg of that
+ * leaves the feature silently doing nothing.
+ *
+ * Deliberately uses the SDK's `jsonSchema` rather than zod: this guard is about
+ * *provider capability*, which is independent of how the schema is authored. The
+ * browser tools themselves will use zod, and both syntaxes serialize identically
+ * as far as any provider is concerned.
+ */
+const TOOL_RESULT_MARKER = "title-of:example.com"
+
+/** Real ids per provider, so an invalid-for-this-provider stub id cannot itself fail the probe. */
+const MODEL_IDS = {
+  openai: "gpt-4o-mini",
+  anthropic: "claude-sonnet-4-5",
+  google: "gemini-2.0-flash",
+  xai: "grok-3",
+}
+
+/** Every provider expects tools=true rather than a tool_choice enum. */
+const EXPECTED_TOOLS = { openai: true, anthropic: true, google: true, xai: true }
+
+/**
+ * The tool-call leg of the round trip, in each provider's own response shape.
+ * Detected off the request body the same way `shapeFor` does, so it does not
+ * depend on a URL a provider could change.
+ */
+const toolCallResponseFor = (body) => {
+  const args = { url: "https://example.com" }
+
+  // OpenAI Responses API routes tool calls through top-level `output` items.
+  if (Array.isArray(body.input)) {
+    return {
+      id: "resp_1", object: "response", created_at: 0, model: "m", status: "completed",
+      output: [{
+        type: "function_call", id: "fc_1", call_id: "call_1",
+        name: "get_page_title", arguments: JSON.stringify(args), status: "completed",
+      }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }
+  }
+
+  if (Array.isArray(body.contents)) {
+    return {
+      candidates: [{
+        content: {
+          parts: [{ functionCall: { name: "get_page_title", args } }],
+          role: "model",
+        },
+        finishReason: "STOP",
+      }],
+      usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+    }
+  }
+
+  if (typeof body.max_tokens === "number") {
+    return {
+      id: "msg_1", type: "message", role: "assistant", model: "m",
+      content: [{ type: "tool_use", id: "toolu_1", name: "get_page_title", input: args }],
+      stop_reason: "tool_use", stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }
+  }
+
+  // OpenAI chat completions: `tool_calls` on the assistant message.
+  return {
+    id: "chatcmpl_1", object: "chat.completion", created: 0, model: "m",
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant", content: null,
+        tool_calls: [{
+          id: "call_1", type: "function",
+          function: { name: "get_page_title", arguments: JSON.stringify(args) },
+        }],
+      },
+      finish_reason: "tool_calls",
+    }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }
+}
+
+/**
+ * Drives one full round trip against a mocked transport. Call 1 answers with a
+ * tool call, call 2 answers with text so the loop terminates.
+ */
+const probeToolCalling = async (providerName) => {
+  const bodies = []
+  let executed = false
+
+  const makeTool = () =>
+    tool({
+      description: "Return the title of the current page.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+        additionalProperties: false,
+      }),
+      execute: async ({ url }) => {
+        executed = true
+        return `title-of:${new URL(url).hostname}`
+      },
+    })
+
+  const mockFetch = async (_url, init) => {
+    const body = JSON.parse(init.body)
+    bodies.push(body)
+    const payload = bodies.length === 1 ? toolCallResponseFor(body) : shapeFor(body)
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+
+  try {
+    await generateText({
+      model: PROVIDERS[providerName](mockFetch)(MODEL_IDS[providerName]),
+      messages: [{ role: "user", content: "What is the title of https://example.com?" }],
+      tools: { get_page_title: makeTool() },
+      stopWhen: stepCountIs(5),
+    })
+  } catch (err) {
+    return { supported: false, reason: err.name }
+  }
+
+  // Leg 1: the tool definition reached the provider at all.
+  const first = bodies[0] ? JSON.stringify(bodies[0]) : ""
+  const serialized = first.includes("get_page_title") && first.includes("current page")
+
+  // Leg 2: the parsed tool call actually ran.
+  const ranTool = executed
+
+  // Leg 3: the result came back to the provider on a follow-up request.
+  const roundTripped =
+    bodies.length >= 2 && JSON.stringify(bodies.slice(1)).includes(TOOL_RESULT_MARKER)
+
+  if (serialized && ranTool && roundTripped) return { supported: true }
+  return {
+    supported: false,
+    reason: !serialized
+      ? "ToolNotSerialized"
+      : !ranTool
+        ? "ToolNotExecuted"
+        : "ToolResultNotSent",
+  }
+}
+
+console.log("\ntool-calling round trip")
+observed["tool-calling round trip"] = {}
+for (const providerName of Object.keys(PROVIDERS)) {
+  const result = await probeToolCalling(providerName)
+  observed["tool-calling round trip"][providerName] = result.supported
+  const expected = EXPECTED_TOOLS[providerName]
+  const agrees = result.supported === expected
+  if (!agrees) failures++
+  const verdict = update ? "   " : agrees ? "ok " : "FAIL"
+  console.log(
+    `  ${verdict} ${providerName.padEnd(10)} ${result.supported ? "supported" : `refused (${result.reason})`}`,
+  )
 }
 
 if (update) {

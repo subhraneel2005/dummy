@@ -61,6 +61,62 @@ type ChatEvent =
   | { type: "done"; sessionId: string }
   | { type: "error"; sessionId: string; message: string }
   | { type: "load-error"; message: string }
+  // Browser tool lifecycle. The timeline is driven by `tool-call`/`tool-result`;
+  // `approval-request` is what parks a turn until `chat.respondToApproval` runs.
+  | {
+      type: "tool-call"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+    }
+  | {
+      type: "tool-result"
+      sessionId: string
+      toolCallId: string
+      toolName: string
+      output: unknown
+    }
+  | {
+      type: "approval-request"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      input: unknown
+      reason?: string
+    }
+  | {
+      type: "approval-response"
+      sessionId: string
+      approvalId: string
+      toolCallId: string
+      toolName: string
+      approved: boolean
+    }
+  // A page the model captured. Carries the bytes so it can be shown now, and is
+  // written into the assistant's message when the turn ends.
+  | {
+      type: "browser-capture"
+      sessionId: string
+      attachmentId: string
+      mediaType: string
+      width: number
+      height: number
+      dataBase64: string
+    }
+
+/** Where the embedded browser currently is. Read-only; the model drives it via tools. */
+type BrowserStatus = {
+  page: { url: string; title: string } | null
+  open: boolean
+}
+
+/**
+ * Where the browser panel sits, in CSS pixels relative to the window viewport.
+ * `null` means the panel is collapsed.
+ */
+type BrowserBounds = { x: number; y: number; width: number; height: number }
 
 type ChatSession = {
   id: string
@@ -197,9 +253,17 @@ const electronAPI = {
         ipcRenderer.invoke("chat:rename-session", sessionId, title) as Promise<ChatSessionResult>,
       deleteSession: (sessionId: string) =>
         ipcRenderer.invoke("chat:delete-session", sessionId) as Promise<ChatSendResult>,
-      attachmentData: (attachmentId: string) =>
-        ipcRenderer.invoke("chat:attachment-data", attachmentId) as Promise<ChatAttachmentDataResult>,
-      open: (text: string) => ipcRenderer.send("chat:open", text),
+attachmentData: (attachmentId: string) =>
+          ipcRenderer.invoke("chat:attachment-data", attachmentId) as Promise<ChatAttachmentDataResult>,
+        // Stops the in-flight turn, including one parked on an approval.
+        stop: () => ipcRenderer.invoke("chat:stop") as Promise<{ ok: true }>,
+        // Answers a parked `approval-request`. Main rejects an id it does not
+        // recognise, so a stale card cannot approve a live request.
+        respondToApproval: (approvalId: string, approved: boolean) =>
+          ipcRenderer.invoke("chat:approval-response", approvalId, approved) as Promise<
+            { ok: true } | { ok: false; error: string }
+          >,
+        open: (text: string) => ipcRenderer.send("chat:open", text),
       takeInitialText: () => ipcRenderer.invoke("chat:take-initial-text") as Promise<ChatSeed | null>,
       ackInitialText: () => ipcRenderer.invoke("chat:ack-initial-text") as Promise<boolean>,
       onInitialText: (callback: (seed: ChatSeed) => void) => {
@@ -207,13 +271,28 @@ const electronAPI = {
         ipcRenderer.on("chat:initial-text", handler)
         return () => ipcRenderer.removeListener("chat:initial-text", handler)
       },
-      onEvent: (callback: (event: ChatEvent) => void) => {
+onEvent: (callback: (event: ChatEvent) => void) => {
         const handler = (_event: unknown, event: ChatEvent) => callback(event)
         ipcRenderer.on("chat:event", handler)
         return () => ipcRenderer.removeListener("chat:event", handler)
-      }
+      },
     },
-  ready: () => ipcRenderer.send("renderer:ready")
+    browser: {
+      show: () => ipcRenderer.invoke("browser:show") as Promise<BrowserStatus>,
+      status: () => ipcRenderer.invoke("browser:status") as Promise<BrowserStatus>,
+      // Collapses the panel without unloading the page behind it.
+      hide: () => ipcRenderer.invoke("browser:hide") as Promise<BrowserStatus>,
+      /** Where the panel is, in CSS pixels relative to the window's viewport. */
+      setBounds: (rect: BrowserBounds | null) =>
+        ipcRenderer.invoke("browser:set-bounds", rect) as Promise<{ ok: true } | { ok: false }>,
+      close: () => ipcRenderer.invoke("browser:close") as Promise<BrowserStatus>,
+      onStatus: (callback: (status: BrowserStatus) => void) => {
+        const handler = (_event: unknown, status: BrowserStatus) => callback(status)
+        ipcRenderer.on("browser:status", handler)
+        return () => ipcRenderer.removeListener("browser:status", handler)
+      },
+    },
+  ready: () => ipcRenderer.send("renderer:ready"),
 }
 
 contextBridge.exposeInMainWorld("electronAPI", electronAPI)
@@ -228,6 +307,8 @@ export type {
   ChatAttachmentDataResult,
   ChatAttachmentUpload,
   ChatEvent,
+  BrowserBounds,
+  BrowserStatus,
   ChatMessage,
   ChatSeed,
   ChatSession,
