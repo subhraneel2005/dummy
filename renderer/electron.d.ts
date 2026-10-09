@@ -5,6 +5,7 @@ interface AiConfig {
   model: string | null
   hasKey: boolean
   encryptionAvailable: boolean
+  browserBackend?: "embedded" | "deep"
 }
 
 interface ModelInfo {
@@ -25,9 +26,14 @@ type AiCatalogResult = {
   providers: Record<string, ProviderInfo>
   models: Record<string, ModelInfo[]>
 }
+interface ToolInfo {
+  name: string
+  description: string
+}
 type AiModelsResult =
   | { ok: true; models: ModelInfo[] }
   | { ok: false; error: string; models?: ModelInfo[] }
+type AiToolCatalogResult = { ok: true; tools: ToolInfo[] } | { ok: false; error: string }
 
 interface AiWipeCounts {
   messages: number
@@ -176,6 +182,55 @@ type CaptureInfo = {
   permissionMessage: string
 }
 
+/**
+ * One cell in a deep task's run (Feature 6), streamed over `browser:deep`.
+ * Keyed by the deep task's tool call id on the outside and pi's cell id inside.
+ */
+type DeepEvent =
+  | {
+      type: "deep-cell-start"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      kind: "code" | "finish"
+      code: string | null
+    }
+  | {
+      type: "deep-cell-delta"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+    }
+  | {
+      type: "deep-cell-end"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+      isError: boolean
+    }
+  // A human-verification wall handed to the user instead of fought.
+  | {
+      type: "deep-challenge"
+      sessionId: string | null
+      toolCallId: string
+      reason: string
+      snippet: string
+    }
+  // Whether the run is paused, however the pause was requested.
+  | {
+      type: "deep-control"
+      sessionId: string | null
+      toolCallId: string
+      paused: boolean
+    }
+
 /** One screenshot, as the renderer needs it to stage a preview. */
 type StagedCapture = ChatAttachment & { dataBase64: string }
 
@@ -226,6 +281,8 @@ declare global {
         setModel: (model: string) => Promise<AiConfigResult>
         setKey: (provider: string, key: string) => Promise<AiConfigResult>
         clearKey: (provider: string) => Promise<AiConfigResult>
+        setBrowserBackend: (backend: "embedded" | "deep") => Promise<AiConfigResult>
+        getToolCatalog: (backend?: "embedded" | "deep") => Promise<AiToolCatalogResult>
         wipeAllData: () => Promise<AiWipeResult>
         deleteAllImages: () => Promise<AiImagesDeleteResult>
       }
@@ -260,6 +317,11 @@ declare global {
         setBounds: (rect: BrowserBounds | null) => Promise<{ ok: true } | { ok: false }>
         close: () => Promise<BrowserStatus>
         onStatus: (callback: (status: BrowserStatus) => void) => () => void
+      }
+      deep: {
+        onEvent: (callback: (event: DeepEvent) => void) => () => void
+        pause: () => Promise<{ ok: boolean }>
+        resume: () => Promise<{ ok: boolean }>
       }
       onGlobalShortcut: (callback: (phase: "down" | "up") => void) => () => void
       ready: () => void

@@ -3,15 +3,17 @@ import { eq } from "drizzle-orm"
 import { getDb } from "../db/index.js"
 import { clearProviderKey, getProviderKey, isEncryptionAvailable, setProviderKey } from "../db/keys.js"
 import { settings } from "../db/schema.js"
-import { MODEL_CATALOG, PROVIDERS, isProviderId, type ProviderId } from "./models.js"
+import { MODEL_CATALOG, PROVIDERS, isProviderId, type BrowserBackend, type ProviderId } from "./models.js"
 const PROVIDER_KEY = "selected_provider"
 const MODEL_KEY = "selected_model"
+const BROWSER_BACKEND_KEY = "browser_backend"
 
 export interface AiConfig {
   provider: ProviderId | null
   model: string | null
   hasKey: boolean
   encryptionAvailable: boolean
+  browserBackend: BrowserBackend
 }
 
 async function readSetting(key: string): Promise<string | null> {
@@ -51,6 +53,7 @@ export async function getConfig(): Promise<AiConfig> {
     model: await getModel(),
     hasKey: provider ? await providerHasKey(provider) : false,
     encryptionAvailable: isEncryptionAvailable(),
+    browserBackend: await getBrowserBackend(),
   }
 }
 
@@ -78,4 +81,16 @@ export async function setApiKey(provider: ProviderId, key: string): Promise<void
 
 export async function clearApiKey(provider: ProviderId): Promise<void> {
   await clearProviderKey(provider)
+}
+
+export async function getBrowserBackend(): Promise<BrowserBackend> {
+  const value = await readSetting(BROWSER_BACKEND_KEY)
+  return value === "deep" ? "deep" : "embedded"
+}
+
+export async function setBrowserBackend(backend: BrowserBackend): Promise<void> {
+  if (backend !== "embedded" && backend !== "deep") {
+    throw new Error("Invalid browser backend")
+  }
+  await writeSetting(BROWSER_BACKEND_KEY, backend)
 }

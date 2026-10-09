@@ -1,27 +1,33 @@
-"use client"
+"use client";
 
-import { useCallback, useEffect, useRef, useState } from "react"
-import { CheckIcon, CopyIcon, FileTextIcon, MicIcon, PlusIcon } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckIcon,
+  CopyIcon,
+  FileTextIcon,
+  MicIcon,
+  PlusIcon,
+} from "lucide-react";
 
 import {
   Conversation,
   ConversationContent,
   ConversationScrollButton,
-} from "@/components/ai-elements/conversation"
+} from "@/components/ai-elements/conversation";
 import {
   Message,
   MessageAction,
   MessageActions,
   MessageContent,
   MessageResponse,
-} from "@/components/ai-elements/message"
+} from "@/components/ai-elements/message";
 import {
   Attachment,
   AttachmentInfo,
   AttachmentPreview,
   AttachmentRemove,
   Attachments,
-} from "@/components/ai-elements/attachments"
+} from "@/components/ai-elements/attachments";
 import {
   PromptInput,
   PromptInputButton,
@@ -32,31 +38,55 @@ import {
   PromptInputTools,
   usePromptInputAttachments,
   type PromptInputMessage,
-} from "@/components/ai-elements/prompt-input"
-import { AppSidebar, type ChatSession } from "@/components/app-sidebar"
-import { BrowserActivity } from "@/components/browser-activity"
-import { BrowserPanel } from "@/components/browser-panel"
-import AIVoice from "@/components/kokonutui/ai-voice"
-import { ProviderIcon, providerLabel } from "@/components/provider-icon"
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
+} from "@/components/ai-elements/prompt-input";
+import { AppSidebar, type ChatSession } from "@/components/app-sidebar";
+import { BrowserActivity } from "@/components/browser-activity";
+import { BrowserPanel } from "@/components/browser-panel";
+import AIVoice from "@/components/kokonutui/ai-voice";
+import { ProviderIcon, providerLabel } from "@/components/provider-icon";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import {
   useAttachmentSrc,
   useChat,
   type ChatAttachmentUpload,
   type ChatAttachmentView,
   type ChatMessage,
-} from "@/hooks/use-chat"
-import { useDictation } from "@/hooks/use-dictation"
-import { cn } from "@/lib/utils"
+} from "@/hooks/use-chat";
+import { useDictation } from "@/hooks/use-dictation";
+import { cn } from "@/lib/utils";
 
 /**
  * A transcript handed over by main when dictation ends. Declared locally rather
  * than shared, matching how the rest of this tree treats bridge types.
  */
-type ChatSeed = { text: string | null; holdId: string | null }
+type ChatSeed = { text: string | null; holdId: string | null };
 
 /** What `capture.consume` returns. Only the bytes matter to the composer. */
-type StagedCapture = { mediaType: string; fileName: string; dataBase64: string }
+type StagedCapture = {
+  mediaType: string;
+  fileName: string;
+  dataBase64: string;
+};
+
+/** One row of the `@` picker. Mirrors main's `ToolSummary`. */
+type ToolInfo = { name: string; description: string };
+
+/**
+ * Where the caret sits inside an `@` token, or null when it does not.
+ *
+ * The `@` has to start the message or follow whitespace, which is what keeps an
+ * email address or a stray `@` mid-word from opening the picker. The token is
+ * whatever word characters follow it.
+ */
+function mentionContext(
+  value: string,
+  caret: number,
+): { start: number; query: string } | null {
+  const match = /(?:^|\s)@([a-zA-Z0-9_]*)$/.exec(value.slice(0, caret));
+  if (!match) return null;
+  const query = match[1] ?? "";
+  return { start: caret - query.length - 1, query };
+}
 
 /**
  * Streamdown ships its vertical rhythm as `space-y-4` plus `my-4` on the code
@@ -66,7 +96,7 @@ type StagedCapture = { mediaType: string; fileName: string; dataBase64: string }
  * rhythm in app source (where it does get compiled) and zeroes the inherited
  * margins so the spacing is deliberate rather than whatever collapses last.
  */
-const MARKDOWN_SPACING = "[&>*]:!my-0 [&>*+*]:!mt-6"
+const MARKDOWN_SPACING = "[&>*]:!my-0 [&>*+*]:!mt-6";
 
 /**
  * Lists need their own rules, and they cannot come from the block rhythm above.
@@ -86,10 +116,10 @@ const MARKDOWN_LISTS = [
   // Nested lists sit tight under their parent item, indented a step further.
   "[&_li>ul]:!mt-1.5 [&_li>ol]:!mt-1.5",
   "[&_li>ul]:!pl-5 [&_li>ol]:!pl-5",
-].join(" ")
+].join(" ");
 
 /** Shared measure for the transcript, the hero and the composer. */
-const CHAT_COLUMN = "mx-auto w-full max-w-3xl"
+const CHAT_COLUMN = "mx-auto w-full max-w-3xl";
 
 /**
  * Matches the largest cap in main's attachment registry (`MAX_PDF_BYTES`).
@@ -101,7 +131,7 @@ const CHAT_COLUMN = "mx-auto w-full max-w-3xl"
  * that filtering here by type would silently drop files the user picked. Main
  * still reports the specific per-type limit when it rejects one.
  */
-const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024
+const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024;
 
 // Filled bubbles rather than bare text. The prompt is the action, so it gets the
 // `primary` surface; the reply gets the quieter `secondary` one.
@@ -114,13 +144,13 @@ const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024
 // `--secondary-foreground`, the token designed to sit on `--secondary`
 // (16.1:1 light, 14.3:1 dark).
 const USER_BUBBLE =
-  "group-[.is-user]:bg-primary group-[.is-user]:text-primary-foreground"
+  "group-[.is-user]:bg-primary group-[.is-user]:text-primary-foreground";
 const ASSISTANT_BUBBLE =
-  "group-[.is-assistant]:rounded-lg group-[.is-assistant]:bg-secondary group-[.is-assistant]:px-4 group-[.is-assistant]:py-3 group-[.is-assistant]:text-secondary-foreground"
+  "group-[.is-assistant]:rounded-lg group-[.is-assistant]:bg-secondary group-[.is-assistant]:px-4 group-[.is-assistant]:py-3 group-[.is-assistant]:text-secondary-foreground";
 
 export default function ChatWindowPage() {
-  const [activeId, setActiveId] = useState<string | null>(null)
-  const [sessions, setSessions] = useState<ChatSession[]>([])
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
   const {
     messages,
     streamingText,
@@ -129,36 +159,118 @@ export default function ChatWindowPage() {
     toolActivity,
     approvals,
     respondToApproval,
+    setDeepPaused,
     send,
     clearLocal,
-  } = useChat(activeId)
+  } = useChat(activeId);
   // A decision must not be sent twice from a double click, so the buttons
   // disable the moment one is chosen. The row itself stays visible: the
   // `approval-response` event is what updates it to Allowed/Denied.
-  const [respondingTo, setRespondingTo] = useState<string | null>(null)
+  const [respondingTo, setRespondingTo] = useState<string | null>(null);
   const answerApproval = useCallback(
     async (approvalId: string, approved: boolean) => {
-      setRespondingTo(approvalId)
+      setRespondingTo(approvalId);
       try {
-        await respondToApproval(approvalId, approved)
+        await respondToApproval(approvalId, approved);
       } finally {
-        setRespondingTo(null)
+        setRespondingTo(null);
       }
     },
     [respondToApproval],
-  )
-  const [job, setJob] = useState<{ id: number; text: string } | null>(null)
-  const jobIdRef = useRef(0)
-  const [draft, setDraft] = useState("")
+  );
+  const [job, setJob] = useState<{ id: number; text: string } | null>(null);
+  const jobIdRef = useRef(0);
+  const [draft, setDraft] = useState("");
   // A rejected pick (too large, too many files). Cleared as soon as the
   // attachment list changes so the warning tracks the thing it describes.
-  const [attachmentError, setAttachmentError] = useState("")
-  const clearAttachmentError = useCallback(() => setAttachmentError(""), [])
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-  const [config, setConfig] = useState<{ provider: string | null; model: string | null }>({
+  const [attachmentError, setAttachmentError] = useState("");
+  const clearAttachmentError = useCallback(() => setAttachmentError(""), []);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [config, setConfig] = useState<{
+    provider: string | null;
+    model: string | null;
+  }>({
     provider: null,
     model: null,
-  })
+  });
+
+  // `@`-mention picker. The catalog is whatever the current backend exposes, so
+  // the picker can never offer a tool the agent was not given.
+  const [tools, setTools] = useState<ToolInfo[]>([]);
+  const [mention, setMention] = useState<{
+    start: number;
+    query: string;
+  } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+
+  const matches = useMemo(() => {
+    if (!mention) return [];
+    const query = mention.query.toLowerCase();
+    if (!query) return tools;
+    return tools.filter(
+      (tool) =>
+        tool.name.toLowerCase().includes(query) ||
+        tool.description.toLowerCase().includes(query),
+    );
+  }, [mention, tools]);
+
+  const mentionOpen = mention !== null && matches.length > 0;
+
+  // Re-reads the caret after every edit and after a click into the text, since
+  // both decide whether the caret still sits inside an `@` token.
+  const syncMention = useCallback((el: HTMLTextAreaElement) => {
+    setMention(mentionContext(el.value, el.selectionStart ?? el.value.length));
+  }, []);
+
+  // The caret has to be put back after React re-renders the controlled value;
+  // without it the text lands but the cursor jumps to the end.
+  const insertMention = useCallback(
+    (name: string) => {
+      const el = inputRef.current;
+      if (!el || !mention) {
+        return;
+      }
+      const caret = mention.start + mention.query.length + 1;
+      const next = `${draft.slice(0, mention.start)}@${name} ${draft.slice(caret)}`;
+      setDraft(next);
+      setMention(null);
+      const at = mention.start + name.length + 2;
+      requestAnimationFrame(() => {
+        el.focus();
+        el.setSelectionRange(at, at);
+      });
+    },
+    [draft, mention],
+  );
+
+  const onComposerKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (!mention) return;
+      if (event.key === "Escape") {
+        // Kept open-but-dismissed is not a state this picker has: Escape drops
+        // the token context, so the next keystroke types normally.
+        event.preventDefault();
+        setMention(null);
+        return;
+      }
+      if (!mentionOpen) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        setMentionIndex(
+          (index) => (index + step + matches.length) % matches.length,
+        );
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        const tool = matches[mentionIndex];
+        if (!tool) return;
+        event.preventDefault();
+        insertMention(tool.name);
+      }
+    },
+    [insertMention, matches, mention, mentionIndex, mentionOpen],
+  );
 
   // Same STT + polish pipeline the dictation island uses (whisper.cpp, then the
   // technical-spelling pass), driven from a mic button instead of Alt+D. The
@@ -170,17 +282,17 @@ export default function ChatWindowPage() {
     start: startVoice,
     stop: stopVoice,
     reset: resetVoice,
-  } = useDictation()
+  } = useDictation();
   const voiceBusy =
     voiceState === "listening" ||
     voiceState === "transcribing" ||
-    voiceState === "polishing"
-  const voiceListening = voiceState === "listening"
+    voiceState === "polishing";
+  const voiceListening = voiceState === "listening";
 
   const toggleVoice = useCallback(() => {
-    if (voiceState === "listening") stopVoice()
-    else if (!voiceBusy) startVoice()
-  }, [startVoice, stopVoice, voiceBusy, voiceState])
+    if (voiceState === "listening") stopVoice();
+    else if (!voiceBusy) startVoice();
+  }, [startVoice, stopVoice, voiceBusy, voiceState]);
 
   // The finished transcript is an event, not derived state, so it is consumed
   // during render (React's documented pattern for "a prop changed, adjust
@@ -188,19 +300,21 @@ export default function ChatWindowPage() {
   // pass and trips the set-state-in-effect rule. `consumedTranscript` keeps the
   // same result from being appended twice, and clears on the next recording so
   // dictating identical words twice in a row still works.
-  const [consumedTranscript, setConsumedTranscript] = useState("")
-  if (voiceListening && consumedTranscript) setConsumedTranscript("")
+  const [consumedTranscript, setConsumedTranscript] = useState("");
+  if (voiceListening && consumedTranscript) setConsumedTranscript("");
   if (voiceState === "done" && voiceText && voiceText !== consumedTranscript) {
-    setConsumedTranscript(voiceText)
-    setDraft((prev) => (prev.trim() ? `${prev.trimEnd()} ${voiceText}` : voiceText))
+    setConsumedTranscript(voiceText);
+    setDraft((prev) =>
+      prev.trim() ? `${prev.trimEnd()} ${voiceText}` : voiceText,
+    );
   }
 
   // The hook holds a finished transcript on screen for a few seconds. Drop it as
   // soon as it has been consumed so the voice panel closes and the composer
   // returns to its resting height.
   useEffect(() => {
-    if (voiceState === "done") resetVoice()
-  }, [resetVoice, voiceState])
+    if (voiceState === "done") resetVoice();
+  }, [resetVoice, voiceState]);
 
   // Enter-to-send is handled by the textarea's own keydown, so it only fires
   // while the textarea holds focus. Stopping dictation moves focus to the voice
@@ -208,79 +322,106 @@ export default function ChatWindowPage() {
   // settles, which drops focus to <body> and leaves Enter doing nothing. Hand
   // focus back the moment a session finishes — however it finished, so an
   // error or a dropped recording behaves the same as a good one.
-  const voiceSessionRef = useRef(false)
+  const voiceSessionRef = useRef(false);
   useEffect(() => {
     if (voiceBusy) {
-      voiceSessionRef.current = true
-      return
+      voiceSessionRef.current = true;
+      return;
     }
-    if (!voiceSessionRef.current) return
-    voiceSessionRef.current = false
-    inputRef.current?.focus()
-  }, [voiceBusy])
+    if (!voiceSessionRef.current) return;
+    voiceSessionRef.current = false;
+    inputRef.current?.focus();
+  }, [voiceBusy]);
 
   // The provider/model shown in the chrome comes from the same settings the
   // send path uses, so it can never drift from what actually answers.
   const refreshConfig = useCallback(async () => {
-    const result = await window.electronAPI?.ai.getConfig()
+    const result = await window.electronAPI?.ai.getConfig();
     if (result?.ok) {
-      setConfig({ provider: result.config.provider, model: result.config.model })
+      setConfig({
+        provider: result.config.provider,
+        model: result.config.model,
+      });
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    let cancelled = false
+    let cancelled = false;
     void window.electronAPI?.ai.getConfig().then((result) => {
-      if (cancelled || !result?.ok) return
-      setConfig({ provider: result.config.provider, model: result.config.model })
-    })
+      if (cancelled || !result?.ok) return;
+      setConfig({
+        provider: result.config.provider,
+        model: result.config.model,
+      });
+    });
     return () => {
-      cancelled = true
-    }
-  }, [])
+      cancelled = true;
+    };
+  }, []);
+
+  // The picker lists the tools the current backend exposes, so it is read from
+  // main rather than hardcoded here. Fetched on mount: settings is a route
+  // inside this window, so changing the backend unmounts this page and the next
+  // visit refetches with the new lane.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const result = await window.electronAPI?.ai.getConfig();
+      if (cancelled || !result?.ok) return;
+      const catalog = await window.electronAPI?.ai.getToolCatalog(
+        result.config.browserBackend,
+      );
+      if (cancelled) return;
+      setTools(catalog?.ok ? catalog.tools : []);
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshSessions = useCallback(async () => {
-    const result = await window.electronAPI?.chat.listSessions()
-    if (result?.ok) setSessions(result.sessions)
-  }, [])
+    const result = await window.electronAPI?.chat.listSessions();
+    if (result?.ok) setSessions(result.sessions);
+  }, []);
 
   useEffect(() => {
-    let cancelled = false
+    let cancelled = false;
     void window.electronAPI?.chat.listSessions().then((result) => {
-      if (cancelled || !result?.ok) return
-      setSessions(result.sessions)
-    })
+      if (cancelled || !result?.ok) return;
+      setSessions(result.sessions);
+    });
     return () => {
-      cancelled = true
-    }
-  }, [])
+      cancelled = true;
+    };
+  }, []);
 
   // A finished turn is the moment a thread's auto-title and recency settle, so
   // that is when the sidebar list is worth re-reading.
-  const wasSending = useRef(false)
+  const wasSending = useRef(false);
   useEffect(() => {
     if (!wasSending.current || sending) {
-      wasSending.current = sending
-      return
+      wasSending.current = sending;
+      return;
     }
-    wasSending.current = false
-    let cancelled = false
+    wasSending.current = false;
+    let cancelled = false;
     void window.electronAPI?.chat.listSessions().then((result) => {
-      if (cancelled || !result?.ok) return
-      setSessions(result.sessions)
-    })
+      if (cancelled || !result?.ok) return;
+      setSessions(result.sessions);
+    });
     // The provider can be switched from settings while a turn is in flight.
-    void refreshConfig()
+    void refreshConfig();
     return () => {
-      cancelled = true
-    }
-  }, [sending, refreshConfig])
+      cancelled = true;
+    };
+  }, [sending, refreshConfig]);
 
   const enqueue = useCallback((text: string) => {
-    if (!text.trim()) return
-    jobIdRef.current += 1
-    setJob({ id: jobIdRef.current, text })
-  }, [])
+    if (!text.trim()) return;
+    jobIdRef.current += 1;
+    setJob({ id: jobIdRef.current, text });
+  }, []);
 
   /**
    * Screenshots waiting to be dropped into the composer.
@@ -290,7 +431,7 @@ export default function ChatWindowPage() {
    * to decide it. A hold that captured nothing keeps the old auto-send, so
    * plain dictation is unchanged.
    */
-  const [staged, setStaged] = useState<StagedCapture[]>([])
+  const [staged, setStaged] = useState<StagedCapture[]>([]);
 
   /**
    * Whether the browser panel is expanded, and where the page behind it is.
@@ -299,65 +440,70 @@ export default function ChatWindowPage() {
    * one state, one owner, so the sidebar button and the panel's own collapse
    * control can never disagree about what is on screen.
    */
-  const [browserOpen, setBrowserOpen] = useState(false)
-  const [browserPage, setBrowserPage] = useState<{ url: string; title: string } | null>(null)
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserPage, setBrowserPage] = useState<{
+    url: string;
+    title: string;
+  } | null>(null);
   useEffect(() => {
-    const api = window.electronAPI?.browser
-    if (!api) return
-    void api.status().then((status) => setBrowserPage(status.page))
-    return api.onStatus((status) => setBrowserPage(status.page))
-  }, [])
+    const api = window.electronAPI?.browser;
+    if (!api) return;
+    void api.status().then((status) => setBrowserPage(status.page));
+    return api.onStatus((status) => setBrowserPage(status.page));
+  }, []);
 
   const applySeed = useCallback(
     (seed: ChatSeed) => {
       if (seed.holdId) {
-        if (seed.text) setDraft(seed.text)
-        void window.electronAPI?.capture.consume(seed.holdId).then((captures) => {
-          if (captures.length > 0) setStaged(captures)
-        })
-        return
+        if (seed.text) setDraft(seed.text);
+        void window.electronAPI?.capture
+          .consume(seed.holdId)
+          .then((captures) => {
+            if (captures.length > 0) setStaged(captures);
+          });
+        return;
       }
-      if (seed.text) enqueue(seed.text)
+      if (seed.text) enqueue(seed.text);
     },
-    [enqueue]
-  )
+    [enqueue],
+  );
 
   // `takeInitialText` is non-destructive: main keeps the seed until we ack it,
   // so an effect torn down mid-flight (HMR, reload) can't lose it.
   useEffect(() => {
-    let cancelled = false
+    let cancelled = false;
     void window.electronAPI?.chat
       .takeInitialText()
       .then((seed) => {
-        if (cancelled || !seed) return
-        applySeed(seed)
-        void window.electronAPI?.chat.ackInitialText()
+        if (cancelled || !seed) return;
+        applySeed(seed);
+        void window.electronAPI?.chat.ackInitialText();
       })
-      .catch(() => undefined)
+      .catch(() => undefined);
     return () => {
-      cancelled = true
-    }
-  }, [applySeed])
+      cancelled = true;
+    };
+  }, [applySeed]);
 
   useEffect(() => {
-    return window.electronAPI?.chat.onInitialText((seed) => applySeed(seed))
-  }, [applySeed])
+    return window.electronAPI?.chat.onInitialText((seed) => applySeed(seed));
+  }, [applySeed]);
 
   /** Sends into `activeId`, minting an id when this is a brand-new thread. */
   const dispatch = useCallback(
     async (text: string, uploads: readonly ChatAttachmentUpload[] = []) => {
-      const trimmed = text.trim()
+      const trimmed = text.trim();
       // Images with no caption are a valid message; nothing at all is not.
-      if ((!trimmed && uploads.length === 0) || sending) return
-      const target = activeId ?? crypto.randomUUID()
-      if (!activeId) setActiveId(target)
+      if ((!trimmed && uploads.length === 0) || sending) return;
+      const target = activeId ?? crypto.randomUUID();
+      if (!activeId) setActiveId(target);
       // `send` appends the prompt to the transcript, so the box can be emptied
       // immediately instead of holding a stale copy that Enter would resend.
-      setDraft("")
-      await send(trimmed, target, uploads)
+      setDraft("");
+      await send(trimmed, target, uploads);
     },
-    [activeId, send, sending]
-  )
+    [activeId, send, sending],
+  );
 
   // Consume the queued transcript.
   //
@@ -365,14 +511,14 @@ export default function ChatWindowPage() {
   // useCallback keyed on `sending`, so its identity changes every time a request
   // starts and finishes. Depending on it alone made this effect re-send the same
   // transcript on each toggle. Only a genuinely new job may send.
-  const handledJobRef = useRef(0)
+  const handledJobRef = useRef(0);
   useEffect(() => {
-    if (!job || job.id === handledJobRef.current) return
-    handledJobRef.current = job.id
+    if (!job || job.id === handledJobRef.current) return;
+    handledJobRef.current = job.id;
     // Auto-sent dictation never carries screenshots — a hold with captures
     // stages for review instead, so `uploads` is always empty on this path.
-    void dispatch(job.text)
-  }, [job, dispatch])
+    void dispatch(job.text);
+  }, [job, dispatch]);
 
   /**
    * `PromptInput` strips each part's `id` when it converts blob URLs to data
@@ -381,13 +527,13 @@ export default function ChatWindowPage() {
    */
   const submit = useCallback(
     async ({ text, files }: PromptInputMessage) => {
-      const uploads: ChatAttachmentUpload[] = []
+      const uploads: ChatAttachmentUpload[] = [];
       for (const part of files ?? []) {
         // Data URLs are what the component hands over; a blob URL that failed to
         // convert cannot be sent, so it is dropped rather than sent as garbage.
-        const comma = part.url?.indexOf(",") ?? -1
-        const dataBase64 = comma >= 0 ? part.url.slice(comma + 1) : ""
-        if (!dataBase64) continue
+        const comma = part.url?.indexOf(",") ?? -1;
+        const dataBase64 = comma >= 0 ? part.url.slice(comma + 1) : "";
+        if (!dataBase64) continue;
         uploads.push({
           id: crypto.randomUUID().replace(/-/g, ""),
           mediaType: part.mediaType,
@@ -396,55 +542,59 @@ export default function ChatWindowPage() {
           // as unsupported, which is the honest answer.
           fileName: part.filename || "attachment",
           dataBase64,
-        })
+        });
       }
-      await dispatch(text, uploads)
-      setAttachmentError("")
+      await dispatch(text, uploads);
+      setAttachmentError("");
     },
-    [dispatch]
-  )
+    [dispatch],
+  );
 
   const startNewChat = useCallback(() => {
-    clearLocal()
-    setActiveId(null)
-    setDraft("")
-  }, [clearLocal])
+    clearLocal();
+    setActiveId(null);
+    setDraft("");
+  }, [clearLocal]);
 
   const selectSession = useCallback(
     (id: string) => {
-      if (id === activeId) return
-      clearLocal()
-      setActiveId(id)
-      setDraft("")
+      if (id === activeId) return;
+      clearLocal();
+      setActiveId(id);
+      setDraft("");
     },
-    [activeId, clearLocal]
-  )
+    [activeId, clearLocal],
+  );
 
   const renameSession = useCallback(
     async (id: string, title: string) => {
-      const result = await window.electronAPI?.chat.renameSession(id, title)
-      if (result?.ok) void refreshSessions()
+      const result = await window.electronAPI?.chat.renameSession(id, title);
+      if (result?.ok) void refreshSessions();
     },
-    [refreshSessions]
-  )
+    [refreshSessions],
+  );
 
   const deleteSession = useCallback(
     async (id: string) => {
-      const result = await window.electronAPI?.chat.deleteSession(id)
-      if (!result?.ok) return
-      if (id === activeId) startNewChat()
-      void refreshSessions()
+      const result = await window.electronAPI?.chat.deleteSession(id);
+      if (!result?.ok) return;
+      if (id === activeId) startNewChat();
+      void refreshSessions();
     },
-    [activeId, refreshSessions, startNewChat]
-  )
+    [activeId, refreshSessions, startNewChat],
+  );
 
   // "Thinking" is the absence of output, so anything the model has produced
   // suppresses it — including a parked approval. Showing "Thinking" directly
   // above a question the user is being asked to answer reads as if the request
   // were ignored, when in fact it is waiting on them.
-  const showThinking = sending && !streamingText && approvals.length === 0
+  const showThinking = sending && !streamingText && approvals.length === 0;
   const isEmpty =
-    !messages.length && !streamingText && !showThinking && !approvals.length && !Object.keys(toolActivity).length
+    !messages.length &&
+    !streamingText &&
+    !showThinking &&
+    !approvals.length &&
+    !Object.keys(toolActivity).length;
 
   return (
     <SidebarProvider className="h-dvh overflow-hidden bg-background">
@@ -496,6 +646,7 @@ export default function ChatWindowPage() {
                 approvals={approvals}
                 onRespond={answerApproval}
                 responding={respondingTo !== null}
+                onDeepControl={setDeepPaused}
               />
 
               {streamingText ? (
@@ -504,7 +655,10 @@ export default function ChatWindowPage() {
                     className={cn("max-w-full", ASSISTANT_BUBBLE)}
                     aria-live="polite"
                   >
-                    <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating>
+                    <MessageResponse
+                      className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)}
+                      isAnimating
+                    >
                       {streamingText}
                     </MessageResponse>
                   </MessageContent>
@@ -513,8 +667,12 @@ export default function ChatWindowPage() {
 
               {showThinking ? (
                 <Message from="assistant" className="max-w-full">
-                  <MessageContent className={cn("max-w-full", ASSISTANT_BUBBLE)}>
-                    <p className="text-sm motion-safe:animate-pulse">Thinking</p>
+                  <MessageContent
+                    className={cn("max-w-full", ASSISTANT_BUBBLE)}
+                  >
+                    <p className="text-sm motion-safe:animate-pulse">
+                      Thinking
+                    </p>
                   </MessageContent>
                 </Message>
               ) : null}
@@ -556,51 +714,149 @@ export default function ChatWindowPage() {
               group, so the border, the radius, the row gap and the collapsed
               height all have to be restated against the group itself.
               `border-input` (white/15%) is heavier than the hairline asked for. */}
-          <PromptInput
-            onSubmit={submit}
-            maxFileSize={MAX_ATTACHMENT_FILE_BYTES}
-            onError={(err) => setAttachmentError(err.message)}
-            className="w-full shadow-none [&_[data-slot=input-group]]:gap-1 [&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border-border"
-          >
-            <ComposerHeader
-              voiceActive={voiceBusy}
-              voiceListening={voiceListening}
-              voiceError={voiceState === "error" ? voiceError : ""}
-              attachmentError={attachmentError}
-              onClearAttachmentError={clearAttachmentError}
-              onStopVoice={stopVoice}
+          {/* `relative` anchors the picker to the composer's own box so the
+              panel grows upward instead of off the bottom of the window. */}
+          <div className="relative">
+            <ToolPicker
+              open={mentionOpen}
+              tools={matches}
+              active={mentionIndex}
+              onActive={setMentionIndex}
+              onPick={insertMention}
             />
-            <StagedCaptureInbox captures={staged} onConsumed={() => setStaged([])} />
-            <PromptInputTextarea
-              ref={inputRef}
-              value={draft}
-              onChange={(e) => setDraft(e.currentTarget.value)}
-              placeholder="Send a message, or tap the mic to dictate…"
-              aria-label="Message"
-              // `md:` is required: shadcn's Textarea ships `text-base md:text-sm`,
-              // and the responsive variant survives twMerge as its own group.
-              // `py-2` (not `py-3.5`) keeps the collapsed box short, and
-              // `min-h-0` is the load-bearing part: `PromptInputTextarea` ships
-              // `min-h-16`, which alone pinned the box at 64px before any
-              // padding was counted. `max-h-32` caps the growth.
-              className="min-h-0 max-h-32 px-4 py-1.5 text-[0.9375rem] leading-relaxed md:text-[0.9375rem]"
-            />
-            <PromptInputFooter className="px-1.5 pt-0 pb-1">
-              <PromptInputTools>
-                <AddAttachmentsButton />
-                <VoiceButton
-                  listening={voiceListening}
-                  busy={voiceBusy}
-                  onToggle={toggleVoice}
+            <PromptInput
+              onSubmit={submit}
+              maxFileSize={MAX_ATTACHMENT_FILE_BYTES}
+              onError={(err) => setAttachmentError(err.message)}
+              className="w-full shadow-none [&_[data-slot=input-group]]:gap-1 [&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:border-border"
+            >
+              <ComposerHeader
+                voiceActive={voiceBusy}
+                voiceListening={voiceListening}
+                voiceError={voiceState === "error" ? voiceError : ""}
+                attachmentError={attachmentError}
+                onClearAttachmentError={clearAttachmentError}
+                onStopVoice={stopVoice}
+              />
+              <StagedCaptureInbox
+                captures={staged}
+                onConsumed={() => setStaged([])}
+              />
+              <PromptInputTextarea
+                ref={inputRef}
+                value={draft}
+                onChange={(e) => {
+                  setDraft(e.currentTarget.value);
+                  syncMention(e.currentTarget);
+                  setMentionIndex(0);
+                }}
+                onKeyDown={onComposerKeyDown}
+                // Clicking back into a half-typed `@` token has to reopen the
+                // picker, and so does landing the caret there with the arrow keys.
+                onClick={(e) => syncMention(e.currentTarget)}
+                onKeyUp={(e) => {
+                  if (e.key.startsWith("Arrow")) syncMention(e.currentTarget);
+                }}
+                placeholder="Send a message, or tap the mic to dictate…"
+                aria-label="Message"
+                // `md:` is required: shadcn's Textarea ships `text-base md:text-sm`,
+                // and the responsive variant survives twMerge as its own group.
+                // `py-2` (not `py-3.5`) keeps the collapsed box short, and
+                // `min-h-0` is the load-bearing part: `PromptInputTextarea` ships
+                // `min-h-16`, which alone pinned the box at 64px before any
+                // padding was counted. `max-h-32` caps the growth.
+                className="min-h-0 max-h-32 px-4 py-1.5 text-[0.9375rem] leading-relaxed md:text-[0.9375rem]"
+              />
+              <PromptInputFooter className="px-1.5 pt-0 pb-1">
+                <PromptInputTools>
+                  <AddAttachmentsButton />
+                  <VoiceButton
+                    listening={voiceListening}
+                    busy={voiceBusy}
+                    onToggle={toggleVoice}
+                  />
+                </PromptInputTools>
+                <ComposerSubmit
+                  busy={sending}
+                  hasText={Boolean(draft.trim())}
                 />
-              </PromptInputTools>
-              <ComposerSubmit busy={sending} hasText={Boolean(draft.trim())} />
-            </PromptInputFooter>
-          </PromptInput>
+              </PromptInputFooter>
+            </PromptInput>
+          </div>
         </footer>
       </SidebarInset>
     </SidebarProvider>
-  )
+  );
+}
+
+/**
+ * The `@` picker.
+ *
+ * Opens above the composer, lists the tools the current backend exposes, and
+ * inserts the picked name at the caret. Navigation is keyboard-first because the
+ * caret never leaves the textarea — the panel is a visual echo of the selection
+ * the user is driving with the arrow keys, which is why it never takes focus.
+ */
+function ToolPicker({
+  open,
+  tools,
+  active,
+  onActive,
+  onPick,
+}: {
+  open: boolean;
+  tools: ToolInfo[];
+  active: number;
+  onActive: (index: number) => void;
+  onPick: (name: string) => void;
+}) {
+  if (!open) return null;
+  return (
+    <div className="absolute right-0 bottom-full left-0 z-20 mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
+      <ul
+        role="listbox"
+        aria-label="Tools"
+        // The textarea keeps focus, so this has to be a live region to be read.
+        aria-activedescendant={
+          tools[active] ? `tool-${tools[active].name}` : undefined
+        }
+        className="max-h-64 overflow-y-auto p-1"
+      >
+        {tools.map((tool, index) => (
+          <li
+            key={tool.name}
+            id={`tool-${tool.name}`}
+            role="option"
+            aria-selected={index === active}
+          >
+            <button
+              type="button"
+              // Without this the textarea blurs before the insert lands, and the
+              // caret the insertion depends on is gone.
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => onActive(index)}
+              onClick={() => onPick(tool.name)}
+              className={cn(
+                "flex w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                index === active
+                  ? "bg-accent text-accent-foreground"
+                  : "hover:bg-accent/50",
+              )}
+            >
+              <span className="font-mono text-[0.8125rem] font-medium">
+                @{tool.name}
+              </span>
+              {tool.description ? (
+                <span className="line-clamp-2 text-xs text-muted-foreground">
+                  {tool.description}
+                </span>
+              ) : null}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 function VoiceButton({
@@ -608,14 +864,16 @@ function VoiceButton({
   busy,
   onToggle,
 }: {
-  listening: boolean
-  busy: boolean
-  onToggle: () => void
+  listening: boolean;
+  busy: boolean;
+  onToggle: () => void;
 }) {
   return (
     <PromptInputButton
       variant="ghost"
-      tooltip={listening ? "Stop dictation" : busy ? "Working…" : "Dictate message"}
+      tooltip={
+        listening ? "Stop dictation" : busy ? "Working…" : "Dictate message"
+      }
       aria-label={listening ? "Stop dictation" : "Dictate message"}
       aria-pressed={listening}
       // Busy means the audio is already captured and is being transcribed, so
@@ -624,12 +882,12 @@ function VoiceButton({
       onClick={onToggle}
       className={cn(
         "text-muted-foreground hover:text-foreground",
-        listening && "text-destructive hover:text-destructive"
+        listening && "text-destructive hover:text-destructive",
       )}
     >
       <MicIcon className={cn(listening && "motion-safe:animate-pulse")} />
     </PromptInputButton>
-  )
+  );
 }
 
 /**
@@ -645,28 +903,28 @@ function ComposerHeader({
   onClearAttachmentError,
   onStopVoice,
 }: {
-  voiceActive: boolean
-  voiceListening: boolean
-  voiceError: string
-  attachmentError: string
-  onClearAttachmentError: () => void
-  onStopVoice: () => void
+  voiceActive: boolean;
+  voiceListening: boolean;
+  voiceError: string;
+  attachmentError: string;
+  onClearAttachmentError: () => void;
+  onStopVoice: () => void;
 }) {
-  const attachments = usePromptInputAttachments()
-  const hasFiles = attachments.files.length > 0
-  const fileCount = attachments.files.length
-  const error = attachmentError || voiceError
+  const attachments = usePromptInputAttachments();
+  const hasFiles = attachments.files.length > 0;
+  const fileCount = attachments.files.length;
+  const error = attachmentError || voiceError;
   // The warning describes a rejected pick, so it stops applying the moment the
   // list it was about changes. Keyed on the count because that is the only
   // thing a pick alters, and re-renders alone must not clear it.
-  const seenCount = useRef(fileCount)
+  const seenCount = useRef(fileCount);
   useEffect(() => {
     if (seenCount.current !== fileCount) {
-      seenCount.current = fileCount
-      onClearAttachmentError()
+      seenCount.current = fileCount;
+      onClearAttachmentError();
     }
-  }, [fileCount, onClearAttachmentError])
-  if (!voiceActive && !error && !hasFiles) return null
+  }, [fileCount, onClearAttachmentError]);
+  if (!voiceActive && !error && !hasFiles) return null;
 
   return (
     <PromptInputHeader>
@@ -698,12 +956,12 @@ function ComposerHeader({
 
       {hasFiles ? <PromptAttachments /> : null}
     </PromptInputHeader>
-  )
+  );
 }
 
 function PromptAttachments() {
-  const attachments = usePromptInputAttachments()
-  if (!attachments.files.length) return null
+  const attachments = usePromptInputAttachments();
+  if (!attachments.files.length) return null;
 
   // Composed from the ready-made ai-elements primitives rather than a bespoke
   // list: `Attachments` supplies the layout/variant context, and each
@@ -722,7 +980,7 @@ function PromptAttachments() {
         </Attachment>
       ))}
     </Attachments>
-  )
+  );
 }
 
 /**
@@ -740,30 +998,30 @@ function StagedCaptureInbox({
   captures,
   onConsumed,
 }: {
-  captures: StagedCapture[]
-  onConsumed: () => void
+  captures: StagedCapture[];
+  onConsumed: () => void;
 }) {
-  const { add } = usePromptInputAttachments()
+  const { add } = usePromptInputAttachments();
   // Effects run twice in development StrictMode, and adding the same batch twice
   // would duplicate every attachment, so the batch is keyed and remembered.
-  const addedKey = useRef("")
+  const addedKey = useRef("");
 
   useEffect(() => {
-    const key = captures.map((capture) => capture.fileName).join("|")
-    if (!key || key === addedKey.current) return
-    addedKey.current = key
+    const key = captures.map((capture) => capture.fileName).join("|");
+    if (!key || key === addedKey.current) return;
+    addedKey.current = key;
     add(
       captures.map(
         (capture) =>
           new File([base64ToBytes(capture.dataBase64)], capture.fileName, {
             type: capture.mediaType,
-          })
-      )
-    )
-    onConsumed()
-  }, [captures, add, onConsumed])
+          }),
+      ),
+    );
+    onConsumed();
+  }, [captures, add, onConsumed]);
 
-  return null
+  return null;
 }
 
 /**
@@ -771,8 +1029,14 @@ function StagedCaptureInbox({
  * context — without that, a message of nothing but screenshots would have no
  * enabled way out of the composer.
  */
-function ComposerSubmit({ busy, hasText }: { busy: boolean; hasText: boolean }) {
-  const { files } = usePromptInputAttachments()
+function ComposerSubmit({
+  busy,
+  hasText,
+}: {
+  busy: boolean;
+  hasText: boolean;
+}) {
+  const { files } = usePromptInputAttachments();
   return (
     <PromptInputSubmit
       // "streaming" while a reply is arriving, "submitted" while it is being
@@ -787,21 +1051,21 @@ function ComposerSubmit({ busy, hasText }: { busy: boolean; hasText: boolean }) 
       // exactly the one the user needs to be able to abort.
       disabled={busy ? false : !hasText && files.length === 0}
     />
-  )
+  );
 }
 
 /** `Uint8Array<ArrayBuffer>` rather than the default `ArrayBufferLike`, which `Blob` rejects. */
 function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
+    bytes[index] = binary.charCodeAt(index);
   }
-  return bytes
+  return bytes;
 }
 
 function AddAttachmentsButton() {
-  const attachments = usePromptInputAttachments()
+  const attachments = usePromptInputAttachments();
   return (
     <PromptInputButton
       variant="ghost"
@@ -812,18 +1076,18 @@ function AddAttachmentsButton() {
     >
       <PlusIcon />
     </PromptInputButton>
-  )
+  );
 }
 
 function ChatRow({ message }: { message: ChatMessage }) {
-  const hasText = message.text.trim().length > 0
-  const { attachments } = message
+  const hasText = message.text.trim().length > 0;
+  const { attachments } = message;
   return (
     <Message from={message.role} className="max-w-full gap-1.5">
       <MessageContent
         className={cn(
           "max-w-full break-words text-[0.9375rem] leading-relaxed",
-          message.role === "user" ? USER_BUBBLE : ASSISTANT_BUBBLE
+          message.role === "user" ? USER_BUBBLE : ASSISTANT_BUBBLE,
         )}
       >
         {attachments.length > 0 ? (
@@ -834,7 +1098,10 @@ function ChatRow({ message }: { message: ChatMessage }) {
           </div>
         ) : null}
         {hasText ? (
-          <MessageResponse className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)} isAnimating={false}>
+          <MessageResponse
+            className={cn(MARKDOWN_SPACING, MARKDOWN_LISTS)}
+            isAnimating={false}
+          >
             {message.text}
           </MessageResponse>
         ) : null}
@@ -845,16 +1112,16 @@ function ChatRow({ message }: { message: ChatMessage }) {
         </MessageActions>
       ) : null}
     </Message>
-  )
+  );
 }
 
 /** Compact file size for the attachment tile. Only ever shows one decimal. */
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return ""
-  if (bytes < 1024) return `${bytes} B`
-  const kb = bytes / 1024
-  if (kb < 1024) return `${Math.round(kb)} KB`
-  return `${(kb / 1024).toFixed(1)} MB`
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
 }
 
 /**
@@ -866,26 +1133,36 @@ function formatBytes(bytes: number): string {
  * the bridge.
  */
 function MessageThumbnail({ attachment }: { attachment: ChatAttachmentView }) {
-  const isImage = attachment.mediaType.toLowerCase().startsWith("image/")
-  const src = useAttachmentSrc(attachment)
+  const isImage = attachment.mediaType.toLowerCase().startsWith("image/");
+  const src = useAttachmentSrc(attachment);
 
   if (!isImage) {
-    const size = formatBytes(attachment.byteSize)
+    const size = formatBytes(attachment.byteSize);
     return (
       <div className="flex max-w-64 items-center gap-2.5 rounded-md border border-black/10 bg-black/[0.02] px-3 py-2">
-        <FileTextIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <FileTextIcon
+          className="size-5 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
         <div className="min-w-0">
           <div className="truncate text-sm font-medium">
             {attachment.fileName || "Attachment"}
           </div>
-          {size ? <div className="text-xs text-muted-foreground">{size}</div> : null}
+          {size ? (
+            <div className="text-xs text-muted-foreground">{size}</div>
+          ) : null}
         </div>
       </div>
-    )
+    );
   }
 
   if (!src) {
-    return <div className="h-32 w-48 animate-pulse rounded-md bg-black/10" aria-hidden="true" />
+    return (
+      <div
+        className="h-32 w-48 animate-pulse rounded-md bg-black/10"
+        aria-hidden="true"
+      />
+    );
   }
   return (
     // Data URLs from the bridge have no filesystem path and no intrinsic size
@@ -897,18 +1174,18 @@ function MessageThumbnail({ attachment }: { attachment: ChatAttachmentView }) {
       className="h-auto max-h-64 rounded-md border border-black/10 object-contain"
       loading="lazy"
     />
-  )
+  );
 }
 
 function CopyMessageAction({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<number | null>(null)
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current)
-    }
-  }, [])
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   return (
     <MessageAction
@@ -916,13 +1193,17 @@ function CopyMessageAction({ text }: { text: string }) {
       tooltip={copied ? "Copied" : "Copy message"}
       variant="ghost"
       onClick={() => {
-        void navigator.clipboard.writeText(text)
-        setCopied(true)
-        if (timerRef.current !== null) window.clearTimeout(timerRef.current)
-        timerRef.current = window.setTimeout(() => setCopied(false), 1500)
+        void navigator.clipboard.writeText(text);
+        setCopied(true);
+        if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+        timerRef.current = window.setTimeout(() => setCopied(false), 1500);
       }}
     >
-      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+      {copied ? (
+        <CheckIcon className="size-3.5" />
+      ) : (
+        <CopyIcon className="size-3.5" />
+      )}
     </MessageAction>
-  )
+  );
 }

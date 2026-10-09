@@ -1,7 +1,7 @@
-"use client"
+"use client";
 
-import { useRouter } from "next/navigation"
-import { useEffect, useId, useState } from "react"
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useId, useState } from "react";
 import {
   ArrowLeftIcon,
   CircleAlert,
@@ -10,9 +10,9 @@ import {
   ImageOff,
   KeyRound,
   Trash2,
-} from "lucide-react"
+} from "lucide-react";
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -22,31 +22,32 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-} from "@/components/ui/alert-dialog"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Field, FieldLabel } from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
-import { Skeleton } from "@/components/ui/skeleton"
-import { Spinner } from "@/components/ui/spinner"
-import { ProviderIcon, providerLabel } from "@/components/provider-icon"
-import { isFastModel, useAiSettings } from "@/hooks/use-ai-settings"
-import { cn } from "@/lib/utils"
+} from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { toast } from "@/components/ui/toast";
+import { ProviderIcon, providerLabel } from "@/components/provider-icon";
+import { isFastModel, useAiSettings } from "@/hooks/use-ai-settings";
+import { cn } from "@/lib/utils";
 
-const NO_MODEL = "__none__"
+const NO_MODEL = "__none__";
 
 export default function SettingsPage() {
-  const router = useRouter()
+  const router = useRouter();
   const {
     phase,
     config,
@@ -63,26 +64,56 @@ export default function SettingsPage() {
     selectModel,
     saveKey,
     clearKey,
+    selectBrowserBackend,
     dataBusy,
     dataNote,
     deleteAllData,
     deleteAllImages,
-  } = useAiSettings()
+  } = useAiSettings();
 
   useEffect(() => {
-    load()
-  }, [load])
+    load();
+  }, [load]);
 
-  const keyFieldId = useId()
-  const busy = phase === "loading" || phase === "saving"
-  const current = config.provider ? providers[config.provider] : undefined
+  const keyFieldId = useId();
+  const busy = phase === "loading" || phase === "saving";
+  const current = config.provider ? providers[config.provider] : undefined;
   const modelOptions = liveModels.length
     ? liveModels
-    : (models[config.provider ?? ""] ?? [])
+    : (models[config.provider ?? ""] ?? []);
+
+  // Staged backend choice, stored only while it differs from what is saved.
+  // Swapping the backend changes which tools the whole chat has, so the choice
+  // is committed deliberately and confirmed — an instant write with no
+  // acknowledgement reads as a setting that never saved. Holding `null` when
+  // there is nothing pending means the radio is always driven by the saved
+  // value, so a successful write needs no reset and a failed one stays pending.
+  const saved = config.browserBackend ?? "embedded";
+  const [pendingBackend, setPendingBackend] = useState<
+    "embedded" | "deep" | null
+  >(null);
+  const backendDraft = pendingBackend ?? saved;
+  const backendDirty = pendingBackend !== null && pendingBackend !== saved;
+
+  const saveBrowserBackend = useCallback(async () => {
+    const ok = await selectBrowserBackend(backendDraft);
+    if (!ok) return;
+    setPendingBackend(null);
+    toast.add({
+      type: "success",
+      title: "Browser automation saved",
+      description:
+        backendDraft === "deep"
+          ? "Browser tasks now run through the deep task agent."
+          : "Browser tasks now run through the embedded step tools.",
+    });
+  }, [backendDraft, selectBrowserBackend]);
 
   // Which destructive action is awaiting confirmation, if any. Opening the
   // modal puts its answer here; confirming runs the action, cancel clears it.
-  const [pendingDelete, setPendingDelete] = useState<"all" | "images" | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<"all" | "images" | null>(
+    null,
+  );
 
   return (
     <div className="min-h-dvh bg-background">
@@ -94,7 +125,9 @@ export default function SettingsPage() {
             className="-ml-2 mb-3 text-muted-foreground"
             // Settings is a route inside the chat window now, not its own
             // window, so it needs an explicit way back to the transcript.
-            render={<button type="button" onClick={() => router.push("/chat")} />}
+            render={
+              <button type="button" onClick={() => router.push("/chat")} />
+            }
           >
             <ArrowLeftIcon aria-hidden="true" />
             Back to chat
@@ -148,14 +181,16 @@ export default function SettingsPage() {
               <RadioGroup
                 value={config.provider ?? ""}
                 onValueChange={(value) => {
-                  if (value) selectProvider(value)
+                  if (value) selectProvider(value);
                 }}
                 disabled={busy}
-                aria-describedby={config.encryptionAvailable ? undefined : "key-warning"}
+                aria-describedby={
+                  config.encryptionAvailable ? undefined : "key-warning"
+                }
                 className="grid gap-2 sm:grid-cols-2"
               >
                 {Object.values(providers).map((provider) => {
-                  const selected = provider.id === config.provider
+                  const selected = provider.id === config.provider;
                   return (
                     <Label
                       key={provider.id}
@@ -164,7 +199,7 @@ export default function SettingsPage() {
                         "flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors",
                         "has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-2",
                         "hover:bg-accent/50",
-                        selected ? "border-ring bg-accent" : "border-border"
+                        selected ? "border-ring bg-accent" : "border-border",
                       )}
                     >
                       <RadioGroupItem
@@ -176,7 +211,7 @@ export default function SettingsPage() {
                         {provider.label}
                       </span>
                     </Label>
-                  )
+                  );
                 })}
               </RadioGroup>
             </section>
@@ -184,13 +219,16 @@ export default function SettingsPage() {
             <Separator />
 
             <section aria-labelledby="model-heading" className="space-y-3">
-              <h2 id="model-heading" className="text-sm font-medium tracking-tight">
+              <h2
+                id="model-heading"
+                className="text-sm font-medium tracking-tight"
+              >
                 Model
               </h2>
               <Select
                 value={config.model ?? NO_MODEL}
                 onValueChange={(value) => {
-                  if (value && value !== NO_MODEL) selectModel(value)
+                  if (value && value !== NO_MODEL) selectModel(value);
                 }}
                 disabled={busy || !config.provider}
               >
@@ -200,7 +238,11 @@ export default function SettingsPage() {
                   className="w-full"
                 >
                   <SelectValue
-                    placeholder={config.provider ? "Select a model" : "Choose a provider first"}
+                    placeholder={
+                      config.provider
+                        ? "Select a model"
+                        : "Choose a provider first"
+                    }
                   />
                 </SelectTrigger>
                 <SelectContent>
@@ -214,7 +256,10 @@ export default function SettingsPage() {
                         <span className="flex w-full items-center justify-between gap-4">
                           <span className="truncate">{model.label}</span>
                           {isFastModel(model.id) ? (
-                            <Badge variant="outline" className="shrink-0 text-[10px]">
+                            <Badge
+                              variant="outline"
+                              className="shrink-0 text-[10px]"
+                            >
                               Fast
                             </Badge>
                           ) : null}
@@ -226,14 +271,18 @@ export default function SettingsPage() {
               </Select>
               <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 {modelsLoading ? <Spinner className="size-3" /> : null}
-                {modelsNotice || "Fast models suit dictation; the rest suit longer answers."}
+                {modelsNotice ||
+                  "Fast models suit dictation; the rest suit longer answers."}
               </p>
             </section>
 
             <Separator />
 
             <section aria-labelledby="key-heading" className="space-y-3">
-              <h2 id="key-heading" className="text-sm font-medium tracking-tight">
+              <h2
+                id="key-heading"
+                className="text-sm font-medium tracking-tight"
+              >
                 API Key
               </h2>
               {current ? (
@@ -262,7 +311,11 @@ export default function SettingsPage() {
                     onClick={saveKey}
                     disabled={busy || !config.provider || !keyDraft.trim()}
                   >
-                    {phase === "saving" ? <Spinner /> : <KeyRound aria-hidden="true" />}
+                    {phase === "saving" ? (
+                      <Spinner />
+                    ) : (
+                      <KeyRound aria-hidden="true" />
+                    )}
                     Save Key
                   </Button>
                 </div>
@@ -307,8 +360,95 @@ export default function SettingsPage() {
 
             <Separator />
 
+            <section aria-labelledby="browser-heading" className="space-y-3">
+              <h2
+                id="browser-heading"
+                className="text-sm font-medium tracking-tight"
+              >
+                Browser automation
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Choose how browser tasks run. Embedded tools run in the in-app
+                browser with step-by-step actions. Deep task uses the separate
+                agent to do longer, multi-step work.
+              </p>
+              <RadioGroup
+                value={backendDraft}
+                onValueChange={(value) => {
+                  if (value === "embedded" || value === "deep")
+                    setPendingBackend(value);
+                }}
+                disabled={busy}
+                className="grid gap-2 sm:grid-cols-2"
+              >
+                <Label
+                  htmlFor="backend-embedded"
+                  className={cn(
+                    "flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors",
+                    "has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-2",
+                    "hover:bg-accent/50",
+                    backendDraft === "embedded"
+                      ? "border-ring bg-accent"
+                      : "border-border",
+                  )}
+                >
+                  <RadioGroupItem id="backend-embedded" value="embedded" />
+                  <span className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">Embedded tools</div>
+                    <div className="text-xs text-muted-foreground">
+                      Step-by-step browser actions
+                    </div>
+                  </span>
+                </Label>
+                <Label
+                  htmlFor="backend-deep"
+                  className={cn(
+                    "flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors",
+                    "has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-2",
+                    "hover:bg-accent/50",
+                    backendDraft === "deep"
+                      ? "border-ring bg-accent"
+                      : "border-border",
+                  )}
+                >
+                  <RadioGroupItem id="backend-deep" value="deep" />
+                  <span className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">Deep task agent</div>
+                    <div className="text-xs text-muted-foreground">
+                      Full multi-step browser agent
+                    </div>
+                  </span>
+                </Label>
+              </RadioGroup>
+              {/* This one is staged rather than written on click. Swapping the
+                  backend changes which tools the whole chat has, so the choice
+                  is committed deliberately and confirmed — an instant write
+                  with no acknowledgement reads as a setting that never saved. */}
+              <div className="flex items-center gap-3">
+                <Button
+                  type="button"
+                  onClick={saveBrowserBackend}
+                  disabled={busy || !backendDirty}
+                >
+                  {phase === "saving" ? (
+                    <Spinner />
+                  ) : (
+                    <CircleCheck aria-hidden="true" />
+                  )}
+                  Save
+                </Button>
+                <p aria-live="polite" className="text-xs text-muted-foreground">
+                  {backendDirty ? "Unsaved change" : ""}
+                </p>
+              </div>
+            </section>
+            <Separator />
+
             <section aria-labelledby="data-heading" className="space-y-3">
-              <h2 id="data-heading" className="text-sm font-medium tracking-tight">
+              <h2
+                id="data-heading"
+                className="text-sm font-medium tracking-tight"
+              >
                 Data &amp; privacy
               </h2>
               <p className="text-sm text-muted-foreground">
@@ -329,7 +469,9 @@ export default function SettingsPage() {
                   ) : (
                     <ImageOff aria-hidden="true" />
                   )}
-                  {dataBusy === "images" ? "Deleting…" : "Delete uploaded images"}
+                  {dataBusy === "images"
+                    ? "Deleting…"
+                    : "Delete uploaded images"}
                 </Button>
                 <Button
                   type="button"
@@ -337,7 +479,11 @@ export default function SettingsPage() {
                   disabled={busy || dataBusy !== null}
                   onClick={() => setPendingDelete("all")}
                 >
-                  {dataBusy === "all" ? <Spinner /> : <Trash2 aria-hidden="true" />}
+                  {dataBusy === "all" ? (
+                    <Spinner />
+                  ) : (
+                    <Trash2 aria-hidden="true" />
+                  )}
                   {dataBusy === "all" ? "Deleting…" : "Delete all my data"}
                 </Button>
               </div>
@@ -349,7 +495,7 @@ export default function SettingsPage() {
             <AlertDialog
               open={pendingDelete !== null}
               onOpenChange={(open) => {
-                if (!open) setPendingDelete(null)
+                if (!open) setPendingDelete(null);
               }}
             >
               <AlertDialogContent>
@@ -370,12 +516,14 @@ export default function SettingsPage() {
                   <AlertDialogAction
                     variant="destructive"
                     onClick={() => {
-                      if (pendingDelete === "all") deleteAllData()
-                      else if (pendingDelete === "images") deleteAllImages()
-                      setPendingDelete(null)
+                      if (pendingDelete === "all") deleteAllData();
+                      else if (pendingDelete === "images") deleteAllImages();
+                      setPendingDelete(null);
                     }}
                   >
-                    {pendingDelete === "all" ? "Delete everything" : "Delete images"}
+                    {pendingDelete === "all"
+                      ? "Delete everything"
+                      : "Delete images"}
                   </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
@@ -384,5 +532,5 @@ export default function SettingsPage() {
         )}
       </main>
     </div>
-  )
+  );
 }

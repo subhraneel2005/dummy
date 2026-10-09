@@ -11,8 +11,9 @@
     "db:generate": "drizzle-kit generate",
     "test:providers": "node scripts/provider-compat.mjs",
     "test:browser": "npm run build && electron scripts/browser-smoke.mjs",
-    "test:approvals": "node scripts/approval-smoke.mjs",
-    "test": "npm run test:providers && npm run test:approvals && npm run build && electron scripts/browser-smoke.mjs"
+    "test:approvals": "node --experimental-strip-types scripts/approval-smoke.mjs",
+    "test:backends": "node --experimental-strip-types scripts/browser-backends-smoke.mjs",
+    "test": "npm run test:providers && npm run test:approvals && npm run test:backends && npm run build && electron scripts/browser-smoke.mjs"
   },
   "keywords": [],
   "author": "",
@@ -30,6 +31,7 @@
     "@ai-sdk/google": "^4.0.80",
     "@ai-sdk/openai": "^4.0.75",
     "@ai-sdk/xai": "^5.0.8",
+    "@browser_use/pi": "0.1.0",
     "@libsql/client": "^0.18.0",
     "ai": "^7.0.114",
     "drizzle-orm": "^1.0.0-rc.4",

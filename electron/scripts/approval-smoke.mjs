@@ -1,5 +1,6 @@
 /**
- * Headless smoke for the Feature 5 approval loop (Phase F).
+ * Headless smoke for the Feature 5 approval loop (Phase F) and the Feature 6
+ * deep-task lane.
  *
  * The loop in `ai/chat.ts` is thin but it rests on an SDK contract that has
  * never been exercised: park on `tool-approval-request`, take
@@ -52,7 +53,7 @@ const chunk = (delta, finish = null) => ({
   choices: [{ index: 0, delta, finish_reason: finish }],
 })
 
-const streamFor = (step) => {
+const streamFor = (step, toolCall = { name: "browser_type", args: '{"ref":1,"text":"hello"}' }) => {
   if (step > 0) {
     return [sse(chunk({ role: "assistant", content: FIRST_TEXT })), sse(chunk({}, "stop")), "data: [DONE]\n\n"]
   }
@@ -62,13 +63,18 @@ const streamFor = (step) => {
         role: "assistant",
         content: null,
         tool_calls: [
-          { index: 0, id: "call_1", type: "function", function: { name: "browser_type", arguments: "" } },
+          {
+            index: 0,
+            id: "call_1",
+            type: "function",
+            function: { name: toolCall.name, arguments: "" },
+          },
         ],
       }),
     ),
     sse(
       chunk({
-        tool_calls: [{ index: 0, function: { arguments: '{"ref":1,"text":"hello"}' } }],
+        tool_calls: [{ index: 0, function: { arguments: toolCall.args } }],
       }),
     ),
     sse(chunk({}, "tool_calls")),
@@ -214,6 +220,104 @@ console.log("\napproval loop")
     waiting.length === 0 && run.executed === 1 && results.length === 1,
     `${waiting.length} waiting, ran ${run.executed}, ${results.length} results`,
   )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Feature 6 — the deep-task lane                                              */
+/* -------------------------------------------------------------------------- */
+
+// Mirrors `browser/tools.ts`'s `DEEP_TASK_APPROVAL_REASON`: a whole-run consent
+// grant, read off the card by the renderer. Kept in sync by hand — importing
+// the compiled module would pull `electron` into a plain-node script.
+const DEEP_TASK_APPROVAL_REASON =
+  "Full control of a separate Chrome window for one long task: it can open sites, sign in, " +
+  "submit forms, download files, and run code with access to your data."
+
+function makeDeepAgent(run) {
+  const deepCall = { name: "browser_deep_task", args: '{"task":"research competitors"}' }
+  const fetch = async (_url, init) => {
+    const body = JSON.parse(init.body)
+    run.requests.push(body)
+    return new Response(streamFor(run.requests.length - 1, deepCall), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })
+  }
+  return new ToolLoopAgent({
+    model: createOpenAI({ apiKey: "test", fetch }).chat("gpt-4o-mini"),
+    tools: {
+      browser_deep_task: tool({
+        description: "Run a long goal in a separate Chrome window",
+        inputSchema: z.object({ task: z.string() }),
+        execute: async () => {
+          run.executed++
+          return { ok: true, summary: "found three results", files: [], workspace: "/tmp/ws" }
+        },
+      }),
+    },
+    stopWhen: stepCountIs(6),
+    // Exactly what `ai/chat.ts` returns for this tool: one upfront approval
+    // whose reason names the scope of the whole run, not a per-action prompt.
+    toolApproval: () => ({ type: "user-approval", reason: DEEP_TASK_APPROVAL_REASON }),
+    experimental_toolApprovalSecret: randomBytes(32),
+  })
+}
+
+{
+  const run = { executed: 0, requests: [] }
+  const agent = makeDeepAgent(run)
+  const input = [{ role: "user", content: "research competitors" }]
+  const first = await agent.stream({ messages: input })
+  const approvals = []
+  for await (const part of first.stream) {
+    if (part.type === "tool-approval-request") approvals.push(part)
+  }
+  const parkedExecuted = run.executed
+  const second = await agent.stream({
+    messages: await resume(input, first, approvals[0]?.approvalId ?? "", true),
+  })
+  let text = ""
+  for await (const part of second.stream) {
+    if (part.type === "text-delta") text += part.text
+  }
+  check("a deep task parks as one approval for the whole run", approvals.length === 1, `${approvals.length} requests`)
+  check("the deep task is NOT on the read-only fast path", (approvals[0]?.isAutomatic ?? false) === false)
+  check("nothing executes while parked", parkedExecuted === 0)
+  check("approving runs the deep task exactly once", run.executed === 1, `ran ${run.executed} times`)
+  check(
+    "the approval carries the capability-grant reason",
+    /Full control of a separate Chrome window/.test(approvals[0]?.reason ?? ""),
+    `reason "${approvals[0]?.reason}"`,
+  )
+  // The reason propagates untouched into `ai/chat.ts`'s part handling, and from
+  // there onto the card. A dropped reason would silently downgrade the card to
+  // its generic "changes something outside the app" caption.
+  check(
+    "the model steps forward after approving",
+    text === FIRST_TEXT && run.requests.length === 2,
+    `requests ${run.requests.length}`,
+  )
+}
+
+{
+  const run = { executed: 0, requests: [] }
+  const agent = makeDeepAgent(run)
+  const input = [{ role: "user", content: "research competitors" }]
+  const first = await agent.stream({ messages: input })
+  const approvals = []
+  for await (const part of first.stream) {
+    if (part.type === "tool-approval-request") approvals.push(part)
+  }
+  const second = await agent.stream({
+    messages: await resume(input, first, approvals[0]?.approvalId ?? "", false),
+  })
+  let text = ""
+  for await (const part of second.stream) {
+    if (part.type === "text-delta") text += part.text
+  }
+  check("denying a deep task resumes without hanging", approvals.length === 1 && run.requests.length === 2, `${run.requests.length} requests`)
+  check("a denied deep task never launches its Chrome", run.executed === 0, `ran ${run.executed} times`)
+  check("the model is told and moves on", text === FIRST_TEXT, `got "${text}"`)
 }
 
 console.log(failures === 0 ? "\napproval smoke passed" : `\nFAILED (${failures})`)

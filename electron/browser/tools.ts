@@ -18,7 +18,9 @@
 import { tool, type ToolSet } from "ai"
 import { z } from "zod"
 
+import type { BrowserBackend } from "../ai/models.js"
 import { captureScreenshot } from "./captures.js"
+import { abortDeepTask, runDeepTask } from "./deep-task.js"
 import type { PageInfo } from "./cdp.js"
 import {
   BrowserNotReadyError,
@@ -57,11 +59,31 @@ export const READ_ONLY = [
   "browser_go",
 ] as const
 
-export type BrowserToolName = (typeof READ_ONLY)[number] | "browser_type" | "browser_save_pdf"
+export type BrowserToolName =
+  | (typeof READ_ONLY)[number]
+  | "browser_type"
+  | "browser_save_pdf"
+  | "browser_deep_task"
 
 export function isReadOnlyTool(name: string): boolean {
   return (READ_ONLY as readonly string[]).includes(name)
 }
+
+/**
+ * What a `browser_deep_task` approval actually grants, shown as the card's
+ * caption. Unlike the other gated tools — a single click or a single file — a
+ * deep task is one approval for an open-ended run over a separate Chrome
+ * window the user can watch. The word "skip" keeps the denial an option, per
+ * the approve-or-`{ error }` convention.
+ */
+export const DEEP_TASK_APPROVAL_REASON =
+  "Full control of a separate Chrome window for one long task: it can open sites, " +
+  "sign in, submit forms, download files, and run code with access to your data. " +
+  "This one approval covers the entire task — there will be no more prompts. " +
+  "Watch it in the live feed below and press Stop to cancel, or deny to skip."
+
+/** Free-text limit keeps the task prompt from becoming a document. */
+const DEEP_TASK_MAX_CHARS = 4_000
 
 /**
  * Constrained at the schema rather than only in `open()`, so an unusable address
@@ -211,6 +233,99 @@ export const browserTools: ToolSet = {
       return { ok: true, path: file }
     }),
   }),
+
+  browser_deep_task: tool({
+    description:
+      "Run a long, self-contained browsing goal — research across several sites, sign in, " +
+      "fill and submit forms, download files — in one shot, in a separate Chrome window " +
+      "driven by its own agent. One approval covers the whole task; you watch it run in the " +
+      "activity feed and nobody will be prompted again while it works. Use this instead of " +
+      "chaining browser_* tools whenever the goal is a complete job rather than a quick " +
+      "lookup on the current page.",
+    inputSchema: z.object({
+      task: z
+        .string()
+        .min(1)
+        .max(DEEP_TASK_MAX_CHARS)
+        .describe(
+          "The complete, self-contained goal: what to accomplish, any sites or accounts involved, " +
+            "what to collect or download, and where to put the results.",
+        ),
+    }),
+    execute: async (input, options) => {
+      try {
+        // A denied deep task never gets here: the approval gate runs first, so
+        // this execute is only reached once the user approved.
+        const result = await runDeepTask(input.task, {
+          toolCallId: options.toolCallId,
+          signal: options.abortSignal,
+        })
+        return { ok: true, ...result }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return { ok: false, error: message }
+      }
+    },
+  }),
+}
+
+/**
+ * The tool set one backend is allowed to use.
+ *
+ * The two backends are *exclusive* rather than cumulative: the embedded lane is
+ * step-by-step tools against the in-app page, and the deep lane is a single
+ * long-running agent in its own Chrome window. Handing the model both at once
+ * means it interleaves a dozen approved clicks with one approved autonomous run,
+ * which is neither auditable nor cheap. So the setting picks the lane outright.
+ */
+export function toolsForBackend(backend: BrowserBackend): ToolSet {
+  if (backend === "deep") {
+    const deep = browserTools.browser_deep_task
+    return deep ? { browser_deep_task: deep } : {}
+  }
+  const tools: ToolSet = {}
+  for (const [name, def] of Object.entries(browserTools)) {
+    if (name !== "browser_deep_task") tools[name] = def
+  }
+  return tools
+}
+
+export interface ToolSummary {
+  name: string
+  description: string
+}
+
+/**
+ * The single `@` the composer offers, which stands for whichever browser tools
+ * the active backend has.
+ *
+ * Not a tool name: it is a capability the user names, not a call they pick. A
+ * picker listing `browser_navigate`/`browser_snapshot`/`browser_read`/… asks the
+ * user to know which internal step they want before the assistant has looked at
+ * anything, and it changes shape when a tool is renamed. Naming the *capability*
+ * is what a person actually means by "go and check that page", so that is what
+ * the mention says — and it resolves to the real tool set at call time.
+ */
+export const BROWSER_MENTION = "BrowserAutomation"
+
+const BROWSER_MENTION_DESCRIPTIONS: Record<BrowserBackend, string> = {
+  embedded:
+    "Open pages, read them, click, type and save PDFs, step by step in the in-app browser.",
+  deep:
+    "Hand a long multi-step goal — research, sign in, submit forms, download files — to the deep task agent.",
+}
+
+/**
+ * What the `@` picker shows: one capability per backend, not its raw tools.
+ *
+ * Kept separate from `toolsForBackend` on purpose. The agent still gets the real
+ * tools; the picker stays a one-line decision that means the same thing in both
+ * modes.
+ */
+export function mentionCatalog(backend: BrowserBackend): ToolSummary[] {
+  return [
+    { name: BROWSER_MENTION, description: BROWSER_MENTION_DESCRIPTIONS[backend] },
+  ]
 }
 
 /** Thin wrapper so `browser_type` reads the same as the others at the call site. */
@@ -224,4 +339,4 @@ export type BrowserEvent =
   | { type: "page"; url: string; title: string }
   | { type: "released" }
 
-export { show, isOpen, releasePageMemory, status }
+export { show, isOpen, releasePageMemory, status, abortDeepTask }

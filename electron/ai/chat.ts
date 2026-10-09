@@ -14,7 +14,8 @@ import {
 import { getDb, type Db } from "../db/index.js"
 import { chatAttachments, chatMessages, chatToolCalls, type ToolCallStatus } from "../db/schema.js"
 import { abandonCaptures, beginCaptures, capturesFor, commitCaptures } from "../browser/captures.js"
-import { browserTools, isReadOnlyTool } from "../browser/tools.js"
+import { DEEP_TASK_APPROVAL_REASON, isReadOnlyTool, mentionCatalog, toolsForBackend } from "../browser/tools.js"
+import { abortDeepTask, registerDeepSessionProvider } from "../browser/deep-task.js"
 import { isOpen, releasePageMemory } from "../browser/window.js"
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
@@ -26,7 +27,9 @@ import {
   type StoredAttachment,
 } from "./attachments.js"
 import { resolveModelWithProvider, supportsInlineDocuments } from "./provider.js"
-import { PROVIDER_INFO, type ProviderId } from "./models.js"
+import { toolMentionDirective as mentionDirective } from "./mentions.js"
+import { getBrowserBackend } from "./config.js"
+import { PROVIDER_INFO, type BrowserBackend, type ProviderId } from "./models.js"
 import { autoTitleSession, clearSessionMessages, ensureSession, touchSession } from "./sessions.js"
 
 /**
@@ -155,23 +158,83 @@ export type ChatStreamEvent =
       dataBase64: string
     }
 
-const CHAT_INSTRUCTIONS =
+const BASE_INSTRUCTIONS =
   "You are a concise assistant embedded in a macOS dictation app. The user dictates technical " +
   "notes and sends them to you for discussion. Answer directly and prefer short, well-structured " +
   "responses. Use markdown for code blocks and lists. Screenshots may be attached to a message " +
   "as images of whatever was on the user's screen at that moment — read them when the question " +
-  "refers to them, and say so plainly if an image does not actually show what was asked about.\n\n" +
-  "You can also drive a web browser to answer questions that need live pages. Call " +
+  "refers to them, and say so plainly if an image does not actually show what was asked about."
+
+const EMBEDDED_BROWSER_INSTRUCTIONS =
+  "You can drive a web browser to answer questions that need live pages. Call " +
   "browser_snapshot before clicking or typing, because the numbered refs it returns are only valid " +
   "for the page they came from and any navigation invalidates them. Prefer browser_read over a " +
   "screenshot for page content: you cannot see images the browser captures. If the user denies an " +
-  "action, do not retry it — carry on without it and say what you could not do."
+  "action, do not retry it — carry on without it and say what you could not do. Every step is shown " +
+  "to the user as it happens, so keep the run short and explain what you are about to do."
+
+const DEEP_BROWSER_INSTRUCTIONS =
+  "Browser work runs through browser_deep_task and nothing else: there are no step-by-step " +
+  "browser tools in this mode. Hand it one complete, self-contained goal — research across several " +
+  "sites, sign in, fill and submit a form, download files — rather than a single step. It runs in " +
+  "its own Chrome window under a separate agent: one call, one approval, and no further prompts " +
+  "while it works, with the run visible in the activity feed. State what to accomplish, any sites " +
+  "or accounts involved, what to collect or download, and where to put the results."
+
+const TOOL_ERROR_INSTRUCTIONS =
+  "When a tool returns an error, never invent the result, list, or findings it failed to " +
+  "produce, and never present an error as a completed answer. Distinguish two cases. A " +
+  "transient failure — a navigation that was aborted or timed out, a page that was still " +
+  "loading, a stale element reference — is worth retrying once or twice, or working around " +
+  "with another tool; that is a hiccup, not an answer, and abandoning the whole request over " +
+  "one is the wrong call. A failure that is clearly permanent — a site that refuses access, a " +
+  "tool you do not have, a request that cannot be satisfied — is not worth retrying: say " +
+  "plainly what you could not do, then finish the rest of the task and report what you did " +
+  "establish. Never apologise your way out of work you can still do, and never pad the answer " +
+  "with guesses to paper over a gap."
+
+/**
+ * The system prompt for one turn, chosen by the browser backend setting.
+ *
+ * Each backend gets the paragraph that describes *its* tools and not the other's.
+ * Telling a model a tool exists when it is not in the tool set produces a turn
+ * that apologises for a call it cannot make, and it is the model — not the tool
+ * layer — that decides which capability to reach for.
+ */
+function chatInstructions(backend: BrowserBackend): string {
+  return [
+    BASE_INSTRUCTIONS,
+    backend === "deep" ? DEEP_BROWSER_INSTRUCTIONS : EMBEDDED_BROWSER_INSTRUCTIONS,
+    TOOL_ERROR_INSTRUCTIONS,
+  ].join("\n\n")
+}
+
+/**
+ * The directive a `@`-mentioned capability adds to one turn, or null when the
+ * message mentions none.
+ *
+ * `BrowserAutomation` is resolved to the lane's real tools rather than naming
+ * one: the user named a capability, and which tools carry it is the backend's
+ * business, not theirs.
+ */
+function toolMentionDirective(text: string, backend: BrowserBackend): string | null {
+  return mentionDirective(text, mentionCatalog(backend).map((entry) => entry.name))
+}
 
 /**
  * Set on every agent so a click-wait-observe loop cannot burn the SDK default
  * step budget. The flat cap is a runaway guard, not the intended limit.
  */
 const BROWSER_STEP_LIMIT = 24
+
+/**
+ * Deep-task timeouts. The SDK's per-step total timeout defaults to 300s, but a
+ * `browser_deep_task` step legitimately runs the whole 600s of its own budget,
+ * so the step's allowances are lifted to match — scoped to the deep tool so the
+ * other tools keep their normal pace.
+ */
+const DEEP_STEP_TIMEOUT_MS = 600_000
+const DEEP_TASK_CALL_TIMEOUT_MS = 620_000
 
 /**
  * Binds an approval response to the tool call that requested it.
@@ -213,6 +276,11 @@ type ActiveTurn = {
 }
 
 let activeTurn: ActiveTurn | null = null
+
+// The deep-task lane keys its cell feed to the conversation currently being
+// answered, exactly like every other ChatStreamEvent. Injected here rather than
+// imported by `deep-task.ts`, which must not depend on this module.
+registerDeepSessionProvider(() => activeTurn?.sessionId ?? null)
 
 function emit(event: ChatStreamEvent): void {
   for (const listener of listeners) listener(event)
@@ -262,6 +330,10 @@ function abort(notify: boolean): void {
   // answer into a turn that no longer exists.
   turn.denyPending?.()
   turn.denyPending = null
+  // Signals the SDK stream (which propagates into the deep task's abort signal)
+  // — and directly, in case the deep run is mid-fork and hasn't registered a
+  // listener yet. Either way its `finally` closes Chrome and frees the lock.
+  abortDeepTask()
   turn.controller.abort()
   activeTurn = null
   // Emitted here, not in the stream's `finally`, because that runs after an
@@ -668,18 +740,37 @@ export async function sendChatMessage(
 
   let agent: ToolLoopAgent
   let provider: ProviderId
+  let backend: BrowserBackend
   try {
     const resolved = await resolveModelWithProvider()
     provider = resolved.provider
+    backend = await getBrowserBackend()
     agent = new ToolLoopAgent({
       model: resolved.model,
-      instructions: CHAT_INSTRUCTIONS,
-      tools: browserTools,
+      instructions: chatInstructions(backend),
+      tools: toolsForBackend(backend),
       stopWhen: stepCountIs(BROWSER_STEP_LIMIT),
+      timeout: {
+        totalMs: DEEP_STEP_TIMEOUT_MS,
+        toolMs: DEEP_STEP_TIMEOUT_MS,
+        tools: { browser_deep_taskMs: DEEP_TASK_CALL_TIMEOUT_MS },
+      },
       // A single expression rather than a per-tool map: read-only tools run
       // without prompting, everything that can change something waits for a
       // decision. See `browser/tools.ts` for why prompting on reads is harmful.
-      toolApproval: ({ toolCall }) => (isReadOnlyTool(toolCall.toolName) ? "approved" : "user-approval"),
+      // A deep task is the one tool that asks once for a whole run — its opens,
+      // clicks and submits all fall under that single decision, and the reason
+      // is what tells the user what they are granting.
+      toolApproval: ({ toolCall }) => {
+        if (isReadOnlyTool(toolCall.toolName)) return "approved"
+        if (toolCall.toolName === "browser_deep_task") {
+          // ai@7: a toolApproval function may return `{ type, reason }`; the
+          // reason surfaces on the card as its caption, read off the request
+          // part below.
+          return { type: "user-approval", reason: DEEP_TASK_APPROVAL_REASON }
+        }
+        return "user-approval"
+      },
       // Verifies that an approval response came from this app and was not
       // forged by a compromised renderer.
       experimental_toolApprovalSecret: TOOL_APPROVAL_SECRET,
@@ -745,8 +836,13 @@ export async function sendChatMessage(
     })
 
     await touchSession(sessionId)
-    // History as plain text, then the new turn with its images.
-    messages = [...history, { role: "user", content: await buildUserContent(trimmed, stored) }]
+    // History as plain text, then the new turn with its images. The directive a
+    // `@`-mentioned tool contributes is appended here — on the way to the model
+    // only, after `insertMessage` above has already stored the text the user
+    // actually typed.
+    const directive = toolMentionDirective(trimmed, backend)
+    const modelText = directive ? `${trimmed}\n\n[${directive}]` : trimmed
+    messages = [...history, { role: "user", content: await buildUserContent(modelText, stored) }]
   } catch (err) {
     await deleteAttachmentFiles(writtenPaths)
     const message = err instanceof Error ? err.message : String(err)

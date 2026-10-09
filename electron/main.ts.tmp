@@ -18,7 +18,7 @@ import {
   show as showBrowser,
   status as browserStatus,
 } from "./browser/window.js"
-import { browserTools, isReadOnlyTool, mentionCatalog } from "./browser/tools.js"
+import { browserTools, isReadOnlyTool } from "./browser/tools.js"
 import { abortDeepTask, onDeepTaskEvent, pauseDeepTask, resumeDeepTask } from "./browser/deep-task.js"
 import {
   cancelBrowserIdleRelease,
@@ -31,7 +31,7 @@ import {
   stopActiveStream,
 } from "./ai/chat.js"
 import { listProviderModels } from "./ai/catalog.js"
-import { clearApiKey, getConfig, getBrowserBackend, setApiKey, setBrowserBackend, setModel, setProvider } from "./ai/config.js"
+import { clearApiKey, getConfig, setApiKey, setModel, setProvider } from "./ai/config.js"
 import { deleteAllAttachments, deleteAllData } from "./ai/data.js"
 import { isProviderId, MODEL_CATALOG, PROVIDER_INFO } from "./ai/models.js"
 import { polishTranscript } from "./ai/polish.js"
@@ -813,12 +813,6 @@ function registerIpcHandlers() {
     }
     return listProviderModels(provider)
   })
-  ipcMain.handle("ai:set-browser-backend", (_event, backend: string) => {
-    if (backend !== "embedded" && backend !== "deep") {
-      return Promise.resolve({ ok: false as const, error: `Invalid browser backend: ${backend}` })
-    }
-    return mutateConfig(() => setBrowserBackend(backend as "embedded" | "deep"))
-  })
 
   // Destructive. A wipe frees the local DB *and* the bytes behind it, so the
   // in-flight turn and the embedded page are torn down first, then every row
@@ -851,12 +845,6 @@ function registerIpcHandlers() {
     } catch (err) {
       return { ok: false as const, error: errText(err) }
     }
-  })
-
-  // What the composer's `@` picker shows: capabilities, not raw tool names.
-  ipcMain.handle("ai:get-tool-catalog", async (_event, backend?: string) => {
-    const lane = backend === "deep" ? "deep" : "embedded"
-    return { ok: true as const, tools: mentionCatalog(lane) }
   })
 
   ipcMain.on("dictation:audio", async (event, wav: ArrayBuffer) => {

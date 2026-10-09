@@ -9,6 +9,7 @@ export interface AiConfig {
   model: string | null;
   hasKey: boolean;
   encryptionAvailable: boolean;
+  browserBackend?: "embedded" | "deep";
 }
 
 export interface ModelInfo {
@@ -49,6 +50,7 @@ const EMPTY_CONFIG: AiConfig = {
   model: null,
   hasKey: false,
   encryptionAvailable: true,
+  browserBackend: "embedded",
 };
 
 // `preload` casts the IPC result to `AiConfigResult`, but a cast is a promise
@@ -60,10 +62,12 @@ function normalizeConfig(value: unknown): AiConfig | null {
   const raw = value as Partial<AiConfig>;
   if (typeof raw.hasKey !== "boolean") return null;
   return {
-    provider: typeof raw.provider === "string" && raw.provider ? raw.provider : null,
+    provider:
+      typeof raw.provider === "string" && raw.provider ? raw.provider : null,
     model: typeof raw.model === "string" && raw.model ? raw.model : null,
     hasKey: raw.hasKey,
     encryptionAvailable: raw.encryptionAvailable !== false,
+    browserBackend: raw.browserBackend === "deep" ? "deep" : "embedded",
   };
 }
 
@@ -147,33 +151,40 @@ export function useAiSettings() {
       >,
       // Re-fetch the live list when the change affects which models exist.
       reloadModels?: boolean,
-    ) => {
+      // Resolves to whether the write landed, so a caller that stages a change
+      // can confirm it rather than assume. Failures are already turned into the
+      // panel's error banner below.
+    ): Promise<boolean> => {
       setPhase("saving");
       setMessage("");
-      call
+      return call
         .then((res) => {
           if (!res.ok) {
             setMessage(res.error);
             setPhase("error");
-            return;
+            return false;
           }
           const next = normalizeConfig(res.config);
           if (!next) {
-            setMessage("The AI configuration came back in an unexpected shape.");
+            setMessage(
+              "The AI configuration came back in an unexpected shape.",
+            );
             setPhase("error");
-            return;
+            return false;
           }
           setConfig(next);
           setKeyDraft("");
           setPhase("ready");
           if (reloadModels && next.provider) void refreshModels(next.provider);
+          return true;
         })
         .catch(() => {
           setMessage("Failed to save the AI configuration.");
           setPhase("error");
+          return false;
         });
     },
-    [refreshModels]
+    [refreshModels],
   );
 
   const selectProvider = useCallback(
@@ -183,7 +194,7 @@ export function useAiSettings() {
       setLiveModels([]);
       apply(api.setProvider(provider), true);
     },
-    [apply]
+    [apply],
   );
 
   const selectModel = useCallback(
@@ -192,7 +203,7 @@ export function useAiSettings() {
       if (!api) return;
       apply(api.setModel(model));
     },
-    [apply]
+    [apply],
   );
 
   const saveKey = useCallback(() => {
@@ -217,6 +228,15 @@ export function useAiSettings() {
   // `message` carries failures to the page's error banner; `dataNote` carries
   // the success summary into the Data & privacy section while it waits out the
   // 1.2 s reload timer.
+  const selectBrowserBackend = useCallback(
+    (backend: "embedded" | "deep"): Promise<boolean> => {
+      const api = window.electronAPI?.ai;
+      if (!api) return Promise.resolve(false);
+      return apply(api.setBrowserBackend(backend));
+    },
+    [apply],
+  );
+
   const deleteAllData = useCallback(() => {
     const api = window.electronAPI?.ai;
     if (!api) return;
@@ -290,6 +310,7 @@ export function useAiSettings() {
     selectModel,
     saveKey,
     clearKey,
+    selectBrowserBackend,
     dataBusy,
     dataNote,
     deleteAllData,

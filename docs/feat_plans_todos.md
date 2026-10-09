@@ -1033,7 +1033,7 @@ Realistically: usable, but expect macOS to swap during heavy pages. Do not let t
 ### Goal
 For long autonomous web tasks ("find the top 5 X and save a list to a file"), add an **optional second lane**: a one-shot `browser_deep_task` tool that hands the task to **browser-use-pi** (Browser Use's pure-TypeScript Pi agent, `@browser_use/pi`), which runs its **own** agent loop in a forked worker and drives **its own external Chrome window**. The embedded F5 panel, its 8 tools, and the `ToolLoopAgent` approval loop stay exactly as they are — this extends chat, it does not replace it.
 
-> **Status: planned only.** Evaluation of https://github.com/browser-use/browser-use-pi is complete (read-only source/docs review); all three design decisions below are locked with the user; nothing is implemented. Realization of the backlog-shaped question "should we adopt browser-use-pi?" — verdict: **not as-is for the embedded panel, yes as a hybrid lane.**
+> **Status: Phase 0 + G1–G3 done, G4 automated pieces done — keyed manual QA is yours to run, nothing is committed.** The Phase 0 spike (`electron/scripts/pi-spike.mjs`) runs green under Electron; `browser_deep_task` is live end to end (service → tool → approval → cells → row). The keyed section of the spike and the manual checklist below are what the user has volunteered to test by hand.
 
 ### Non-goals (v1)
 - Not replacing or wrapping the F5 embedded tools — the deep lane is a *separate* tool on the same `ToolLoopAgent`.
@@ -1110,6 +1110,7 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 - Running: one `chat_tool_calls` row (running) + live cells nested under it (code line, status, duration); the turn occupies chat until done or stopped.
 - Result: TypeBox schema `{ summary, files[], workspace }` → tool output → model weaves it into the reply; files live in the per-run workspace under `userData/deep-tasks/`.
 - One deep task at a time (their profile lock makes concurrent runs impossible anyway).
+- **Human-verification wall (G5):** when a cell's result matches a CAPTCHA/anti-bot phrase (`recaptcha`, `hcaptcha`, `turnstile`, `cf-challenge`, `not a robot`, `verify you are human`, `unusual traffic`, `checking your browser`, `just a moment`, …), the run is **paused** and its row shows an amber "prove you're human" card with a quoted snippet. The user solves it in the visible Chrome window and presses **Resume** (`browser:deep-resume`) — no automated bypass; the agent never attempts the challenge. A **Pause** control on a running deep row does the same on demand. Pause is cooperative (pi acknowledges at the next tool boundary); `resumeDeepTask` re-arms detection so a second wall later in the same task is reported too.
 
 ### Risks
 1. **Chrome must be installed** (`/Applications/Google Chrome.app` on macOS) — surface their "Chrome not found" error verbatim instead of a generic failure.
@@ -1124,45 +1125,110 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 
 ## Todos — Feature 6
 
-> **Status: planned only — research complete, decisions locked, zero code.** Phase 0 is a spike and must run first; everything after it assumes Phase 0's findings.
+> **Status: G1–G8 built, manual QA pending — do not re-research from memory.** Phase 0 is a spike and must run first; everything after it assumes Phase 0's findings. G5 adds the human-in-the-loop handoff for CAPTCHA/"verify you are human" walls; G6 adds provider rate-limit retries + honest error surfacing; G7 adds the browser-backend setting and the `@` tool picker; G8 fixes concurrent-navigation aborts (`ERR_ABORTED`) that made parallel browser lookups fail.
 
 ### Phase 0 — Spike (blocks everything)
-- [ ] `npm i @browser_use/pi` in `electron/` (pin exact version); `tsc -b` accepts its types
-- [ ] Dump `builtinModels()` at runtime: entries + env-var names + vision flags for openai/anthropic/google/xai — record the chosen default per provider **here**, not from memory
-- [ ] One trivial real-key `BrowserUse.run()` under Electron — proves the worker fork, `ELECTRON_RUN_AS_NODE` path, telemetry off, Chrome launch (headed)
-- [ ] Confirm `.bu-pi.lock` behavior (second run rejected cleanly)
+- [x] `npm i @browser_use/pi` in `electron/` (pin exact version); `tsc -b` accepts its types — pinned `0.1.0`; `npm run build` is green
+- [x] Dump `builtinModels()` at runtime: entries + env-var names + vision flags for openai/anthropic/google/xai — **all 78 entries across the four providers are vision-capable** (`input` includes `"image"`); record the chosen default per provider **here**, not from memory:
+  - openai → `gpt-5.4` · anthropic → `claude-sonnet-4-6` · google → `gemini-2.5-flash` · xai → `grok-4.3`
+  - env vars pi-ai reads: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, **`GEMINI_API_KEY`** (NOT `GOOGLE_API_KEY`), `XAI_API_KEY`; model id form `provider/modelId`
+- [x] One trivial real-key `BrowserUse.run()` under Electron — proves the worker fork, `ELECTRON_RUN_AS_NODE` path, telemetry off, Chrome launch (headed). The spike now loads `electron/.env` and picks the provider from whichever key is present (Anthropic, else Google), bridging a Google key stored as `GOOGLE_GEMINI_API_KEY` to the `GEMINI_API_KEY` pi-ai reads:
+  ```
+  ANTHROPIC_API_KEY=... electron scripts/pi-spike.mjs --keyed
+  GOOGLE_GEMINI_API_KEY=... electron scripts/pi-spike.mjs --keyed   # or in electron/.env
+  ```
+  (create-only mode needs no key and runs green; run with no key resolves to `{ status: "error", error }` with an auth-flavoured message — fails cleanly, no hang, no throw. Verified keyed green on `google/gemini-2.5-flash`, 2026-10.)
+- [x] Confirm `.bu-pi.lock` behavior (second run rejected cleanly) — locked: a second `BrowserUse.create` on the same profile throws the verbatim lock error; `close()` removes the lock so a later run can reuse the profile
+
+#### Phase 0 findings (spike + source, 2026-10)
+- `create()` ≠ `run()`: the browser launch, `--remote-debugging-port=0` discovery, profile dir creation (0o700) and `.bu-pi.lock` (`wx`, 0o600) all happen **in `create()`, before `run()`**. So the single-flight guard must gate `create()`, and chrome-missing/lock errors surface at create time.
+- Chrome is spawned headed when `headless: false` is passed (no `--headless=new` flag); the devtools endpoint is read from `<profile>/DevToolsActivePort` (`<port>\n/devtools/browser/<uuid>`), which is also how the spike verifies the launch.
+- macOS Chrome path is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`; when absent pi throws `Chrome not found. Install Chrome or set browser.executablePath / browser.cdpUrl.` — surface verbatim with our own "install Chrome" hint added.
+- Worker: `fork(process.execPath, …)`, `execArgv: ['--max-old-space-size=256']`, `env: {}` (only `ELECTRON_RUN_AS_NODE=1` survives), `stdio ignore+ipc`, `serialization: 'json'`. Provider keys stay in the agent process; env vars must be set where `BrowserUse` lives, just-in-time.
+- `run(task, options)` at runtime accepts `options.schema` (TypeBox) even though the shipped `RunOptions` type omits it → we skip pi's schema and build `{ summary, files, workspace }` from the string output + `result.workspace` + a workspace `readdir`, avoiding an unchecked cast.
+- Events: `AgentEvent.tool_execution_{start,update,end}` (toolCallId, toolName, args, partialResult / result, isError). `javascript` args are `{ code }`; `finish`/`finish_from_js` are the delivery cells. `onEvent` (per-run) is the mapping source for the cell feed.
+- `BrowserUseOptions` are per-instance; `close()` is idempotent (kills Chrome, closes+removes the lock, keeps the persistent profile).
 
 ### Phase G1 — Deep-task service (`electron/browser/deep-task.ts`)
-- [ ] `resolveDeepModel()`: provider from the chat config → `getProviderKey()` → set matching env var just-in-time → vision-capable `builtinModels()` pick; typed error when no key / no catalog entry
-- [ ] `runDeepTask({ task, sessionId, signal, onEvent })` — dynamic import (off startup path), `BrowserUse.create({ telemetry:false, researchTools:false, headless:false, profileDir, workspace, timeoutMs: 600_000, maxCostUsd: 1 })`, `run()`, `close()` in `finally`
-- [ ] `abortDeepTask()` export + module-level single-flight guard
-- [ ] Per-run workspace dir `userData/deep-tasks/<sessionId>-<ts>/` + persistent Chrome profile dir
-- [ ] Chrome-missing / lock-held / no-key errors surfaced as plain actionable tool-error text
+- [x] `resolveDeepModel()`: provider from the chat config → `getProviderKey()` → set matching env var just-in-time → vision-capable `builtinModels()` pick; typed error when no key / no catalog entry — defaults `openai/gpt-5.4 · anthropic/claude-sonnet-4-6 · google/gemini-2.5-flash · xai/grok-4.3`, fallback to first image-capable entry, `DUMMY_DEEP_MODEL` (global) or the per-provider env var overrides
+- [x] `runDeepTask({ task, toolCallId, signal })` — dynamic import off startup path, `BrowserUse.create({ telemetry:false, researchTools:false, headless:false, profileDir, workspace, timeoutMs: 600_000, maxCostUsd: 1 })`, `run()`, `close()` in `finally`
+- [x] `abortDeepTask()` export + module-level single-flight guard; key env var restored/removed in `finally`; `DeepEvent` on `onDeepTaskEvent()` for the cell feed; `registerDeepSessionProvider` (injected by chat.ts)
+- [x] Per-run workspace `userData/deep-tasks/<sessionId>-<ts>/` + persistent Chrome profile `userData/deep-chrome`
+- [x] Chrome-missing / lock-held / no-key errors surfaced as plain actionable tool-error text (with install/quit guidance)
 
 ### Phase G2 — Tool + wiring
-- [ ] `browser_deep_task { task }` in `browser/tools.ts`, **not** in `READ_ONLY` → existing one-expression `toolApproval` in `ai/chat.ts` gates it (no approval-policy change needed)
-- [ ] `stopActiveStream()` also calls `abortDeepTask()` so stop mid-run cancels the child + Chrome
-- [ ] `chat_tool_calls` row: input = task, output = summary + files + workspace path (row writing is already generic)
-- [ ] Approval-card copy for this tool (capability-grant wording, decision 1)
-- [ ] CHAT_INSTRUCTIONS note: when to prefer the embedded panel vs a deep task
+- [x] `browser_deep_task { task }` (task ≤ 4000 chars) in `browser/tools.ts`, **not** in `READ_ONLY` → `toolApproval` returns `{ type: "user-approval", reason: DEEP_TASK_APPROVAL_REASON }`, surfaced on the card via `part.reason`
+- [x] `abort()` also calls `abortDeepTask()` so any stop mid-run cancels the child + Chrome (belt alongside the SDK abortSignal riding into `runDeepTask`)
+- [x] `chat_tool_calls` row: input = task, output = summary + files + workspace path (row writing was already generic)
+- [x] Approval-card copy: capability-grant wording (`DEEP_TASK_APPROVAL_REASON`), renders in the existing card
+- [x] CHAT_INSTRUCTIONS note: deep task for whole-jobs, embedded tools for quick lookups; `ToolLoopAgent` `timeout` lifted to 600 s (600 s tool / 620 s deep-call) because the SDK default step timeout would kill a >5 min run
 
 ### Phase G3 — Live feed UI
-- [ ] main forwards their `onEvent` stream → `browser:deep` IPC; preload + `renderer/electron.d.ts` types (mirror the `chat:event` pattern)
-- [ ] `browser-activity.tsx` / `page.tsx` / `use-chat.ts`: deep row + nested live cells (code line, status, duration) — **read `node_modules/next/dist/docs/` first, per `renderer/AGENTS.md`** (this Next version is not the one you know)
-- [ ] Stop button verified end to end: click → abort → cells settle → row closes as `stopped`
+- [x] main forwards `onDeepTaskEvent` → `browser:deep` IPC; preload + `renderer/electron.d.ts` types (mirror the `chat:event` pattern, `DeepEvent` exported from preload)
+- [x] `use-chat.ts` subscribes, patches `ToolActivity.cells` by pi cell id (`deep-cell-start/delta/end`); `toStoredToolCall` drops `cells` (live-only v1); `browser-activity.tsx` renders nested cells (code line + latest output, height-capped) and a deep row label/summary
+- [x] Stop path verified by construction: `abort()` → `abortDeepTask()` → `run()` aborts → `finally` closes Chrome → tool-result (or stopped row) settles the row
 
 ### Phase G4 — Validation + docs
-- [ ] `approval-smoke.mjs` extended: `browser_deep_task` parks → approve → executes (mocked) → deny → never runs
-- [ ] Full gate green: `npm test`, `tsc -b` (electron), preload + renderer typecheck, eslint on touched files
-- [ ] Manual: real key + installed Chrome → sample task → external window moves, cells stream, stop cancels, result lands in chat, workspace files exist
-- [ ] Manual: no Chrome / no key paths show the actionable errors
-- [ ] Update this section with outcomes and traps found
+- [x] `approval-smoke.mjs` extended: `browser_deep_task` parks → approves → executes (mocked) → denies → never runs, reason propagates, `isAutomatic` shows it is NOT read-only — green
+- [x] Full gate green: `npm test` (providers + approvals + build + CDP smoke), electron `tsc -b` + preload, renderer `tsc --noEmit`, eslint on touched files
+- [ ] Manual (yours, needs a real key): sample task → external Chrome window moves, cells stream live, stop cancels, result lands in chat, workspace files exist
+- [ ] Manual (yours): no-Chrome / no-key paths show the actionable errors
+- [x] Update this section with outcomes and traps found — see below
+
+### Outcomes + traps found (2026-10)
+- **The SDK only parks tools it recognises.** The first deep-tool smoke failed because the mock streamed `browser_type` to a toolset that only had `browser_deep_task` — zero parks, no execute. The scripted stream took a tool name + args, and everything green. Trap shaped like a mock, not the app.
+- **The approval `reason` round-trips.** `toolApproval` returning `{ type: "user-approval", reason }` lands on the `tool-approval-request` part's `reason` field (asserted in the smoke), so chat.ts's existing `part.reason` plumbing needs no change.
+- **`exactOptionalPropertyTypes: true`** in electron: passing `signal: undefined` from the SDK's `ToolExecutionOptions` requires `signal?: AbortSignal | undefined` on `runDeepTask`'s options.
+- **`BrowserUse` has a private constructor** — type the instance via `Awaited<ReturnType<typeof BrowserUse.create>>`, not `InstanceType<typeof BrowserUse>`.
+- **The devtools probe reads `<profile>/DevToolsActivePort`** which is `<port>\n/devtools/browser/<uuid>` (never an IP) — the first spike check looked for `127.0.0.1` and was the only non-pi false fail.
+- **App quitting mid-task** orphans Chrome behind `userData/deep-chrome/.bu-pi.lock`; the lock error text tells the user exactly how to recover, and `will-quit` best-effort aborts the run.
+
+### Phase G5 — Human-in-the-loop challenge handoff (2026-10)
+- [x] `deep-task.ts`: `deep-challenge { reason, snippet }` + `deep-control { paused }` event/payload variants; `CHALLENGE_PATTERN` + `challengeSnippet()` (windowed quote around the match); detection runs once per run on each `tool_execution_end` result (`challengeSignalled` flag, re-armed on resume)
+- [x] `pauseDeepTask()` / `resumeDeepTask()` exports + module-level `activeBrowser` / `activeToolCallId` (set after `create()`, cleared in `finally`); pause emitted optimistically, then `browser.pause()` called **without await** (it only resolves at the next tool boundary — awaiting from the event handler would deadlock the run)
+- [x] `main.ts`: `browser:deep-pause` / `browser:deep-resume` handlers, restricted to the chat window (`windowFor(event) === chatWindow`)
+- [x] `preload.ts` + `renderer/electron.d.ts`: `deep.pause()` / `deep.resume()` + the two event variants mirrored
+- [x] `use-chat.ts`: `DeepEvent` union renamed/extended; `ToolActivity.deepPaused` / `deepChallenge` (live-only, dropped by `toStoredToolCall`); handler patches the row from `deep-challenge`/`deep-control`; `setDeepPaused(paused)` returned by the hook
+- [x] `browser-activity.tsx`: amber challenge banner (reason + snippet + Resume), plain "Paused + Resume" when paused without a challenge, and a "Pause" affordance on a running `browser_deep_task` row; status text reads "Needs you"/"Paused"
+- [x] Gate green: electron `npm run build`, renderer `tsc --noEmit`, eslint on touched files, `test:providers`, `test:approvals`
+
+#### G5 decisions + traps
+- **No automated bypass.** Stealth fingerprints / solver services are anti-bot circumvention; the app hands the wall to the human instead. The regex is intentionally broad — a false positive costs one click on Resume, a miss costs the agent a loop against a wall it cannot pass.
+- **Pause resolves at the next tool boundary**, so `pause()` must never be awaited from inside `onEvent`; the row reflects the request immediately and pi's next state is "no tool taken".
+- **Two events, two jobs:** `deep-challenge` carries the reason/snippet for the card; `deep-control` is the authoritative paused bit (set for a detection pause, cleared for a resume). Resume clears `deepChallenge` so a stale banner cannot linger over a moving run.
+- **Live-only.** Like `cells`, both fields are dropped by `toStoredToolCall`: history keeps the final output, not the moment the wall appeared.
+
+### Phase G6 — Provider rate-limit resilience (2026-10)
+- [x] **Root cause:** pi-ai retries 408/409/429/5xx with backoff, but only when the caller passes `maxRetries` (`retryProviderRequest` defaults it to `0`). `BrowserUseOptions` never sets it, so a single transient `429` from Google ended the run — common on free-tier RPM/TPM with the deep agent's image-heavy burst. The outer chat model then paraphrased the failed tool result into a fabricated answer.
+- [x] `deep-task.ts`: wrap pi's transport (`models.streamSimple`) in a `streamFn` that forwards `maxRetries: 2` + `maxRetryDelayMs: 60_000`; pass the same `models` collection into `BrowserUse.create` so identity is preserved. Aborts during backoff still fire (pi-ai's sleep is abortable).
+- [x] `deep-task.ts`: `rateLimitHint()` turns a rate-limit/quota stop into plain actionable text ("wait a minute or switch provider/model in Settings") before the tool returns `{ error }`.
+- [x] `deep-task.ts`: `DUMMY_DEEP_MODEL` override — a bare model id for the active provider, or `provider/modelId` (ignored if the provider differs); validated against the catalog and falls back to the vision default.
+- [x] `ai/chat.ts`: `CHAT_INSTRUCTIONS` now tells the model to report tool errors plainly and never invent the results a failed tool should have produced.
+- [x] Gate green: electron `npm run build`, renderer `tsc --noEmit`, `test:providers`, `test:approvals`
+
+### Phase G7 — Browser backend setting + `@` tool picker (2026-10)
+- [x] **`browser_backend` setting** (`embedded` | `deep`, default `embedded`) in the `settings` table, read/written through `getBrowserBackend`/`setBrowserBackend` in `ai/config.ts` and surfaced on `AiConfig`. IPC `ai:set-browser-backend` reuses the existing `mutateConfig` helper so the renderer gets the re-read config back.
+- [x] **Backends are exclusive, not cumulative.** `toolsForBackend()` in `browser/tools.ts` hands the agent the step tools with no deep task, or `browser_deep_task` alone. Cumulative sets were the first design and they let the model interleave a dozen approved clicks with one approved autonomous run — neither auditable nor cheap.
+- [x] **Backend-aware prompt.** `CHAT_INSTRUCTIONS` became `chatInstructions(backend)`: each lane gets the paragraph describing *its* tools and not the other's. Telling a model a tool exists when it is not in the tool set produces a turn that apologises for a call it cannot make.
+- [x] **Settings UI (staged + saved):** a "Browser automation" `RadioGroup` in `renderer/app/settings/page.tsx`. The choice is **staged, not written on click** — swapping the backend changes which tools the whole chat has, and an instant write with no acknowledgement reads as a setting that never saved. `pendingBackend` holds a value only while it differs from the saved one, so the radio is always driven by the saved config, a successful write needs no reset, and a failed one stays pending and retryable. **Save** is disabled unless dirty; `apply()` now resolves `Promise<boolean>` so the page can confirm rather than assume. Success raises a `Toaster` toast (mounted once in `app/layout.tsx`).
+- [x] **`@` picker in the composer:** typing `@` opens a panel above the textarea. It lists **one capability, `BrowserAutomation`, in both modes** — not the raw tools. A picker listing `browser_navigate`/`browser_snapshot`/`browser_read`/… asks the user to know which internal step they want before the assistant has looked at anything, and it changes shape whenever a tool is renamed; naming the *capability* is what a person means by "go and check that page". `mentionCatalog(backend)` returns the single entry with a backend-specific description; the agent still receives the real tools from `toolsForBackend`. Arrow/Enter/Tab/Escape are handled on the textarea (it keeps focus; the panel is a visual echo of the selection), and `onMouseDown` is prevented so the caret survives the click. The `@` must start the message or follow whitespace, which keeps an email address from opening the picker.
+- [x] **`ai/mentions.ts`:** the directive builder, deliberately free of the browser/DB/Electron graph so it can be tested alone. Only names the picker actually offered are honoured, so a hand-typed `@browser_navigate` is not a mention. The directive is phrased as a capability — *"use the browser tools available to you … take as many of them as the job needs"* — rather than pinning one call, which is what lets one mention drive a multi-step run. Appended to the model turn only, after `insertMessage` has stored what the user typed — the transcript stays exactly what was written.
+- [x] `scripts/browser-backends-smoke.mjs` (`npm run test:backends`, wired into `npm test`): 16 checks over backend exclusivity, picker collapse, mention detection and directive scoping.
+- [x] Gate green: electron `npm run build`, renderer `tsc --noEmit` + eslint on touched files, `test:providers`, `test:approvals`, `test:backends`
+- [ ] Manual: Settings → pick a backend → Save → toast + "Unsaved change" clears, value survives a restart; `@BrowserAutomation` in the composer → arrows + Enter inserts and the model drives a multi-step run rather than one pinned call.
+
+### Phase G8 — Concurrent-navigation aborts (2026-10)
+- [x] **Root cause:** `open()` (`browser_navigate`) was the only page operation **not** run under `browser/window.ts`'s `Mutex`, so two `loadURL` calls raced: the second aborted the first, and Chromium reports that as `ERR_ABORTED (-3) loading '<url>'`. The model reads that as the site refusing it. The module's own header comment already claimed *"Every operation therefore runs through a mutex"* — the invariant was documented but not held. `open()` is now `mutex.run(async () => …)`; no nested `mutex.run` exists on its call path, so there is no deadlock.
+- [x] `close()` had the same defect — it navigates to `about:blank` and clears refs outside the mutex, so evicting the page mid-`browser_navigate` aborted the load the same way. Now under the mutex, still fire-and-forget because `will-quit` calls it.
+- [x] **Regression test** (`scripts/browser-smoke.mjs`): fires three `open()` calls concurrently and asserts none reject. Verified it reproduces `ERR_ABORTED (-3)` with the fix reverted, so it fails on the bug rather than merely passing on the current code.
+- [x] `ai/chat.ts`: `TOOL_ERROR_INSTRUCTIONS` split **transient** from **permanent** failures. It previously said "report it plainly and stop", which is what made one aborted navigation collapse into "I'm sorry, but I can't reliably complete this". It now asks for a retry on aborts/timeouts/stale refs and for finishing the rest of the task on a refusal — while keeping the G6 rule that a failure is never dressed up as an answer.
+- [x] Gate green: `npm run build`, browser-smoke (incl. the new race checks), `test:providers`, `test:approvals`, `test:backends`, renderer `tsc --noEmit`
 
 ---
 
 ## Open Questions — Feature 6
-- Model override in settings if the auto-pick picks wrong (or user wants a cheaper/deeper model than chat)?
-- Persist the cell transcript into `chat_tool_calls.output` (JSON) so the timeline survives reload, or live-only v1?
+- Model override in settings if the auto-pick picks wrong (or user wants a cheaper/deeper model than chat)? — interim: `DUMMY_DEEP_MODEL` env / per-provider env var override
+- ~~Persist the cell transcript into `chat_tool_calls.output` (JSON) so the timeline survives reload, or live-only v1?~~ — **decided: live-only v1** (Row keeps final output; cells are dropped in `toStoredToolCall`)
 - Headless mode + screenshots into the panel as a toggle, for watching without a second window?
 - Block deep tasks while a heavy F5 page is open (memory), or leave it to the user?
 - Should the deep lane ever be allowed to target the *embedded* panel (i.e. revisit the CDP bridge), or is the external window permanent?

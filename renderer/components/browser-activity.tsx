@@ -13,10 +13,14 @@ import {
   FileTextIcon,
   ArrowLeftIcon,
   ArrowRightIcon,
+  PlayIcon,
+  PauseIcon,
+  ShieldAlertIcon,
+  TerminalIcon,
 } from "lucide-react"
 import { useState } from "react"
 import { cn } from "@/lib/utils"
-import type { BrowserApproval, ToolActivity } from "@/hooks/use-chat"
+import type { BrowserApproval, DeepCell, ToolActivity } from "@/hooks/use-chat"
 
 /**
  * Tools are read as sentences, not as identifiers.
@@ -35,6 +39,7 @@ const toolLabels: Record<string, string> = {
   browser_type: "Typed",
   browser_go: "Went back or forward",
   browser_save_pdf: "Saved PDF",
+  browser_deep_task: "Ran deep task",
 }
 
 const toolIcons: Record<string, typeof GlobeIcon> = {
@@ -46,6 +51,7 @@ const toolIcons: Record<string, typeof GlobeIcon> = {
   browser_type: TypeIcon,
   browser_go: UndoIcon,
   browser_save_pdf: SaveIcon,
+  browser_deep_task: PlayIcon,
 }
 
 /** A stable order for back/forward, which arrive as one tool with a direction. */
@@ -83,6 +89,10 @@ function inputSummary(input: unknown): string {
     const text = record.text
     return text.length > 60 ? `“${text.slice(0, 60)}…”` : `“${text}”`
   }
+  if (typeof record.task === "string") {
+    const task = record.task
+    return task.length > 80 ? `“${task.slice(0, 80)}…”` : `“${task}”`
+  }
   return ""
 }
 
@@ -95,6 +105,61 @@ function outputPage(output: unknown): string | null {
   return typeof url === "string" && url ? url : null
 }
 
+/** A deep task's closing summary, shown as the row's destination line. */
+function deepTaskSummary(output: unknown): string | null {
+  if (typeof output !== "object" || output === null) return null
+  const summary = (output as Record<string, unknown>).summary
+  if (typeof summary !== "string" || !summary) return null
+  return summary.length > 120 ? `${summary.slice(0, 120)}…` : summary
+}
+
+/**
+ * One live cell inside a running deep task.
+ *
+ * The code snippet sits above the cell's latest output; both are replaced as
+ * the cell progresses, never accumulated — each event already carries the full
+ * current text. A height cap keeps a chatty cell from stretching the timeline.
+ */
+function DeepCellRow({ cell }: { cell: DeepCell }) {
+  const statusText = cell.status === "error" ? "Failed" : cell.status === "done" ? "Done" : "Running"
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        {cell.kind === "code" ? (
+          <TerminalIcon aria-hidden="true" className="size-3 shrink-0" />
+        ) : (
+          <CheckIcon aria-hidden="true" className="size-3 shrink-0" />
+        )}
+        <span className="font-medium">{cell.kind === "code" ? "JS cell" : "Finished"}</span>
+        {cell.status === "running" ? (
+          <Spinner aria-label="Running" className="size-3 text-muted-foreground" />
+        ) : null}
+        <span
+          className={cn("ml-auto shrink-0", cell.status === "error" && "text-destructive")}
+        >
+          {statusText}
+        </span>
+      </div>
+      {cell.code ? (
+        <pre className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[11px] leading-relaxed text-muted-foreground">
+          {cell.code}
+        </pre>
+      ) : null}
+      {cell.detail ? (
+        <pre
+          className={cn(
+            "max-h-32 overflow-auto rounded bg-muted/40 px-2 py-1 font-mono text-[11px] leading-relaxed",
+            cell.status === "error" ? "text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {cell.detail}
+          {cell.truncated ? " …" : ""}
+        </pre>
+      ) : null}
+    </div>
+  )
+}
+
 /**
  * One tool call in the transcript.
  *
@@ -103,11 +168,17 @@ function outputPage(output: unknown): string | null {
  * unreadable at a glance. The disclosure only guards the full input/output
  * JSON, which is long and rarely interesting.
  */
-function ToolRow({ activity }: { activity: ToolActivity }) {
+function ToolRow({
+  activity,
+  onControl,
+}: {
+  activity: ToolActivity
+  onControl: (paused: boolean) => void
+}) {
   const [open, setOpen] = useState(false)
 
   const summary = inputSummary(activity.input)
-  const destination = outputPage(activity.output)
+  const destination = outputPage(activity.output) ?? deepTaskSummary(activity.output)
   const denied = activity.approved === false
   const failed = activity.error !== null
 
@@ -115,11 +186,15 @@ function ToolRow({ activity }: { activity: ToolActivity }) {
     ? "Denied"
     : failed
       ? "Failed"
-      : activity.status === "running"
-        ? activity.approvalId
-          ? "Waiting for you"
-          : "Running"
-        : "Done"
+      : activity.deepChallenge
+        ? "Needs you"
+        : activity.deepPaused
+          ? "Paused"
+          : activity.status === "running"
+            ? activity.approvalId
+              ? "Waiting for you"
+              : "Running"
+            : "Done"
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
@@ -133,7 +208,7 @@ function ToolRow({ activity }: { activity: ToolActivity }) {
         ) : (
           <span className="min-w-0 flex-1" />
         )}
-        {activity.status === "running" && !activity.approvalId ? (
+        {activity.status === "running" && !activity.approvalId && !activity.deepPaused ? (
           <Spinner aria-label="Running" className="size-3.5 text-muted-foreground" />
         ) : null}
         <span
@@ -150,6 +225,55 @@ function ToolRow({ activity }: { activity: ToolActivity }) {
       </div>
       {destination ? (
         <p className="mt-1 truncate text-xs text-muted-foreground">{destination}</p>
+      ) : null}
+      {activity.cells && activity.cells.length > 0 ? (
+        <div className="mt-2 flex flex-col gap-1.5 border-t border-border/40 pt-2">
+          {activity.cells.map((cell) => (
+            <DeepCellRow key={cell.cellId} cell={cell} />
+          ))}
+        </div>
+      ) : null}
+      {activity.deepChallenge ? (
+        <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2">
+          <div className="flex items-start gap-2">
+            <ShieldAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-medium">{activity.deepChallenge.reason}</p>
+              {activity.deepChallenge.snippet ? (
+                <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                  {activity.deepChallenge.snippet}
+                </p>
+              ) : null}
+              <p className="mt-1 text-xs text-muted-foreground">
+                Solve it in the Chrome window, then resume the task.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" type="button" onClick={() => onControl(false)}>
+              <PlayIcon aria-hidden="true" />
+              Resume
+            </Button>
+          </div>
+        </div>
+      ) : activity.deepPaused ? (
+        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <PauseIcon aria-hidden="true" className="size-3.5 shrink-0" />
+          <span className="flex-1">Paused</span>
+          <Button variant="outline" size="sm" type="button" onClick={() => onControl(false)}>
+            <PlayIcon aria-hidden="true" />
+            Resume
+          </Button>
+        </div>
+      ) : activity.status === "running" && activity.toolName === "browser_deep_task" ? (
+        <div className="mt-2 flex justify-end">
+          <button
+            type="button"
+            onClick={() => onControl(true)}
+            className="flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:underline"
+          >
+            <PauseIcon aria-hidden="true" className="size-3" />
+            Pause
+          </button>
+        </div>
       ) : null}
       <button
         type="button"
@@ -238,11 +362,13 @@ export function BrowserActivity({
   approvals,
   onRespond,
   responding,
+  onDeepControl,
 }: {
   toolActivity: Record<string, ToolActivity>
   approvals: BrowserApproval[]
   onRespond: (approvalId: string, approved: boolean) => void
   responding: boolean
+  onDeepControl: (paused: boolean) => void
 }) {
   const rows = Object.values(toolActivity)
   if (rows.length === 0 && approvals.length === 0) return null
@@ -260,7 +386,7 @@ export function BrowserActivity({
       {rows.length > 0 ? (
         <div className="flex flex-col gap-1.5">
           {rows.map((activity) => (
-            <ToolRow key={activity.toolCallId} activity={activity} />
+            <ToolRow key={activity.toolCallId} activity={activity} onControl={onDeepControl} />
           ))}
         </div>
       ) : null}

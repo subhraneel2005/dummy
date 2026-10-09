@@ -11,6 +11,7 @@ interface AiConfig {
   model: string | null
   hasKey: boolean
   encryptionAvailable: boolean
+  browserBackend?: "embedded" | "deep"
 }
 
 interface ModelInfo {
@@ -31,7 +32,12 @@ type AiCatalogResult = {
   providers: Record<string, ProviderInfo>
   models: Record<string, ModelInfo[]>
 }
+interface ToolInfo {
+  name: string
+  description: string
+}
 type AiModelsResult = { ok: true; models: ModelInfo[] } | { ok: false; error: string; models?: ModelInfo[] }
+type AiToolCatalogResult = { ok: true; tools: ToolInfo[] } | { ok: false; error: string }
 
 interface AiWipeCounts {
   messages: number
@@ -126,6 +132,58 @@ type BrowserStatus = {
   page: { url: string; title: string } | null
   open: boolean
 }
+
+/**
+ * One cell in a deep task's run, streamed over `browser:deep`.
+ *
+ * Keyed by the *deep task's* tool call id on the outside (so the renderer can
+ * target the row) and by pi's internal cell id inside (so it can patch the
+ * right cell without the SDK's ids leaking into the chat event types).
+ */
+type DeepEvent =
+  | {
+      type: "deep-cell-start"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      kind: "code" | "finish"
+      code: string | null
+    }
+  | {
+      type: "deep-cell-delta"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+    }
+  | {
+      type: "deep-cell-end"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+      isError: boolean
+    }
+  // A human-verification wall the run hands to the user instead of fighting.
+  | {
+      type: "deep-challenge"
+      sessionId: string | null
+      toolCallId: string
+      reason: string
+      snippet: string
+    }
+  // Whether the run is currently paused, however the pause was requested.
+  | {
+      type: "deep-control"
+      sessionId: string | null
+      toolCallId: string
+      paused: boolean
+    }
 
 /**
  * Where the browser panel sits, in CSS pixels relative to the window viewport.
@@ -252,6 +310,10 @@ const electronAPI = {
         ipcRenderer.invoke("ai:set-key", provider, key) as Promise<AiConfigResult>,
       clearKey: (provider: string) =>
         ipcRenderer.invoke("ai:clear-key", provider) as Promise<AiConfigResult>,
+      setBrowserBackend: (backend: "embedded" | "deep") =>
+        ipcRenderer.invoke("ai:set-browser-backend", backend) as Promise<AiConfigResult>,
+      getToolCatalog: (backend?: "embedded" | "deep") =>
+        ipcRenderer.invoke("ai:get-tool-catalog", backend) as Promise<AiToolCatalogResult>,
       wipeAllData: () => ipcRenderer.invoke("ai:delete-all-data") as Promise<AiWipeResult>,
       deleteAllImages: () =>
         ipcRenderer.invoke("ai:delete-all-attachments") as Promise<AiImagesDeleteResult>,
@@ -310,6 +372,19 @@ onEvent: (callback: (event: ChatEvent) => void) => {
         return () => ipcRenderer.removeListener("browser:status", handler)
       },
     },
+    deep: {
+      onEvent: (callback: (event: DeepEvent) => void) => {
+        const handler = (_event: unknown, event: DeepEvent) => callback(event)
+        ipcRenderer.on("browser:deep", handler)
+        return () => ipcRenderer.removeListener("browser:deep", handler)
+      },
+      // Takes effect at the run's next tool boundary; the row updates from the
+      // `deep-control` event main emits, not from these calls.
+      pause: () =>
+        ipcRenderer.invoke("browser:deep-pause") as Promise<{ ok: boolean }>,
+      resume: () =>
+        ipcRenderer.invoke("browser:deep-resume") as Promise<{ ok: boolean }>,
+    },
   ready: () => ipcRenderer.send("renderer:ready"),
 }
 
@@ -321,6 +396,7 @@ export type {
   AiConfig,
   AiConfigResult,
   AiImagesDeleteResult,
+  AiToolCatalogResult,
   AiWipeCounts,
   AiWipeResult,
   CaptureInfo,
@@ -333,8 +409,10 @@ export type {
   ChatMessage,
   ChatSeed,
   ChatSession,
+  DeepEvent,
   DictationStatus,
   ModelInfo,
   ProviderInfo,
-  StagedCapture
+  StagedCapture,
+  ToolInfo
 }

@@ -84,6 +84,55 @@ type ChatEvent =
     }
 
 /**
+ * A deep-task stream event (Feature 6), mirrored locally exactly like
+ * `ChatEvent`: the wire type in `electron.d.ts` is module-scoped, so the
+ * handler's parameter is typed with this structurally-identical union. Cells
+ * drive the row's live output; challenge/control events drive its pause state.
+ */
+export type DeepEvent =
+  | {
+      type: "deep-cell-start"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      kind: "code" | "finish"
+      code: string | null
+    }
+  | {
+      type: "deep-cell-delta"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+    }
+  | {
+      type: "deep-cell-end"
+      sessionId: string | null
+      toolCallId: string
+      cellId: string
+      toolName: string
+      detail: string
+      truncated: boolean
+      isError: boolean
+    }
+  | {
+      type: "deep-challenge"
+      sessionId: string | null
+      toolCallId: string
+      reason: string
+      snippet: string
+    }
+  | {
+      type: "deep-control"
+      sessionId: string | null
+      toolCallId: string
+      paused: boolean
+    }
+
+/**
  * A tool call as the UI shows it.
  *
  * Tool activity is deliberately not part of `ChatMessage`: it is not a turn,
@@ -117,10 +166,54 @@ export interface ToolActivity {
    * a message and reloaded from history, where `durationMs` is already final.
    */
   startedAt?: number
+  /**
+   * The deep task's live cells (Feature 6), streamed over `browser:deep`.
+   *
+   * Live-only in v1: cells are patched by cell id as pi reports them, and are
+   * explicitly dropped when the row is stored on a message. History therefore
+   * never carries them — a reloaded transcript shows the deep task as one row
+   * with its final output, which is the degree of detail worth persisting.
+   */
+  cells?: DeepCell[]
+  /**
+   * Whether a deep task is paused (Feature 6), live-only like `cells`.
+   *
+   * Set from the run's `deep-control` event — the one place a pause or resume
+   * is actually observed — so the row's button state cannot drift from main.
+   */
+  deepPaused?: boolean
+  /**
+   * The human-verification wall a deep task hit (Feature 6), live-only.
+   *
+   * Present only while the run is parked on a challenge; cleared on resume.
+   * Like `cells`, it never reaches history — the stored row keeps the final
+   * output, which is the durable fact; the wall was a moment in the run.
+   */
+  deepChallenge?: { reason: string; snippet: string } | null
+}
+
+/**
+ * One cell in a deep task's run, as the panel renders it.
+ *
+ * Built from the three `deep-cell-*` events: `start` creates the cell with its
+ * code, `delta` streams its latest output, `end` settles it. `detail` is the
+ * most recent payload and is replaced, never accumulated — each event already
+ * carries the current text of the cell.
+ */
+export interface DeepCell {
+  cellId: string
+  toolName: string
+  kind: "code" | "finish"
+  code: string | null
+  status: "running" | "done" | "error"
+  detail: string | null
+  truncated: boolean
 }
 
 /** One tool row, with the live-only fields removed, ready to store on a message. */
-export function toStoredToolCall(call: ToolActivity): Omit<ToolActivity, "approvalId" | "startedAt"> {
+export function toStoredToolCall(
+  call: ToolActivity,
+): Omit<ToolActivity, "approvalId" | "startedAt" | "cells" | "deepPaused" | "deepChallenge"> {
   return {
     toolCallId: call.toolCallId,
     toolName: call.toolName,
@@ -309,6 +402,32 @@ export function useChat(sessionId: string | null) {
     setToolActivity(next)
   }, [])
 
+  /**
+   * Merges one cell update into a tool row's live cells.
+   *
+   * Keyed by pi's cell id, so deltas and the terminal event patch the cell the
+   * run started rather than stacking duplicates beside it. The cell is created
+   * on first sight if the `deep-cell-start` raced the `tool-call` event.
+   */
+  const patchDeepCell = useCallback(
+    (toolCallId: string, update: { cellId: string } & Partial<DeepCell>) => {
+      const current = toolActivityRef.current[toolCallId]
+      const existing = (current?.cells ?? []).find((entry) => entry.cellId === update.cellId)
+      const cell: DeepCell = {
+        cellId: update.cellId,
+        toolName: update.toolName ?? existing?.toolName ?? "javascript",
+        kind: update.kind ?? existing?.kind ?? "code",
+        code: update.code !== undefined ? update.code : existing?.code ?? null,
+        status: update.status ?? existing?.status ?? "running",
+        detail: update.detail !== undefined ? update.detail : existing?.detail ?? null,
+        truncated: update.truncated ?? existing?.truncated ?? false,
+      }
+      const cells = [...(current?.cells ?? []).filter((entry) => entry.cellId !== cell.cellId), cell]
+      patchTool(toolCallId, { cells })
+    },
+    [patchTool],
+  )
+
   const settleTool = useCallback(
     (toolCallId: string) => {
       const started = toolStartRef.current.get(toolCallId)
@@ -494,6 +613,57 @@ export function useChat(sessionId: string | null) {
     })
   }, [flushTail, patchTool, settleTool, settleUnfinishedTools])
 
+  // Deep-task cells arrive on their own channel (see `browser/deep-task.ts`):
+  // they are not SDK parts, so they have no business in the chat event stream.
+  // They patch the row the run belongs to by the tool call id both sides key on.
+  useEffect(() => {
+    return window.electronAPI?.deep.onEvent((event: DeepEvent) => {
+      // Same rule as the chat stream: cells for a conversation the user has
+      // left belong to its own reload, not to this pane.
+      if (event.sessionId !== sessionIdRef.current) return
+      if (event.type === "deep-cell-start") {
+        patchDeepCell(event.toolCallId, {
+          cellId: event.cellId,
+          toolName: event.toolName,
+          kind: event.kind,
+          code: event.code,
+          status: "running",
+          detail: null,
+        })
+      } else if (event.type === "deep-cell-delta") {
+        // A delta is a running cell showing its latest output; `end` settles it.
+        patchDeepCell(event.toolCallId, {
+          cellId: event.cellId,
+          toolName: event.toolName,
+          detail: event.detail,
+          truncated: event.truncated,
+        })
+      } else if (event.type === "deep-cell-end") {
+        patchDeepCell(event.toolCallId, {
+          cellId: event.cellId,
+          detail: event.detail,
+          truncated: event.truncated,
+          status: event.isError ? "error" : "done",
+        })
+      } else if (event.type === "deep-challenge") {
+        // The wall and the pause behind it arrive as separate events; flagging
+        // both here means the card is already marked paused when it renders.
+        patchTool(event.toolCallId, {
+          deepChallenge: { reason: event.reason, snippet: event.snippet },
+          deepPaused: true,
+        })
+      } else {
+        // `deep-control` is the authoritative pause state: set for a detection
+        // pause and cleared for a resume, so a stale challenge banner goes with
+        // it rather than lingering over a run that is moving again.
+        patchTool(event.toolCallId, {
+          deepPaused: event.paused,
+          ...(event.paused ? {} : { deepChallenge: null }),
+        })
+      }
+    })
+  }, [patchDeepCell, patchTool])
+
   // Switch sessions by clearing local state at the moment of the switch. Doing it
   // in an effect on [sessionId] raced the optimistic send: minting a new session
   // id re-ran the effect and wiped the message the user had just submitted.
@@ -619,6 +789,20 @@ export function useChat(sessionId: string | null) {
     }
   }, [approvals])
 
+  /**
+   * Pauses or resumes the in-flight deep task (Feature 6).
+   *
+   * No optimistic patch: main emits `deep-control`, and that event is what
+   * updates the row. Reading the same event the challenge detection feeds means
+   * the button can never show a state main did not actually reach.
+   */
+  const setDeepPaused = useCallback(async (paused: boolean) => {
+    const api = window.electronAPI?.deep
+    if (!api) return
+    if (paused) await api.pause()
+    else await api.resume()
+  }, [])
+
   const reset = useCallback(async () => {
     if (!sessionId) return
     const result = await window.electronAPI?.chat.reset(sessionId)
@@ -649,6 +833,7 @@ export function useChat(sessionId: string | null) {
     toolActivity,
     approvals,
     respondToApproval,
+    setDeepPaused,
     send,
     history,
     reset,

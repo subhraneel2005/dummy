@@ -2,6 +2,8 @@ export const PROVIDERS = ["openai", "anthropic", "google", "xai"] as const
 
 export type ProviderId = (typeof PROVIDERS)[number]
 
+export type BrowserBackend = "embedded" | "deep"
+
 export interface ProviderInfo {
   id: ProviderId
   label: string

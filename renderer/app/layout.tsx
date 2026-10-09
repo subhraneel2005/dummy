@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
-import { GeistSans } from 'geist/font/sans';
+import { GeistSans } from "geist/font/sans";
 
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
 
 export const metadata: Metadata = {
@@ -14,8 +15,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
-      className={cn("h-full", "antialiased", GeistSans.className
-      )}
+      className={cn("h-full", "antialiased", GeistSans.className)}
       suppressHydrationWarning
     >
       {/* No `dark` class here on purpose. `.dark` re-declares every token for the
@@ -31,6 +31,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         >
           {children}
         </ThemeProvider>
+        {/* Mounted once at the root so any route can raise a confirmation
+            without owning the portal. Settings uses it to confirm a write. */}
+        <Toaster />
       </body>
     </html>
   );

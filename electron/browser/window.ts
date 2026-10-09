@@ -189,9 +189,17 @@ export function close() {
   if (!target) return
   bounds = null
   target.setVisible(false)
-  refs.clear()
-  void target.webContents.loadURL(ALLOWED_ABOUT_URL).catch(() => undefined)
-  emitStatus(null)
+  // Under the mutex for the same reason `open()` is: this navigates, so
+  // evicting the document while a `browser_navigate` is still loading would
+  // abort that load and report it as the site refusing. Fire-and-forget —
+  // callers include `will-quit`, which must not wait on a page teardown.
+  void mutex
+    .run(async () => {
+      refs.clear()
+      await target.webContents.loadURL(ALLOWED_ABOUT_URL)
+      emitStatus(null)
+    })
+    .catch(() => undefined)
 }
 
 /**
@@ -409,26 +417,28 @@ async function settleAfterAction(session: CdpSession, beforeUrl: string): Promis
 /* -------------------------------------------------------------------------- */
 
 /** Navigates and reveals the panel. Backs `browser_navigate`. */
-export async function open(rawUrl: string): Promise<PageInfo> {
-  let url: string
-  try {
-    const parsed = new URL(rawUrl)
-    if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) throw new Error("bad protocol")
-    url = parsed.toString()
-  } catch {
-    throw new Error(`Cannot open "${rawUrl}" — only http and https addresses are allowed`)
-  }
+export function open(rawUrl: string): Promise<PageInfo> {
+  return mutex.run(async () => {
+    let url: string
+    try {
+      const parsed = new URL(rawUrl)
+      if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) throw new Error("bad protocol")
+      url = parsed.toString()
+    } catch {
+      throw new Error(`Cannot open "${rawUrl}" — only http and https addresses are allowed`)
+    }
 
-  const target = ensureView()
-  const session = await activeSession()
-  refs.clear()
-  await target.webContents.loadURL(url)
-  await settle(session)
-  // The model just opened something, so the panel is revealed rather than left
-  // hiding it. `show()` is a no-op while the user has it collapsed and no
-  // rectangle has arrived yet, so it never fights the UI.
-  show()
-  return requirePage()
+    const target = ensureView()
+    const session = await activeSession()
+    refs.clear()
+    await target.webContents.loadURL(url)
+    await settle(session)
+    // The model just opened something, so the panel is revealed rather than left
+    // hiding it. `show()` is a no-op while the user has it collapsed and no
+    // rectangle has arrived yet, so it never fights the UI.
+    show()
+    return requirePage()
+  })
 }
 
 export function pageInfo(): PageInfo {
