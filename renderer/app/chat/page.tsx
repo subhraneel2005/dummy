@@ -577,6 +577,7 @@ export default function ChatWindowPage() {
     clearLocal();
     setActiveId(null);
     setDraft("");
+    setIsReaSession(false);
     setReaLog([]);
     setReaRunning(false);
   }, [clearLocal]);
@@ -597,6 +598,7 @@ export default function ChatWindowPage() {
       clearLocal();
       setActiveId(id);
       setDraft("");
+      setIsReaSession(false);
       setReaLog([]);
       setReaRunning(false);
     },

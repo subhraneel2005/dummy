@@ -1260,6 +1260,81 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 
 ---
 
+## Feature 8 — REA Reverse-Engineering Sessions
+
+> **Status: shipped** (commit `7473ceb`). Adds a **REA Session** entry to the sidebar: a chat seeded with an **App path** field that runs a [`rea-agents`](https://rea.tools/) analysis of a local application bundle and folds the result back into the conversation.
+
+### Goal
+Point a chat session at a local app (e.g. `/Applications/Discord.app`), run REA's `analyze-javascript-application`, watch its progress live in the transcript, and have the model answer over a compact preview of the evidence — without freezing the app and without pasting a multi-megabyte JSON blob into the thread.
+
+### User Flow (v1)
+1. Sidebar → **REA Session** → new session (`crypto.randomUUID()`), the composer gains an **App path** field + **Analyze with REA** button.
+2. Enter `/Applications/Discord.app`, click **Analyze with REA**.
+3. An assistant "thinking" bubble appears immediately (`Starting REA analysis for …`), then streams REA's decoded progress lines.
+4. On completion the full evidence envelope is written to `rea_output/<App>-<timestamp>.json`; a short preview + the file path are sent as the turn, and the model replies normally in the same thread.
+5. Switching to a normal chat or another session hides the REA field and clears the log (`isReaSession` reset).
+
+### How REA actually emits (verified, not assumed)
+- Command: `npx -y rea-agents@latest analyze-javascript-application <path> --json`.
+- **Progress → stderr**, one JSON envelope per line: `{"rea_progress":{"phase","completed","total","message","sequence"}}` (~19–22 lines for Discord.app; parsed to the `message` for display).
+- **Evidence → stdout**, the full envelope (a ~10 MB JSON for Discord.app; node list at `normalized_result.graph.nodes`).
+- Runtime for Discord.app ≈ 28 s. REA requires Node 22.19+/24.11+/26+; `npx -y` fetches it on first use.
+
+### Decisions
+- **Stream progress, buffer payload.** Only stderr is streamed to the renderer; stdout is accumulated whole. Streaming the 10 MB payload line-by-line would flood both IPC and the transcript.
+- **Large output goes to disk, not the chat.** The full envelope is written to `rea_output/` at the **project root** (`path.resolve(app.getAppPath(), "..", "rea_output")`; `app.getAppPath()` is `electron/` in dev). Only `{ file, byteSize, preview }` crosses IPC.
+- **Preview is capped at 3000 chars** — `Parsed N entries.` + the first two nodes when the analysis is an array, else the pretty JSON — so a huge result still yields a bounded user message.
+- **Async `spawn`, never `spawnSync`.** A synchronous run blocks the Electron main process and freezes the entire app for the length of the analysis (the original symptom was "click does nothing").
+- **Progress is also `console.log`'d** as `[rea:log] …` in main so the terminal shows the run even if the UI bridge is misbehaving.
+
+### Architecture Overview
+```
+renderer (chat page)                       electron/main
+--------------------                       -------------
+AppSidebar → onNewReaSession()             ipcMain.handle("rea:analyze", appPath, sessionId)
+  → isReaSession = true                      spawn("npx", ["-y","rea-agents@latest",
+  → rea.onEvent(cb) ◄── rea:event ───────────     "analyze-javascript-application", path, "--json"])
+        { sessionId, type, text }            stderr line ─► formatProgress() ─► emit("log", …)
+  rea.analyze(path, sessionId) ─────────────► stdout buffered whole
+        │                                   close(0) ─► parse normalized_result.graph.nodes
+        │                                              └─► write rea_output/<App>-<ts>.json
+        └◄── { ok, result:{ file, byteSize,    emit("done", …)
+                preview } }                      resolve({ ok, result })
+  send("… preview …", activeId)  ──► normal chat turn (AI SDK)
+```
+
+### IPC Surface (additions)
+- renderer → main (invoke): `rea:analyze(appPath, sessionId)` → `{ ok: true, result: { file, byteSize, preview } } | { ok: false, error }`.
+- main → renderer (events): `rea:event` `{ sessionId, type: "log" | "done" | "error", text }`.
+- Preload: `window.electronAPI.rea.analyze` + `window.electronAPI.rea.onEvent` (top-level sibling of `chat`/`browser`).
+
+### Files
+- `electron/main.ts` — `rea:analyze` handler (async spawn, 5-min SIGKILL timeout, stderr streaming, stdout→disk, preview).
+- `electron/preload.ts` — `rea` bridge + `ReaEvent` type.
+- `renderer/electron.d.ts` — `rea` API + `ReaEvent` interface.
+- `renderer/app/chat/page.tsx` — `isReaSession`/`reaAppPath`/`reaRunning`/`reaLog` state, `startNewReaSession`, `handleReaAnalyze`, the `rea:event` subscription, the log bubble, and the App-path field.
+- `renderer/components/app-sidebar.tsx` — **REA Session** menu item (`SearchIcon`, before Settings), `onNewReaSession` prop.
+
+### Traps found (real, and how they presented)
+1. **`spawnSync` freezes the app.** The first implementation used `spawnSync`; the UI showed a static "Starting…" line forever because main was blocked. Async `spawn` with streamed events is mandatory. *(This was the actual "clicking does nothing" report.)*
+2. **Payload on stdout, progress on stderr.** Naïvely streaming both dumps ~10 MB into the transcript. Split them: stderr → UI, stdout → disk.
+3. **Preload nesting bug.** `rea` was added *inside* the `chat` object, so at runtime it was `window.electronAPI.chat.rea` while the renderer looked for `window.electronAPI.rea`. **Typecheck did not catch it** because `renderer/electron.d.ts` is hand-written and declared `rea` at the top level. The renderer's new guard surfaced it ("REA bridge is unavailable"). Fix: move `rea` to a sibling of `chat`/`browser`.
+4. **`onNewReaSession is not defined`.** The prop was declared in `AppSidebarProps` and used in `onClick` but never destructured from props nor passed by the parent. An undeclared identifier in a closure is not a type error at the use site, so it reached runtime. Fix: destructure it and pass `onNewReaSession={startNewReaSession}`.
+5. **Session filter dropped the events.** An early event subscription filtered by `activeIdRef.current`; with the ref not yet synced it silently discarded every progress line. Removed — the chat window shows one session at a time.
+6. **`isReaSession` never reset.** Opening a normal chat or selecting another session left the App-path field visible; now reset in both paths.
+
+### Validation
+- ✅ `tsc -b` + preload typecheck green; renderer `tsc --noEmit` and eslint on `app/chat/page.tsx` + `components/app-sidebar.tsx` green.
+- ✅ Manual end-to-end: REA Session → `/Applications/Discord.app` → live progress lines stream, `rea_output/<App>-<timestamp>.json` is written, preview + file path land in the chat, model replies.
+- [ ] Add `rea_output/` to a root `.gitignore` and `git rm --cached` the evidence file that commit `7473ceb` accidentally tracked (`rea_output/Discord.app-…json`, ~10 MB).
+
+### Open Questions
+- Summarize `normalized_result.graph.nodes` into a tighter structured preview (module list, dependencies) instead of a raw JSON slice?
+- Let the user re-run against the saved file without re-invoking REA, and/or open the JSON from the chat?
+- Offer a cancel button for a long run (today it is a fixed 5-minute kill)?
+
+---
+
 ## Backlog (future features)
 - Streaming/live transcription with VAD (whisper-command style).
 - Local command execution ("draft a reply").

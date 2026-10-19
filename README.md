@@ -51,6 +51,7 @@ Everything is local-first: your API keys are encrypted with the **OS keychain** 
 | 8 | **`@` tool picker** | Type `@` in the composer for one entry — **`@BrowserAutomation`** — and the model is told to use the browser for that message. You name the *capability*, never the internal steps; the mention resolves to whichever tools the active backend has. |
 | 9 | **Human-in-the-loop CAPTCHA handoff** | When a site hits a "verify you are human" wall, the agent **pauses and hands it to you** instead of fighting it. No automated bypass — resolve it, press Resume, and the run picks up where it stopped. |
 | 10 | **Rate-limit resilience** | Transient `429`s from free-tier providers are retried with backoff instead of killing the run, and a tool failure is never dressed up as an answer: the model retries transient errors, states what it could not do, and finishes the rest of the task. |
+| 11 | **REA reverse-engineering session** | Point a session at a local app bundle (e.g. `/Applications/Discord.app`); [`rea-agents`](https://rea.tools/) inventories and parses it as a streamed subprocess, progress renders live in the chat, the full evidence JSON is saved to `rea_output/`, and only a short preview is handed to the model for analysis. |
 
 ### Browser automation, two lanes
 
@@ -64,6 +65,15 @@ Both lanes run on the same `ToolLoopAgent` as normal chat, so the assistant inte
 | **Watching it** | The panel updates live in the chat | Live cell-by-cell feed in the activity panel; pause / resume / stop |
 | **Good for** | "What's on this page?", quick lookups | "Research these ten companies and verify each site" |
 | **Blocked walls** | n/a | Pauses for you at a CAPTCHA or human-verification wall |
+
+### REA reverse-engineering sessions
+
+The sidebar's **REA Session** opens a chat with an **App path** field above the composer. **Analyze with REA** shells out to [`rea-agents`](https://rea.tools/) (`analyze-javascript-application <path> --json`) and folds the result back into the conversation:
+
+- The subprocess is **spawned, not run synchronously** — otherwise REA's runtime would freeze the whole app while it parses the bundle.
+- REA emits progress to **stderr** as `{"rea_progress":{…}}` lines; those are decoded and streamed live into the transcript as a "thinking" log bubble.
+- The evidence envelope goes to **stdout** and can be tens of megabytes, so it is written to `rea_output/<App>-<timestamp>.json` at the project root instead of being pasted into the chat.
+- Only a short preview plus the saved file path is handed to the model, which then answers normally in the same thread.
 
 ## How it works
 
@@ -184,7 +194,7 @@ The browser backend is set in the same panel under **Browser automation**. It is
 
 | | |
 |---|---|
-| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation · **deep-task agent (`@browser_use/pi`)** · **switchable browser backend** · **`@` tool picker** · **CAPTCHA handoff** · **rate-limit resilience** · local data wipe & image deletion |
+| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation · **deep-task agent (`@browser_use/pi`)** · **switchable browser backend** · **`@` tool picker** · **CAPTCHA handoff** · **rate-limit resilience** · **REA reverse-engineering session** · local data wipe & image deletion |
 | 📋 Backlog | Streaming/VAD dictation · local command execution · chat-scoped dictation · compact tool-trace summaries in chat · headless deep runs |
 
 The **ledger** for every feature — decisions, provider quirks, hard constraints, and traps found — lives in [`docs/feat_plans_todos.md`](docs/feat_plans_todos.md). It is written as the work happens, not after.
