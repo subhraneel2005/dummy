@@ -127,6 +127,16 @@ type ChatEvent =
       dataBase64: string
     }
 
+/**
+ * One line of progress from a running REA analysis, streamed over `rea:event`.
+ * `log` carries a raw stdout/stderr line; `done`/`error` terminate the run.
+ */
+type ReaEvent = {
+  sessionId: string
+  type: "log" | "done" | "error"
+  text: string
+}
+
 /** Where the embedded browser currently is. Read-only; the model drives it via tools. */
 type BrowserStatus = {
   page: { url: string; title: string } | null
@@ -351,10 +361,21 @@ attachmentData: (attachmentId: string) =>
         ipcRenderer.on("chat:initial-text", handler)
         return () => ipcRenderer.removeListener("chat:initial-text", handler)
       },
-onEvent: (callback: (event: ChatEvent) => void) => {
+      onEvent: (callback: (event: ChatEvent) => void) => {
         const handler = (_event: unknown, event: ChatEvent) => callback(event)
         ipcRenderer.on("chat:event", handler)
         return () => ipcRenderer.removeListener("chat:event", handler)
+      },
+    },
+    rea: {
+      analyze: (appPath: string, sessionId: string) =>
+        ipcRenderer.invoke("rea:analyze", appPath, sessionId) as Promise<
+          { ok: true; result: unknown } | { ok: false; error: string }
+        >,
+      onEvent: (callback: (event: ReaEvent) => void) => {
+        const handler = (_event: unknown, payload: ReaEvent) => callback(payload)
+        ipcRenderer.on("rea:event", handler)
+        return () => ipcRenderer.removeListener("rea:event", handler)
       },
     },
     browser: {
@@ -413,6 +434,7 @@ export type {
   DictationStatus,
   ModelInfo,
   ProviderInfo,
+  ReaEvent,
   StagedCapture,
   ToolInfo
 }

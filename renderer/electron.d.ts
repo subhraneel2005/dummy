@@ -123,6 +123,16 @@ type ChatEvent =
       dataBase64: string
     }
 
+/**
+ * One line of progress from a running REA analysis, streamed over `rea:event`.
+ * `log` carries a raw stdout/stderr line; `done`/`error` terminate the run.
+ */
+interface ReaEvent {
+  sessionId: string
+  type: "log" | "done" | "error"
+  text: string
+}
+
 /** Where the embedded browser currently is. */
 interface BrowserStatus {
   page: { url: string; title: string } | null
@@ -309,6 +319,13 @@ declare global {
         ackInitialText: () => Promise<boolean>
         onInitialText: (callback: (seed: ChatSeed) => void) => () => void
         onEvent: (callback: (event: ChatEvent) => void) => () => void
+      }
+      rea: {
+        analyze: (
+          appPath: string,
+          sessionId: string,
+        ) => Promise<{ ok: true; result: unknown } | { ok: false; error: string }>
+        onEvent: (callback: (event: ReaEvent) => void) => () => void
       }
       browser: {
         show: () => Promise<BrowserStatus>

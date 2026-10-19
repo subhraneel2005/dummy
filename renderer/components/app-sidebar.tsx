@@ -9,6 +9,7 @@ import {
   PanelLeftIcon,
   PencilIcon,
   PlugIcon,
+  SearchIcon,
   SettingsIcon,
   SquarePenIcon,
   Trash2Icon,
@@ -57,6 +58,7 @@ interface AppSidebarProps {
   onNewChat: () => void
   onRename: (id: string, title: string) => void
   onDelete: (id: string) => void
+  onNewReaSession: () => void
   provider: string | null
   /** Whether the browser panel is expanded. The panel lives in the chat page. */
   browserOpen: boolean
@@ -71,6 +73,7 @@ export function AppSidebar({
   onNewChat,
   onRename,
   onDelete,
+  onNewReaSession,
   provider,
   browserOpen,
   browserPage,
@@ -166,6 +169,15 @@ export function AppSidebar({
                       className="size-1.5 shrink-0 rounded-full bg-emerald-500"
                     />
                   ) : null}
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    tooltip="REA Session"
+                    onClick={() => onNewReaSession()}
+                  >
+                    <SearchIcon aria-hidden="true" />
+                    <span>REA Session</span>
+                  </SidebarMenuButton>
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton

@@ -42,6 +42,8 @@ import {
 import { AppSidebar, type ChatSession } from "@/components/app-sidebar";
 import { BrowserActivity } from "@/components/browser-activity";
 import { BrowserPanel } from "@/components/browser-panel";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import AIVoice from "@/components/kokonutui/ai-voice";
 import { ProviderIcon, providerLabel } from "@/components/provider-icon";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -181,6 +183,27 @@ export default function ChatWindowPage() {
   const [job, setJob] = useState<{ id: number; text: string } | null>(null);
   const jobIdRef = useRef(0);
   const [draft, setDraft] = useState("");
+  const [isReaSession, setIsReaSession] = useState(false);
+  const [reaAppPath, setReaAppPath] = useState("");
+  const [reaRunning, setReaRunning] = useState(false);
+  const [reaLog, setReaLog] = useState<string[]>([]);
+
+  // Progress from a running REA analysis. Lines are appended to a rolling buffer
+  // so a long run cannot grow the log without bound. The chat window shows one
+  // conversation at a time, so no session filtering is needed here.
+  useEffect(() => {
+    const subscribe = window.electronAPI?.rea?.onEvent;
+    if (!subscribe) {
+      setReaLog(["REA bridge is unavailable (window.electronAPI.rea.onEvent missing)."]);
+      return;
+    }
+    return subscribe((event) => {
+      setReaLog((prev) => {
+        const next = [...prev, event.text];
+        return next.length > 200 ? next.slice(next.length - 200) : next;
+      });
+    });
+  }, []);
   // A rejected pick (too large, too many files). Cleared as soon as the
   // attachment list changes so the warning tracks the thing it describes.
   const [attachmentError, setAttachmentError] = useState("");
@@ -554,6 +577,18 @@ export default function ChatWindowPage() {
     clearLocal();
     setActiveId(null);
     setDraft("");
+    setReaLog([]);
+    setReaRunning(false);
+  }, [clearLocal]);
+
+  const startNewReaSession = useCallback(() => {
+    clearLocal();
+    setActiveId(crypto.randomUUID());
+    setDraft("");
+    setIsReaSession(true);
+    setReaAppPath("");
+    setReaLog([]);
+    setReaRunning(false);
   }, [clearLocal]);
 
   const selectSession = useCallback(
@@ -562,6 +597,8 @@ export default function ChatWindowPage() {
       clearLocal();
       setActiveId(id);
       setDraft("");
+      setReaLog([]);
+      setReaRunning(false);
     },
     [activeId, clearLocal],
   );
@@ -584,11 +621,61 @@ export default function ChatWindowPage() {
     [activeId, refreshSessions, startNewChat],
   );
 
+  const handleReaAnalyze = useCallback(async () => {
+    const appPath = reaAppPath.trim();
+    if (!appPath || !activeId || reaRunning || sending) return;
+    const bridge = window.electronAPI?.rea?.analyze;
+    if (!bridge) {
+      setReaLog([
+        "Starting REA analysis for " + appPath + "…",
+        "REA bridge is unavailable (window.electronAPI.rea.analyze missing).",
+      ]);
+      return;
+    }
+    setReaLog(["Starting REA analysis for " + appPath + "…"]);
+    setReaRunning(true);
+    try {
+      const result = await bridge(appPath, activeId);
+      if (!result) {
+        setReaLog((prev) => [...prev, "REA analysis returned no result."]);
+        return;
+      }
+      if (!result.ok) {
+        setReaLog((prev) => [...prev, "REA analysis failed: " + result.error]);
+        return;
+      }
+      const data = result.result as {
+        file?: string;
+        byteSize?: number;
+        preview?: string;
+      } | null;
+      const preview = data?.preview ?? "";
+      const location = data?.file
+        ? "\n\nFull evidence JSON saved to: " + data.file
+        : "";
+      await send(
+        "REA analysis of " +
+          appPath +
+          " finished." +
+          location +
+          (preview ? "\n\nPreview:\n\n" + preview : ""),
+        activeId,
+      );
+    } catch (err) {
+      setReaLog((prev) => [
+        ...prev,
+        "REA request failed: " + (err instanceof Error ? err.message : String(err)),
+      ]);
+    } finally {
+      setReaRunning(false);
+    }
+  }, [activeId, reaAppPath, reaRunning, send, sending]);
+
   // "Thinking" is the absence of output, so anything the model has produced
   // suppresses it — including a parked approval. Showing "Thinking" directly
   // above a question the user is being asked to answer reads as if the request
   // were ignored, when in fact it is waiting on them.
-  const showThinking = sending && !streamingText && approvals.length === 0;
+  const showThinking = sending && !streamingText && approvals.length === 0 && !reaRunning;
   const isEmpty =
     !messages.length &&
     !streamingText &&
@@ -606,6 +693,7 @@ export default function ChatWindowPage() {
         onNewChat={startNewChat}
         onRename={renameSession}
         onDelete={deleteSession}
+        onNewReaSession={startNewReaSession}
         browserOpen={browserOpen}
         browserPage={browserPage}
         onToggleBrowser={() => setBrowserOpen((value) => !value)}
@@ -648,6 +736,25 @@ export default function ChatWindowPage() {
                 responding={respondingTo !== null}
                 onDeepControl={setDeepPaused}
               />
+
+              {isReaSession && reaLog.length > 0 ? (
+                <Message from="assistant" className="max-w-full">
+                  <MessageContent className={cn("max-w-full", ASSISTANT_BUBBLE)}>
+                    <div className="mb-1 text-xs font-medium text-muted-foreground">
+                      {reaRunning ? (
+                        <span className="motion-safe:animate-pulse">
+                          Analyzing with REA…
+                        </span>
+                      ) : (
+                        <span>REA analysis log</span>
+                      )}
+                    </div>
+                    <pre className="max-h-64 overflow-auto rounded-md bg-muted/50 p-2 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
+                      {reaLog.join("\n")}
+                    </pre>
+                  </MessageContent>
+                </Message>
+              ) : null}
 
               {streamingText ? (
                 <Message from="assistant" className="max-w-full">
@@ -710,6 +817,28 @@ export default function ChatWindowPage() {
               {config.model ? ` · ${config.model}` : ""}
             </span>
           </div>
+          {isReaSession ? (
+            <div className="mb-2 flex items-center gap-2 px-1">
+              <label className="shrink-0 text-xs text-muted-foreground">
+                App path
+              </label>
+              <Input
+                value={reaAppPath}
+                onChange={(e) => setReaAppPath(e.currentTarget.value)}
+                placeholder="/Applications/Discord.app"
+                aria-label="Application path to analyze with REA"
+                className="h-8 flex-1 text-sm"
+              />
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleReaAnalyze}
+                disabled={sending || reaRunning || !reaAppPath.trim()}
+              >
+                Analyze with REA
+              </Button>
+            </div>
+          ) : null}
           {/* `PromptInput` forwards className to its <form>, not to the bordered
               group, so the border, the radius, the row gap and the collapsed
               height all have to be restated against the group itself.
