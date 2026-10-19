@@ -32,6 +32,7 @@ export interface ModelInfo {
  */
 export const MODEL_CATALOG: Record<ProviderId, ModelInfo[]> = {
   openai: [
+    { id: "gpt-4o-mini", label: "GPT-4o Mini (cheap, fast)" },
     { id: "gpt-5.6-luna", label: "GPT-5.6 Luna (fast)" },
     { id: "gpt-5.4-nano", label: "GPT-5.4 Nano (fastest)" },
     { id: "gpt-5.4-mini", label: "GPT-5.4 Mini (fast)" },
