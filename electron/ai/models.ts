@@ -1,4 +1,4 @@
-export const PROVIDERS = ["openai", "anthropic", "google", "xai"] as const
+export const PROVIDERS = ["openai", "anthropic", "google", "xai", "openrouter"] as const
 
 export type ProviderId = (typeof PROVIDERS)[number]
 
@@ -26,6 +26,7 @@ export interface ModelInfo {
  *   Anthropic docs.anthropic.com/en/api/models -> HYPHENATED (`claude-sonnet-4-5`)
  *   Google    ai.google.dev/gemini-api/docs/models
  *   xAI       api.x.ai (OpenAI-compatible)
+ *   OpenRouter openrouter.ai/models (namespaced `vendor/model` ids)
  *
  * Note the inconsistency is real and not a typo: OpenAI dotted, Anthropic
  * hyphenated. Verify against live docs before editing.
@@ -60,6 +61,13 @@ export const MODEL_CATALOG: Record<ProviderId, ModelInfo[]> = {
     { id: "grok-4.6", label: "Grok 4.6" },
     { id: "grok-4.3", label: "Grok 4.3" },
   ],
+  openrouter: [
+    { id: "openai/gpt-4o-mini", label: "OpenAI: GPT-4o Mini (cheap, fast)" },
+    { id: "anthropic/claude-sonnet-4.5", label: "Anthropic: Claude Sonnet 4.5" },
+    { id: "google/gemini-2.5-flash", label: "Google: Gemini 2.5 Flash" },
+    { id: "meta-llama/llama-3.3-70b-instruct", label: "Meta: Llama 3.3 70B Instruct" },
+    { id: "openrouter/auto", label: "OpenRouter Auto (auto-routed)" },
+  ],
 }
 
 export const PROVIDER_INFO: Record<ProviderId, ProviderInfo> = {
@@ -86,6 +94,12 @@ export const PROVIDER_INFO: Record<ProviderId, ProviderInfo> = {
     label: "xAI",
     keyPlaceholder: "xai-...",
     docsUrl: "https://console.x.ai/",
+  },
+  openrouter: {
+    id: "openrouter",
+    label: "OpenRouter",
+    keyPlaceholder: "sk-or-v1-...",
+    docsUrl: "https://openrouter.ai/keys",
   },
 }
 

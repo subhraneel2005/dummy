@@ -27,6 +27,7 @@ import { createAnthropic } from "@ai-sdk/anthropic"
 import { createGoogleGenerativeAI } from "@ai-sdk/google"
 import { createOpenAI } from "@ai-sdk/openai"
 import { createXai } from "@ai-sdk/xai"
+import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
@@ -57,10 +58,10 @@ const CASES = {
  * to pre-empt.
  */
 const EXPECTED = {
-  "pdf file part": { openai: true, anthropic: true, google: true, xai: false },
-  "png file part": { openai: true, anthropic: true, google: true, xai: true },
+  "pdf file part": { openai: true, anthropic: true, google: true, xai: false, openrouter: true },
+  "png file part": { openai: true, anthropic: true, google: true, xai: true, openrouter: true },
   "text document inlined as a text part": {
-    openai: true, anthropic: true, google: true, xai: true,
+    openai: true, anthropic: true, google: true, xai: true, openrouter: true,
   },
 }
 
@@ -107,6 +108,7 @@ const PROVIDERS = {
   anthropic: (fetch) => createAnthropic({ apiKey: "test", fetch }),
   google: (fetch) => createGoogleGenerativeAI({ apiKey: "test", fetch }),
   xai: (fetch) => createXai({ apiKey: "test", fetch }),
+  openrouter: (fetch) => createOpenRouter({ apiKey: "test", fetch, compatibility: "strict" }),
 }
 
 const update = process.argv.includes("--update")
@@ -187,10 +189,11 @@ const MODEL_IDS = {
   anthropic: "claude-sonnet-4-5",
   google: "gemini-2.0-flash",
   xai: "grok-3",
+  openrouter: "openai/gpt-4o-mini",
 }
 
 /** Every provider expects tools=true rather than a tool_choice enum. */
-const EXPECTED_TOOLS = { openai: true, anthropic: true, google: true, xai: true }
+const EXPECTED_TOOLS = { openai: true, anthropic: true, google: true, xai: true, openrouter: true }
 
 /**
  * The tool-call leg of the round trip, in each provider's own response shape.

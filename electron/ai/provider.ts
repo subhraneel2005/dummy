@@ -2,6 +2,7 @@ import { createAnthropic } from "@ai-sdk/anthropic"
 import { createGoogle } from "@ai-sdk/google"
 import { createOpenAI } from "@ai-sdk/openai"
 import { createXai } from "@ai-sdk/xai"
+import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 import type { LanguageModel } from "ai"
 
 import { getProviderKey } from "../db/keys.js"
@@ -32,6 +33,8 @@ function createProviderModel(provider: ProviderId, apiKey: string, modelId: stri
       return createGoogle({ apiKey })(modelId)
     case "xai":
       return createXai({ apiKey })(modelId)
+    case "openrouter":
+      return createOpenRouter({ apiKey, compatibility: "strict", appName: "dummy" }).chat(modelId)
   }
 }
 
@@ -43,7 +46,8 @@ function createProviderModel(provider: ProviderId, apiKey: string, modelId: stri
  * API accepts only a URL or a Files API reference for non-image files, throwing
  * `UnsupportedFunctionalityError` on inline bytes. Neither alternative is wired
  * up here, so the caller refuses a PDF for xAI rather than surfacing that error
- * mid-stream. Images and inlined text work on every provider.
+ * mid-stream. OpenRouter's adapter serializes non-image files as a `file` part
+ * with `file_data`, so it is included. Images and inlined text work everywhere.
  */
 export function supportsInlineDocuments(provider: ProviderId): boolean {
   return provider !== "xai"

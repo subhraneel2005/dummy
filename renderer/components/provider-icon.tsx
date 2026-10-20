@@ -8,6 +8,7 @@ const PROVIDER_ICONS: Record<string, string> = {
   anthropic: "/icons8-claude-96.png",
   google: "/icons8-google-96.png",
   xai: "/icons8-grok-100.png",
+  openrouter: "/openrouter-logo.png",
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -15,6 +16,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   anthropic: "Anthropic",
   google: "Google",
   xai: "xAI",
+  openrouter: "OpenRouter",
 }
 
 export function providerLabel(provider: string | null | undefined): string {

@@ -66,6 +66,8 @@ const DEEP_MODEL_DEFAULTS: Record<ProviderId, string> = {
   anthropic: "claude-sonnet-4-6",
   google: "gemini-2.5-flash",
   xai: "grok-4.3",
+  // pi's OpenRouter ids keep the vendor namespace after the provider prefix.
+  openrouter: "anthropic/claude-sonnet-4.6",
 }
 
 /** The env var pi-ai's transport reads per provider (from its env-api-keys). */
@@ -74,6 +76,7 @@ const PROVIDER_KEY_ENV: Record<ProviderId, string> = {
   anthropic: "ANTHROPIC_API_KEY",
   google: "GEMINI_API_KEY",
   xai: "XAI_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
 }
 
 /** One entry in the live cell feed, matching pi's `javascript`/`finish` cells. */

@@ -20,6 +20,8 @@ const TIMEOUT_MS = 15_000
  *             (requires `x-api-key` + `anthropic-version` headers)
  *   Google    GET https://generativelanguage.googleapis.com/v1beta/models?key=...
  *             -> { models: [{ name: "models/gemini-...", displayName, ... }] }
+ *   OpenRouter GET https://openrouter.ai/api/v1/models        -> { data: [{ id, name, architecture }] }
+ *             (public; the bearer key is sent so a future private catalog works)
  *
  * Falls back to the curated seed catalog when the request fails (offline, bad
  * key, or an endpoint change) so the picker is never empty.
@@ -53,6 +55,9 @@ interface RawModel {
   display_name?: unknown
   supportedGenerationMethods?: unknown
   supported_actions?: unknown
+  architecture?: {
+    output_modalities?: unknown
+  }
 }
 
 async function requestModels(provider: ProviderId, key: string): Promise<RawModel[]> {
@@ -77,6 +82,10 @@ async function requestModels(provider: ProviderId, key: string): Promise<RawMode
         break
       case "google":
         url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${encodeURIComponent(key)}`
+        break
+      case "openrouter":
+        url = "https://openrouter.ai/api/v1/models"
+        headers = { Authorization: `Bearer ${key}` }
         break
     }
 
@@ -119,6 +128,9 @@ const NON_CHAT_PATTERNS = [
   /gemma/i,
   /tuned/i,
   /vision-model/i,
+  // OpenRouter exposes batch-only variants as `<model>:batch`; they cannot
+  // serve an interactive chat turn.
+  /:batch$/i,
 ]
 
 function isChatModel(provider: ProviderId, model: RawModel, id: string): boolean {
@@ -126,6 +138,15 @@ function isChatModel(provider: ProviderId, model: RawModel, id: string): boolean
     const methods = model.supportedGenerationMethods
     if (Array.isArray(methods) && methods.length > 0) {
       return methods.some((m) => typeof m === "string" && m === "generateContent")
+    }
+  }
+  if (provider === "openrouter") {
+    // Chat needs a text-only model. Image/video generators also list "text"
+    // in `output_modalities`, so checking for the presence of text is not
+    // enough — a mixed output would be routed through the chat path.
+    const outputs = model.architecture?.output_modalities
+    if (Array.isArray(outputs) && outputs.length > 0 && !(outputs.length === 1 && outputs[0] === "text")) {
+      return false
     }
   }
   return !NON_CHAT_PATTERNS.some((re) => re.test(id))
@@ -154,6 +175,9 @@ function normalize(provider: ProviderId, raw: RawModel[]): ModelInfo[] {
     const display =
       (typeof model.displayName === "string" && model.displayName) ||
       (typeof model.display_name === "string" && model.display_name) ||
+      // OpenRouter's `name` is the human label ("OpenAI: GPT-4o Mini"); for
+      // Google the same field is the id, which is why it is provider-scoped.
+      (provider === "openrouter" && typeof model.name === "string" && model.name) ||
       null
     out.push({ id, label: display ? `${display} (${id})` : id })
   }

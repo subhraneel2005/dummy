@@ -40,7 +40,7 @@ Everything is local-first: your API keys are encrypted with the **OS keychain** 
 | # | Feature | What it does |
 |---|---|---|
 | 1 | **Push-to-talk dictation** | Hold Alt+D → speak → local whisper.cpp (`base.en`) transcribes → text lands on your clipboard. Runs entirely offline. |
-| 2 | **BYOK AI providers** | Bring your own key for **OpenAI, Anthropic, Google, or xAI**. Keys are encrypted at rest; the model catalog is fetched **live** from each provider, not hardcoded. |
+| 2 | **BYOK AI providers** | Bring your own key for **OpenAI, Anthropic, Google, xAI, or OpenRouter**. Keys are encrypted at rest; the model catalog is fetched **live** from each provider, not hardcoded. |
 | 2.5 | **Jargon polish** | Transcribed text is passed through your selected model to fix mangled technical terms (library names, flags, commands) before it is copied. Degrades gracefully to the raw transcript. |
 | 3 | **Persistent chat** | Streams live replies over IPC; history survives restarts in SQLite. Reset, rename, and multiple sessions supported. |
 | 4 | **Circle-capture screenshots** | While holding Alt+D, drag a rectangle around anything on screen → it is attached to the chat as an image (up to 5 per hold). One-shot context: sent once, never silently re-sent. |
@@ -186,6 +186,7 @@ Providers are configured in-app under **AI Settings** (sidebar):
 | Anthropic | ✅ | ✅ |
 | Google | ✅ | ✅ |
 | xAI | ✅ | ❌ (refused with guidance) |
+| OpenRouter | ✅ | ✅ |
 
 Keys never leave the main process: `safeStorage`-encrypted in SQLite, decrypted only at call time, never over IPC.
 
@@ -217,7 +218,7 @@ The **ledger** for every feature — decisions, provider quirks, hard constraint
 |---|---|
 | Shell | Electron 44.3.0 (Node 24.20 embedded, ESM, plain `tsc`) |
 | UI | Next.js 16 · React 19 · shadcn/ui · react-markdown |
-| AI | Vercel AI SDK 7 (`ToolLoopAgent`, `streamText`) + `@ai-sdk/{openai,anthropic,google,xai}` |
+| AI | Vercel AI SDK 7 (`ToolLoopAgent`, `streamText`) + `@ai-sdk/{openai,anthropic,google,xai}` + `@openrouter/ai-sdk-provider` |
 | Deep-task agent | `@browser_use/pi` 0.1.0 (`@earendil-works/pi-ai` provider layer) |
 | Terminal | `node-pty` 1.1 (N-API PTY in main) + `@xterm/xterm` 6 (renderer) |
 | Diagrams | `mermaid` 12 via `@streamdown/mermaid` |

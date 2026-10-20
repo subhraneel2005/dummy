@@ -150,6 +150,7 @@ The user configures which AI provider + model the app talks to. The provider key
 | `@ai-sdk/anthropic` | 4.0.63 | Anthropic provider |
 | `@ai-sdk/google` | 4.0.80 | Google provider |
 | `@ai-sdk/xai` | 5.0.8 | xAI provider |
+| `@openrouter/ai-sdk-provider` | 3.1.0 | OpenRouter gateway (one key, many vendors) |
 | `drizzle-orm` | 1.0.0-rc.4 | ORM |
 | `drizzle-kit` | 1.0.0-rc.4 | Migration generation (dev) |
 | `@libsql/client` | 0.18.0 | SQLite driver |
@@ -761,7 +762,7 @@ Therefore:
 - **Text is always a `TextPart`** — the only encoding every provider accepts, so `.md` attaches on any provider.
 - **Word/OpenDocument are refused by name** (`application/msword`, `docx`, `odt`, …) with an actionable error ("Export the document to PDF, or paste the text into the message"). Sending the bytes anyway would surface the provider's own `UnsupportedFunctionalityError` verbatim; Anthropic only reaches Word through its Files API, which the AI SDK's prompt conversion does not use — so the list cannot just be widened.
 - **PDF is refused pre-flight for xAI** — `supportsInlineDocuments(provider)` in `ai/provider.ts:48` gates `sendChatMessage` before the transaction writes anything, so the user gets `"xAI cannot read PDF attachments. Paste the text, or attach an image of the page."` instead of a mid-stream provider error.
-- **`scripts/provider-compat.mjs` asserts this matrix** against the installed adapters (`pdf file part: { openai: true, anthropic: true, google: true, xai: false }`), so a provider upgrade that changes its file-part support fails the test suite before it breaks the app.
+- **`scripts/provider-compat.mjs` asserts this matrix** against the installed adapters (`pdf file part: { openai: true, anthropic: true, google: true, xai: false, openrouter: true }`), so a provider upgrade that changes its file-part support fails the test suite before it breaks the app.
 
 ### Hardening (the file never reaches the model until it has been checked)
 - **Content sniffing** at `decodeAttachment` (`attachments.ts:355`): claims must be *readable*, not just claimed — images must decode (`nativeImage`), PDFs must start with the `%PDF-` magic, and text must have no NUL in the first 2 KiB (a binary masquerading as `.txt` would otherwise put mojibake in the prompt).
@@ -913,7 +914,7 @@ The embedded page is treated as hostile-by-default:
 - The sidebar entry already exists, disabled, at `renderer/components/app-sidebar.tsx:141-143`.
 
 ### Risks
-1. **Tool-calling support varies by provider/model** — *resolved by Phase 0*: all four providers complete a tool-call round trip.
+1. **Tool-calling support varies by provider/model** — *resolved by Phase 0*: all five providers complete a tool-call round trip (OpenRouter added later).
 2. **One global browser session** means two chat sessions racing would invalidate each other's element `ref`s — *resolved*: a single `Mutex` wraps every page operation.
 3. **Canvas-heavy sites** (Gmail, Figma, most SPAs with virtualized DOM) expose a poor AX tree. Worth setting expectations before the user tries it there.
 4. **`zod` was only installed as a transitive peer of `ai`** — *resolved*: declared directly in `electron/package.json`.
@@ -944,8 +945,8 @@ Realistically: usable, but expect macOS to swap during heavy pages. Do not let t
 
 ### Phase 0 — De-risk provider tool-calling (do this first)
 - [x] Extended `electron/scripts/provider-compat.mjs` (`npm run test:providers`) with a **tool-call round trip** per provider — asserts three legs independently: the tool definition was serialized into the request, the parsed tool call actually executed, and the tool result went back on a follow-up request
-- [x] Verified the guard is not vacuous: flipping an expectation fails loudly with exit code 1, and removing the execute hook makes all four report `ToolNotExecuted`
-- [x] Recorded the verdict: **all four providers (OpenAI, Anthropic, Google, xAI) complete the round trip.** No provider blocks Feature 5, so no provider needs blocking, warning, or special-casing in settings
+- [x] Verified the guard is not vacuous: flipping an expectation fails loudly with exit code 1, and removing the execute hook makes every provider report `ToolNotExecuted`
+- [x] Recorded the verdict: **all five providers (OpenAI, Anthropic, Google, xAI, OpenRouter) complete the round trip.** No provider blocks Feature 5, so no provider needs blocking, warning, or special-casing in settings
 - [x] Used the SDK's bundled `jsonSchema` in the guard deliberately — it probes *provider capability*, which is independent of schema syntax; the browser tools themselves use zod
 
 ### Phase A — Page + CDP core
@@ -1045,7 +1046,7 @@ For long autonomous web tasks ("find the top 5 X and save a list to a file"), ad
 ### Locked decisions (confirmed with user)
 1. **Approvals — upfront only + live feed.** The existing `toolApproval` expression already gates every non-read tool, so `browser_deep_task` gets one approval card before anything starts (it can browse, run JS, and save files — the card is the capability grant). While running, every JS cell streams live into the activity timeline; the existing stop button cancels. `researchTools` (shell) stays **off**. Per-cell gating was rejected: their primitive is an opaque REPL cell (arbitrary JS with fs + network), `beforeToolCall` can only block *whole cells*, and read-vs-write cannot be classified inside arbitrary code — so per-cell means "ask about everything" or a fragile LLM classifier.
 2. **Headed external Chrome.** `Browser.chromium({ headless: false, profileDir })` spawns the installed Chrome with an isolated persistent profile (`userData/deep-chrome`), so logins survive and the user can watch/take over. It cannot be embedded in the panel (constraint below). Headless-with-screenshots is deferred.
-3. **Reuse existing provider keys.** Read the chat's provider key from `db/keys.ts` (`safeStorage`), set the matching env var (their transports read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / …), and pick a vision-capable entry from `builtinModels()` for that provider. No OpenRouter account, no second key to enter, no `streamFn` bridge. A settings override can come later if the auto-pick is ever wrong.
+3. **Reuse existing provider keys.** Read the chat's provider key from `db/keys.ts` (`safeStorage`), set the matching env var (their transports read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / …), and pick a vision-capable entry from `builtinModels()` for that provider. No second account or key to enter, no `streamFn` bridge. A settings override can come later if the auto-pick is ever wrong.
 
 ### The hard constraint: the embedded view can never be their target
 Their client connects to a **browser-level CDP WebSocket**: `Target.*` with flatten sessions (`sessionId` routing), tab create/close, plus `Fetch` interception installed by their policy layer. Electron gives us only `webContents.debugger` — page-level, no WS endpoint, no Target domain, no sessions. The four options, evaluated:
@@ -1131,7 +1132,8 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 - [x] `npm i @browser_use/pi` in `electron/` (pin exact version); `tsc -b` accepts its types — pinned `0.1.0`; `npm run build` is green
 - [x] Dump `builtinModels()` at runtime: entries + env-var names + vision flags for openai/anthropic/google/xai — **all 78 entries across the four providers are vision-capable** (`input` includes `"image"`); record the chosen default per provider **here**, not from memory:
   - openai → `gpt-5.4` · anthropic → `claude-sonnet-4-6` · google → `gemini-2.5-flash` · xai → `grok-4.3`
-  - env vars pi-ai reads: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, **`GEMINI_API_KEY`** (NOT `GOOGLE_API_KEY`), `XAI_API_KEY`; model id form `provider/modelId`
+  - OpenRouter (added later) → `anthropic/claude-sonnet-4.6`; its pi catalog has 366 entries (237 vision-capable), and pi keeps the vendor namespace in the id (`openrouter/anthropic/claude-sonnet-4.6`)
+  - env vars pi-ai reads: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, **`GEMINI_API_KEY`** (NOT `GOOGLE_API_KEY`), `XAI_API_KEY`, `OPENROUTER_API_KEY`; model id form `provider/modelId`
 - [x] One trivial real-key `BrowserUse.run()` under Electron — proves the worker fork, `ELECTRON_RUN_AS_NODE` path, telemetry off, Chrome launch (headed). The spike now loads `electron/.env` and picks the provider from whichever key is present (Anthropic, else Google), bridging a Google key stored as `GOOGLE_GEMINI_API_KEY` to the `GEMINI_API_KEY` pi-ai reads:
   ```
   ANTHROPIC_API_KEY=... electron scripts/pi-spike.mjs --keyed

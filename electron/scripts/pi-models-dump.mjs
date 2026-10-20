@@ -2,7 +2,7 @@ import { builtinModels } from "@browser_use/pi"
 
 const models = builtinModels()
 
-for (const provider of ["openai", "anthropic", "google", "xai"]) {
+for (const provider of ["openai", "anthropic", "google", "xai", "openrouter"]) {
   const list = models.getModels(provider)
   console.log(`\n== ${provider} (${list.length} models) ==`)
   for (const m of list) {

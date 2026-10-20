@@ -9,6 +9,7 @@ import {
   readStagedCaptures,
   stageCapture,
 } from "./ai/attachments.js"
+import { appIconPath, applyAppIcon } from "./app-icon.js"
 import {
   close as closeBrowser,
   hide as hideBrowser,
@@ -341,9 +342,11 @@ async function captureAndStage(hold: CaptureHold, rect: CaptureRect) {
 }
 
 function createWindow() {
+  const icon = appIconPath()
   mainWindow = new BrowserWindow ({
     width: ISLAND_WIDTH + PAD * 2,
     height: ISLAND_HEIGHT + PAD * 2,
+    ...(icon ? { icon } : {}),
 
     frame: false,
     transparent: true,
@@ -392,12 +395,16 @@ function chatBackgroundColor() {
 
 function createChatWindow() {
   const size = chatWindowSize()
+  const icon = appIconPath()
 
   chatWindow = new BrowserWindow({
     width: size.width,
     height: size.height,
     minWidth: CHAT_MIN_WIDTH,
     minHeight: CHAT_MIN_HEIGHT,
+    // Ignored on macOS (the dock icon above is what shows there); used by
+    // Linux/Windows window lists and taskbars.
+    ...(icon ? { icon } : {}),
 
     // Standard native title bar on every platform, including macOS. No
     // `titleBarStyle`/`trafficLightPosition` overrides, so the system chrome is
@@ -1044,6 +1051,7 @@ function registerGlobalShortcut() {
 }
 
 app.whenReady().then(async () => {
+  applyAppIcon()
   initDb()
   await migrateDb()
   // Screenshots staged by a hold that never finished (crash, force quit) are
