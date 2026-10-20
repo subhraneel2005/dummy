@@ -1462,7 +1462,7 @@ renderer (composer)                            electron/main
 
 ### Dependencies (deliberate choices)
 - `@xterm/xterm` + `@xterm/addon-fit` in **renderer**. The old `xterm` package is deprecated; use the scoped packages. Link detection is out of scope (no generic `openExternal` bridge would be safe to add just for that).
-- `node-pty@1.1.0` in **electron** only. It is N-API (`node-addon-api`) and ships a `darwin-arm64` prebuild, so it should load in Electron without `electron-rebuild`. A smoke test proves it before any UI work is trusted.
+- `node-pty@1.1.0` in **electron** only. It is N-API (`node-addon-api`) and ships `darwin-arm64` / `darwin-x64` / Windows prebuilds, so it loads in Electron without `electron-rebuild` on macOS. A smoke test proves it before any UI work is trusted. **Linux has no prebuild**: the package must compile with `node-gyp`, so a policy that blocks install scripts needs an explicit allow (or a manual `npm rebuild node-pty`).
 - `node-pty` must never be imported by Next.js or the renderer bundle: it is a native module and only exists in the main process.
 
 ### Architecture Overview
@@ -1484,7 +1484,7 @@ xterm Terminal + FitAddon                       Map<id, { pty, shell, cwd }>
 - Env: `{ ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }`. The PTY is the user's own shell under their account; the app's provider keys are not printed or passed on argv.
 
 ### Layout / UX
-- Sidebar gains **Terminal** (`SquareTerminal` icon) under **Browser automation**, same active/toggle pattern as the browser item. A small dot marks a live session.
+- Sidebar gains **Terminal** (`SquareTerminal` icon) under **Browser automation**, same active/toggle pattern as the browser item. The panel header owns the live/exited/error indicator.
 - The panel docks in the same slot as `BrowserPanel` (between transcript and composer, `CHAT_COLUMN` width). **One dock at a time:** opening the terminal collapses the browser and vice versa, because two panels plus the composer do not fit on a short window. Hiding the terminal keeps its PTY alive, so a build survives while the user looks at the browser.
 - Header: status dot, "Terminal", `<cwd> · <shell>`, **Restart** (`RotateCcw`), **Hide** (`X`). Hiding keeps the PTY alive; restart disposes and spawns a fresh one.
 - Body: xterm fills a `36vh` box (`min-h-[200px] max-h-[480px]`), dark palette, monospace, 5k scrollback, blinking cursor. Clicking the panel focuses it; opening it focuses and fits.
@@ -1521,7 +1521,7 @@ Preload: `electronAPI.terminal.{create,write,resize,dispose,onData,onExit}`. Typ
 - `README.md` — feature row + repo layout.
 
 ### Traps to avoid
-1. **Native ABI mismatch.** node-pty's `.node` must be built/loaded for Electron, not the Next.js Node runtime. Keep it in `electron/`, verify with the Electron smoke test, and never import it in renderer code. This repo's npm policy also skips install scripts, and the tarball's `spawn-helper` has no executable bit; the manager `chmod +x`es it before the first spawn, otherwise `pty.spawn` fails with `posix_spawnp failed`.
+1. **Native ABI mismatch.** node-pty's `.node` must be built/loaded for Electron, not the Next.js Node runtime. Keep it in `electron/`, verify with the Electron smoke test, and never import it in renderer code. This repo's npm policy also skips install scripts, and the tarball's `spawn-helper` has no executable bit; the manager `chmod +x`es it before the first spawn, otherwise `pty.spawn` fails with `posix_spawnp failed`. `node-pty` is loaded lazily on first open, so a broken native build shows an error in the panel instead of preventing the app from starting.
 2. **No server-side xterm.** The component is `"use client"`, creates `Terminal` only inside an effect, and disposes it on unmount; xterm touches `document` and will break SSR.
 3. **Fit before layout.** A hidden panel has zero size, so `fit()` must run only when visible, after a frame, and again from a `ResizeObserver`; guard against 0×0.
 4. **Resize storms.** Coalesce `fit()`/`resize` into one `requestAnimationFrame` and send `terminal:resize` only when `cols`/`rows` actually changed.

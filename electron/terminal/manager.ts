@@ -14,8 +14,30 @@ import fs from "node:fs"
 import { createRequire } from "node:module"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
-import * as pty from "node-pty"
 import { app, type WebContents } from "electron"
+
+/** Type-only: the native module itself is loaded lazily on first use. */
+type PtyModule = typeof import("node-pty")
+type IPty = import("node-pty").IPty
+
+let ptyModule: PtyModule | null = null
+
+/**
+ * Load node-pty only when the user opens the terminal. A broken native build
+ * must not take down chat, browser automation, and dictation at startup.
+ */
+function loadPty(): PtyModule {
+  if (ptyModule) return ptyModule
+  try {
+    ptyModule = createRequire(import.meta.url)("node-pty") as PtyModule
+    return ptyModule
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `The terminal module (node-pty) could not be loaded for this Electron build: ${detail}`,
+    )
+  }
+}
 
 export interface TerminalInfo {
   id: string
@@ -35,13 +57,15 @@ export interface TerminalExitPayload {
 }
 
 interface Session {
-  pty: pty.IPty
+  pty: IPty
   webContents: WebContents
 }
 
 const sessions = new Map<string, Session>()
 
 const MAX_WRITE_BYTES = 64 * 1024
+/** The UI opens one shell; this is a backstop against a runaway renderer. */
+const MAX_SESSIONS_PER_WINDOW = 4
 const MIN_COLS = 2
 const MAX_COLS = 500
 const MIN_ROWS = 1
@@ -127,12 +151,22 @@ export function createTerminal(
 ): TerminalInfo {
   ensureSpawnHelper()
 
+  let existing = 0
+  for (const session of sessions.values()) {
+    if (session.webContents === webContents) existing += 1
+  }
+  if (existing >= MAX_SESSIONS_PER_WINDOW) {
+    throw new Error("Too many terminal sessions. Close one before opening another.")
+  }
+
   const [safeCols, safeRows] = clampSize(cols, rows)
   const shell = resolveShell()
   const cwd = resolveCwd()
   const id = randomUUID()
 
-  let child: pty.IPty
+  const pty = loadPty()
+
+  let child: IPty
   try {
     child = pty.spawn(shell, ["-l"], {
       name: "xterm-256color",
@@ -167,16 +201,29 @@ export function createTerminal(
   return { id, shell, cwd }
 }
 
-export function writeTerminal(id: string, data: unknown): void {
+export function writeTerminal(
+  id: string,
+  data: unknown,
+  sender?: WebContents,
+): void {
   const session = sessions.get(id)
   if (!session) throw new Error("That terminal is no longer running.")
+  if (sender && session.webContents !== sender) {
+    throw new Error("That terminal belongs to another window.")
+  }
   if (typeof data !== "string") throw new Error("Terminal input must be text.")
   session.pty.write(data.slice(0, MAX_WRITE_BYTES))
 }
 
-export function resizeTerminal(id: string, cols: unknown, rows: unknown): void {
+export function resizeTerminal(
+  id: string,
+  cols: unknown,
+  rows: unknown,
+  sender?: WebContents,
+): void {
   const session = sessions.get(id)
   if (!session) return
+  if (sender && session.webContents !== sender) return
   const [safeCols, safeRows] = clampSize(cols, rows)
   if (safeCols === session.pty.cols && safeRows === session.pty.rows) return
   try {
@@ -186,9 +233,10 @@ export function resizeTerminal(id: string, cols: unknown, rows: unknown): void {
   }
 }
 
-export function disposeTerminal(id: string): void {
+export function disposeTerminal(id: string, sender?: WebContents): void {
   const session = sessions.get(id)
   if (!session) return
+  if (sender && session.webContents !== sender) return
   sessions.delete(id)
   try {
     session.pty.kill()

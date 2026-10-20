@@ -430,10 +430,10 @@ function createChatWindow() {
 
   chatWindow.on("closed", () => {
     // Shells belong to this window, not to the app: kill them before the
-    // reference goes away or a headless zsh outlives the UI.
-    if (chatWindow && !chatWindow.isDestroyed()) {
-      disposeTerminalsFor(chatWindow.webContents)
-    }
+    // reference goes away or a headless zsh outlives the UI. The window is
+    // already destroyed here, so `disposeTerminalsFor(webContents)` would not
+    // match anymore — the chat window is the only terminal host.
+    disposeAllTerminals()
     // The embedded browser lives in this window's content view, so it has to be
     // detached before the window goes away. Its logins survive in the partition.
     setHostWindow(null)
@@ -690,6 +690,12 @@ function registerIpcHandlers() {
     typeof value === "string" && value.length > 0 && value.length <= 128
 
   ipcMain.handle("terminal:create", (event, payload: unknown) => {
+    if (windowFor(event) !== chatWindow) {
+      return {
+        ok: false as const,
+        error: "The terminal is only available in the chat window.",
+      }
+    }
     const size = (payload ?? {}) as { cols?: unknown; rows?: unknown }
     try {
       return {
@@ -703,11 +709,11 @@ function registerIpcHandlers() {
       }
     }
   })
-  ipcMain.handle("terminal:write", (_event, payload: unknown) => {
+  ipcMain.handle("terminal:write", (event, payload: unknown) => {
     const { id, data } = (payload ?? {}) as { id?: unknown; data?: unknown }
     if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
     try {
-      writeTerminal(id, data)
+      writeTerminal(id, data, event.sender)
       return { ok: true as const }
     } catch (error) {
       return {
@@ -716,19 +722,19 @@ function registerIpcHandlers() {
       }
     }
   })
-  ipcMain.handle("terminal:resize", (_event, payload: unknown) => {
+  ipcMain.handle("terminal:resize", (event, payload: unknown) => {
     const { id, cols, rows } = (payload ?? {}) as {
       id?: unknown
       cols?: unknown
       rows?: unknown
     }
     if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
-    resizeTerminal(id, cols, rows)
+    resizeTerminal(id, cols, rows, event.sender)
     return { ok: true as const }
   })
-  ipcMain.handle("terminal:dispose", (_event, id: unknown) => {
+  ipcMain.handle("terminal:dispose", (event, id: unknown) => {
     if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
-    disposeTerminal(id)
+    disposeTerminal(id, event.sender)
     return { ok: true as const }
   })
 
