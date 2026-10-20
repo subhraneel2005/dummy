@@ -1,0 +1,3 @@
+# REA evidence and acquired targets are runtime artifacts, not source.
+rea_output/
+rea_downloads/

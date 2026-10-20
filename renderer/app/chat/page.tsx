@@ -7,6 +7,8 @@ import {
   FileTextIcon,
   MicIcon,
   PlusIcon,
+  SparklesIcon,
+  XIcon,
 } from "lucide-react";
 
 import {
@@ -42,8 +44,7 @@ import {
 import { AppSidebar, type ChatSession } from "@/components/app-sidebar";
 import { BrowserActivity } from "@/components/browser-activity";
 import { BrowserPanel } from "@/components/browser-panel";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { TerminalPanel } from "@/components/terminal-panel";
 import AIVoice from "@/components/kokonutui/ai-voice";
 import { ProviderIcon, providerLabel } from "@/components/provider-icon";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -73,6 +74,9 @@ type StagedCapture = {
 /** One row of the `@` picker. Mirrors main's `ToolSummary`. */
 type ToolInfo = { name: string; description: string };
 
+/** One row of the `/` picker. Mirrors main's `SkillSummary`. */
+type SkillInfo = { id: string; name: string; description: string };
+
 /**
  * Where the caret sits inside an `@` token, or null when it does not.
  *
@@ -88,6 +92,28 @@ function mentionContext(
   if (!match) return null;
   const query = match[1] ?? "";
   return { start: caret - query.length - 1, query };
+}
+
+/**
+ * Where the caret sits inside a `/` skill token, or null when it does not.
+ *
+ * A skill is only valid at the **start or end** of the input: the token either
+ * opens the message, or nothing but whitespace follows the caret. A slash in
+ * the middle of prose is just a slash, never a command.
+ */
+function slashContext(
+  value: string,
+  caret: number,
+): { start: number; query: string } | null {
+  const before = value.slice(0, caret);
+  const match = /(?:^|\s)\/([a-zA-Z0-9_-]*)$/.exec(before);
+  if (!match) return null;
+  const query = match[1] ?? "";
+  const start = caret - query.length - 1;
+  const atStart = start === 0;
+  const atEnd = value.slice(caret).trim().length === 0;
+  if (!atStart && !atEnd) return null;
+  return { start, query };
 }
 
 /**
@@ -183,20 +209,14 @@ export default function ChatWindowPage() {
   const [job, setJob] = useState<{ id: number; text: string } | null>(null);
   const jobIdRef = useRef(0);
   const [draft, setDraft] = useState("");
-  const [isReaSession, setIsReaSession] = useState(false);
-  const [reaAppPath, setReaAppPath] = useState("");
-  const [reaRunning, setReaRunning] = useState(false);
   const [reaLog, setReaLog] = useState<string[]>([]);
 
-  // Progress from a running REA analysis. Lines are appended to a rolling buffer
+  // Progress from a running REA skill. Lines are appended to a rolling buffer
   // so a long run cannot grow the log without bound. The chat window shows one
   // conversation at a time, so no session filtering is needed here.
   useEffect(() => {
     const subscribe = window.electronAPI?.rea?.onEvent;
-    if (!subscribe) {
-      setReaLog(["REA bridge is unavailable (window.electronAPI.rea.onEvent missing)."]);
-      return;
-    }
+    if (!subscribe) return;
     return subscribe((event) => {
       setReaLog((prev) => {
         const next = [...prev, event.text];
@@ -216,6 +236,30 @@ export default function ChatWindowPage() {
     provider: null,
     model: null,
   });
+
+  // `/`-skill picker. Skills are files discovered by main; the selected one
+  // rides on the next send only, as a chip in the composer.
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [activeSkill, setActiveSkill] = useState<SkillInfo | null>(null);
+  const [slash, setSlash] = useState<{
+    start: number;
+    query: string;
+  } | null>(null);
+  const [slashIndex, setSlashIndex] = useState(0);
+
+  const slashMatches = useMemo(() => {
+    if (!slash) return [];
+    const query = slash.query.toLowerCase();
+    if (!query) return skills;
+    return skills.filter(
+      (skill) =>
+        skill.id.toLowerCase().includes(query) ||
+        skill.name.toLowerCase().includes(query) ||
+        skill.description.toLowerCase().includes(query),
+    );
+  }, [slash, skills]);
+
+  const slashOpen = slash !== null && slashMatches.length > 0;
 
   // `@`-mention picker. The catalog is whatever the current backend exposes, so
   // the picker can never offer a tool the agent was not given.
@@ -240,10 +284,41 @@ export default function ChatWindowPage() {
   const mentionOpen = mention !== null && matches.length > 0;
 
   // Re-reads the caret after every edit and after a click into the text, since
-  // both decide whether the caret still sits inside an `@` token.
-  const syncMention = useCallback((el: HTMLTextAreaElement) => {
-    setMention(mentionContext(el.value, el.selectionStart ?? el.value.length));
+  // both decide whether the caret still sits inside an `@` or `/` token. `/`
+  // wins when both could match, because a slash token is the more specific
+  // intent and its picker is the one the user just opened.
+  const syncPickers = useCallback((el: HTMLTextAreaElement) => {
+    const caret = el.selectionStart ?? el.value.length;
+    const slashToken = slashContext(el.value, caret);
+    if (slashToken) {
+      setSlash(slashToken);
+      setMention(null);
+      return;
+    }
+    setSlash(null);
+    setMention(mentionContext(el.value, caret));
   }, []);
+
+  // Selecting a skill removes the typed `/token` and turns it into composer
+  // state instead, so the text that is sent and stored is the prompt alone.
+  const insertSkill = useCallback(
+    (skill: SkillInfo) => {
+      const el = inputRef.current;
+      if (!slash) return;
+      const caret = slash.start + slash.query.length + 1;
+      const before = draft.slice(0, slash.start).replace(/\s+$/, "");
+      const after = draft.slice(caret).replace(/^\s+/, "");
+      const next = [before, after].filter(Boolean).join(" ");
+      setDraft(next);
+      setSlash(null);
+      setActiveSkill(skill);
+      requestAnimationFrame(() => {
+        el?.focus();
+        el?.setSelectionRange(next.length, next.length);
+      });
+    },
+    [draft, slash],
+  );
 
   // The caret has to be put back after React re-renders the controlled value;
   // without it the text lands but the cursor jumps to the end.
@@ -268,6 +343,30 @@ export default function ChatWindowPage() {
 
   const onComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (slash) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setSlash(null);
+          return;
+        }
+        if (slashOpen) {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            const step = event.key === "ArrowDown" ? 1 : -1;
+            setSlashIndex(
+              (index) => (index + step + slashMatches.length) % slashMatches.length,
+            );
+            return;
+          }
+          if (event.key === "Enter" || event.key === "Tab") {
+            const skill = slashMatches[slashIndex];
+            if (!skill) return;
+            event.preventDefault();
+            insertSkill(skill);
+            return;
+          }
+        }
+      }
       if (!mention) return;
       if (event.key === "Escape") {
         // Kept open-but-dismissed is not a state this picker has: Escape drops
@@ -292,7 +391,18 @@ export default function ChatWindowPage() {
         insertMention(tool.name);
       }
     },
-    [insertMention, matches, mention, mentionIndex, mentionOpen],
+    [
+      insertMention,
+      insertSkill,
+      matches,
+      mention,
+      mentionIndex,
+      mentionOpen,
+      slash,
+      slashIndex,
+      slashMatches,
+      slashOpen,
+    ],
   );
 
   // Same STT + polish pipeline the dictation island uses (whisper.cpp, then the
@@ -403,6 +513,19 @@ export default function ChatWindowPage() {
     };
   }, []);
 
+  // Skills are files under `skills/`. A missing directory yields an empty
+  // list, which simply means the `/` picker has nothing to show.
+  useEffect(() => {
+    let cancelled = false;
+    void window.electronAPI?.skills?.list().then((result) => {
+      if (cancelled) return;
+      setSkills(result?.ok ? result.skills : []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refreshSessions = useCallback(async () => {
     const result = await window.electronAPI?.chat.listSessions();
     if (result?.ok) setSessions(result.sessions);
@@ -468,6 +591,24 @@ export default function ChatWindowPage() {
     url: string;
     title: string;
   } | null>(null);
+  /**
+   * The terminal docks like the browser panel, but it is deliberately not
+   * tied to a chat turn: the shell belongs to the window and survives
+   * collapsing the panel.
+   */
+  const [terminalOpen, setTerminalOpen] = useState(false);
+
+  // One dock at a time: browser + terminal + composer do not fit on a short
+  // window, and stacking them would push the composer off screen. Hiding the
+  // terminal does not kill its PTY, so a build keeps running behind the browser.
+  const toggleBrowserPanel = () => {
+    setBrowserOpen((value) => !value);
+    setTerminalOpen(false);
+  };
+  const toggleTerminalPanel = () => {
+    setTerminalOpen((value) => !value);
+    setBrowserOpen(false);
+  };
   useEffect(() => {
     const api = window.electronAPI?.browser;
     if (!api) return;
@@ -520,12 +661,17 @@ export default function ChatWindowPage() {
       if ((!trimmed && uploads.length === 0) || sending) return;
       const target = activeId ?? crypto.randomUUID();
       if (!activeId) setActiveId(target);
+      // A skill applies to this send only. The chip is cleared here rather than
+      // after the reply so the next message is a normal chat unless re-picked.
+      const skillId = activeSkill?.id;
+      setActiveSkill(null);
+      setReaLog([]);
       // `send` appends the prompt to the transcript, so the box can be emptied
       // immediately instead of holding a stale copy that Enter would resend.
       setDraft("");
-      await send(trimmed, target, uploads);
+      await send(trimmed, target, uploads, skillId);
     },
-    [activeId, send, sending],
+    [activeId, activeSkill, send, sending],
   );
 
   // Consume the queued transcript.
@@ -577,19 +723,9 @@ export default function ChatWindowPage() {
     clearLocal();
     setActiveId(null);
     setDraft("");
-    setIsReaSession(false);
+    setActiveSkill(null);
+    setSlash(null);
     setReaLog([]);
-    setReaRunning(false);
-  }, [clearLocal]);
-
-  const startNewReaSession = useCallback(() => {
-    clearLocal();
-    setActiveId(crypto.randomUUID());
-    setDraft("");
-    setIsReaSession(true);
-    setReaAppPath("");
-    setReaLog([]);
-    setReaRunning(false);
   }, [clearLocal]);
 
   const selectSession = useCallback(
@@ -598,9 +734,9 @@ export default function ChatWindowPage() {
       clearLocal();
       setActiveId(id);
       setDraft("");
-      setIsReaSession(false);
+      setActiveSkill(null);
+      setSlash(null);
       setReaLog([]);
-      setReaRunning(false);
     },
     [activeId, clearLocal],
   );
@@ -623,66 +759,17 @@ export default function ChatWindowPage() {
     [activeId, refreshSessions, startNewChat],
   );
 
-  const handleReaAnalyze = useCallback(async () => {
-    const appPath = reaAppPath.trim();
-    if (!appPath || !activeId || reaRunning || sending) return;
-    const bridge = window.electronAPI?.rea?.analyze;
-    if (!bridge) {
-      setReaLog([
-        "Starting REA analysis for " + appPath + "…",
-        "REA bridge is unavailable (window.electronAPI.rea.analyze missing).",
-      ]);
-      return;
-    }
-    setReaLog(["Starting REA analysis for " + appPath + "…"]);
-    setReaRunning(true);
-    try {
-      const result = await bridge(appPath, activeId);
-      if (!result) {
-        setReaLog((prev) => [...prev, "REA analysis returned no result."]);
-        return;
-      }
-      if (!result.ok) {
-        setReaLog((prev) => [...prev, "REA analysis failed: " + result.error]);
-        return;
-      }
-      const data = result.result as {
-        file?: string;
-        byteSize?: number;
-        preview?: string;
-      } | null;
-      const preview = data?.preview ?? "";
-      const location = data?.file
-        ? "\n\nFull evidence JSON saved to: " + data.file
-        : "";
-      await send(
-        "REA analysis of " +
-          appPath +
-          " finished." +
-          location +
-          (preview ? "\n\nPreview:\n\n" + preview : ""),
-        activeId,
-      );
-    } catch (err) {
-      setReaLog((prev) => [
-        ...prev,
-        "REA request failed: " + (err instanceof Error ? err.message : String(err)),
-      ]);
-    } finally {
-      setReaRunning(false);
-    }
-  }, [activeId, reaAppPath, reaRunning, send, sending]);
-
   // "Thinking" is the absence of output, so anything the model has produced
   // suppresses it — including a parked approval. Showing "Thinking" directly
   // above a question the user is being asked to answer reads as if the request
   // were ignored, when in fact it is waiting on them.
-  const showThinking = sending && !streamingText && approvals.length === 0 && !reaRunning;
+  const showThinking = sending && !streamingText && approvals.length === 0;
   const isEmpty =
     !messages.length &&
     !streamingText &&
     !showThinking &&
     !approvals.length &&
+    !reaLog.length &&
     !Object.keys(toolActivity).length;
 
   return (
@@ -695,10 +782,11 @@ export default function ChatWindowPage() {
         onNewChat={startNewChat}
         onRename={renameSession}
         onDelete={deleteSession}
-        onNewReaSession={startNewReaSession}
         browserOpen={browserOpen}
         browserPage={browserPage}
-        onToggleBrowser={() => setBrowserOpen((value) => !value)}
+        onToggleBrowser={toggleBrowserPanel}
+        terminalOpen={terminalOpen}
+        onToggleTerminal={toggleTerminalPanel}
       />
       <SidebarInset className="min-h-0">
         {/* No custom header: the native title bar owns the top of the window, so
@@ -719,7 +807,8 @@ export default function ChatWindowPage() {
                     Lock In
                   </h1>
                   <p className="text-sm text-muted-foreground">
-                    Hold D to dictate, then send. Or write below.
+                    Hold D to dictate, then send. Or write below. Type{" "}
+                    <span className="font-mono">/</span> for skills.
                   </p>
                 </div>
               ) : null}
@@ -739,17 +828,13 @@ export default function ChatWindowPage() {
                 onDeepControl={setDeepPaused}
               />
 
-              {isReaSession && reaLog.length > 0 ? (
+              {reaLog.length > 0 ? (
                 <Message from="assistant" className="max-w-full">
                   <MessageContent className={cn("max-w-full", ASSISTANT_BUBBLE)}>
                     <div className="mb-1 text-xs font-medium text-muted-foreground">
-                      {reaRunning ? (
-                        <span className="motion-safe:animate-pulse">
-                          Analyzing with REA…
-                        </span>
-                      ) : (
-                        <span>REA analysis log</span>
-                      )}
+                      <span className={cn(sending && "motion-safe:animate-pulse")}>
+                        Reverse engineering log
+                      </span>
                     </div>
                     <pre className="max-h-64 overflow-auto rounded-md bg-muted/50 p-2 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
                       {reaLog.join("\n")}
@@ -808,6 +893,14 @@ export default function ChatWindowPage() {
           className={cn(CHAT_COLUMN, "mx-auto px-6")}
         />
 
+        {/* A second docked panel under the browser. Both are shrink-0, so the
+            transcript gives up the space rather than the composer drifting. */}
+        <TerminalPanel
+          open={terminalOpen}
+          onOpenChange={setTerminalOpen}
+          className={cn(CHAT_COLUMN, "mx-auto px-6")}
+        />
+
         {/* No divider: the composer is separated from the transcript by space
             alone, which keeps the surface quiet and avoids a hard edge across
             the full window width. */}
@@ -819,28 +912,6 @@ export default function ChatWindowPage() {
               {config.model ? ` · ${config.model}` : ""}
             </span>
           </div>
-          {isReaSession ? (
-            <div className="mb-2 flex items-center gap-2 px-1">
-              <label className="shrink-0 text-xs text-muted-foreground">
-                App path
-              </label>
-              <Input
-                value={reaAppPath}
-                onChange={(e) => setReaAppPath(e.currentTarget.value)}
-                placeholder="/Applications/Discord.app"
-                aria-label="Application path to analyze with REA"
-                className="h-8 flex-1 text-sm"
-              />
-              <Button
-                type="button"
-                size="sm"
-                onClick={handleReaAnalyze}
-                disabled={sending || reaRunning || !reaAppPath.trim()}
-              >
-                Analyze with REA
-              </Button>
-            </div>
-          ) : null}
           {/* `PromptInput` forwards className to its <form>, not to the bordered
               group, so the border, the radius, the row gap and the collapsed
               height all have to be restated against the group itself.
@@ -848,6 +919,13 @@ export default function ChatWindowPage() {
           {/* `relative` anchors the picker to the composer's own box so the
               panel grows upward instead of off the bottom of the window. */}
           <div className="relative">
+            <SkillPicker
+              open={slashOpen}
+              skills={slashMatches}
+              active={slashIndex}
+              onActive={setSlashIndex}
+              onPick={insertSkill}
+            />
             <ToolPicker
               open={mentionOpen}
               tools={matches}
@@ -873,22 +951,43 @@ export default function ChatWindowPage() {
                 captures={staged}
                 onConsumed={() => setStaged([])}
               />
+              {activeSkill ? (
+                <div className="px-4 pt-2">
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-xs font-medium text-accent-foreground">
+                    <SparklesIcon aria-hidden="true" className="size-3 shrink-0" />
+                    <span className="truncate">{activeSkill.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setActiveSkill(null)}
+                      aria-label={`Remove ${activeSkill.name} skill`}
+                      className="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
+                    >
+                      <XIcon aria-hidden="true" className="size-3" />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
               <PromptInputTextarea
                 ref={inputRef}
                 value={draft}
                 onChange={(e) => {
                   setDraft(e.currentTarget.value);
-                  syncMention(e.currentTarget);
+                  syncPickers(e.currentTarget);
                   setMentionIndex(0);
+                  setSlashIndex(0);
                 }}
                 onKeyDown={onComposerKeyDown}
-                // Clicking back into a half-typed `@` token has to reopen the
-                // picker, and so does landing the caret there with the arrow keys.
-                onClick={(e) => syncMention(e.currentTarget)}
+                // Clicking back into a half-typed `@` or `/` token has to reopen
+                // its picker, and so does landing the caret there with arrows.
+                onClick={(e) => syncPickers(e.currentTarget)}
                 onKeyUp={(e) => {
-                  if (e.key.startsWith("Arrow")) syncMention(e.currentTarget);
+                  if (e.key.startsWith("Arrow")) syncPickers(e.currentTarget);
                 }}
-                placeholder="Send a message, or tap the mic to dictate…"
+                placeholder={
+                  activeSkill
+                    ? `Ask ${activeSkill.name}…`
+                    : "Send a message, or tap the mic to dictate…"
+                }
                 aria-label="Message"
                 // `md:` is required: shadcn's Textarea ships `text-base md:text-sm`,
                 // and the responsive variant survives twMerge as its own group.
@@ -917,6 +1016,76 @@ export default function ChatWindowPage() {
         </footer>
       </SidebarInset>
     </SidebarProvider>
+  );
+}
+
+/**
+ * The `/` skill picker.
+ *
+ * Same keyboard-first contract as the `@` picker: the caret stays in the
+ * textarea, and the panel only echoes the highlighted row. Picking one turns
+ * the token into a chip instead of inserting text, so the prompt starts clean.
+ */
+function SkillPicker({
+  open,
+  skills,
+  active,
+  onActive,
+  onPick,
+}: {
+  open: boolean;
+  skills: SkillInfo[];
+  active: number;
+  onActive: (index: number) => void;
+  onPick: (skill: SkillInfo) => void;
+}) {
+  if (!open) return null;
+  return (
+    <div className="absolute right-0 bottom-full left-0 z-20 mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
+      <ul
+        role="listbox"
+        aria-label="Skills"
+        aria-activedescendant={
+          skills[active] ? `skill-${skills[active].id}` : undefined
+        }
+        className="max-h-64 overflow-y-auto p-1"
+      >
+        {skills.map((skill, index) => (
+          <li
+            key={skill.id}
+            id={`skill-${skill.id}`}
+            role="option"
+            aria-selected={index === active}
+          >
+            <button
+              type="button"
+              // Keep the textarea focused so the chip lands without losing the
+              // caret the follow-up prompt needs.
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => onActive(index)}
+              onClick={() => onPick(skill)}
+              className={cn(
+                "flex w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                index === active
+                  ? "bg-accent text-accent-foreground"
+                  : "hover:bg-accent/50",
+              )}
+            >
+              <span className="flex items-center gap-1.5 font-mono text-[0.8125rem] font-medium">
+                <SparklesIcon aria-hidden="true" className="size-3" />
+                /{skill.id}
+              </span>
+              <span className="text-xs font-medium">{skill.name}</span>
+              {skill.description ? (
+                <span className="line-clamp-2 text-xs text-muted-foreground">
+                  {skill.description}
+                </span>
+              ) : null}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

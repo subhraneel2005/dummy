@@ -1,6 +1,5 @@
 import { app, BrowserWindow, clipboard, globalShortcut, ipcMain, nativeTheme, screen, shell, type Rectangle } from "electron"
 import { randomUUID } from "node:crypto"
-import fs from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -52,6 +51,16 @@ import {
   type CaptureRect,
 } from "./capture.js"
 import { closeDb, initDb, migrateDb } from "./db/index.js"
+import { listSkills } from "./skills/registry.js"
+import { setReaProgressSink } from "./skills/rea.js"
+import {
+  createTerminal,
+  disposeAllTerminals,
+  disposeTerminal,
+  disposeTerminalsFor,
+  resizeTerminal,
+  writeTerminal,
+} from "./terminal/manager.js"
 import { transcribeWav, whisperReady } from "./transcribe.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -72,6 +81,14 @@ interface CaptureHold {
 let mainWindow: BrowserWindow | null = null
 let chatWindow: BrowserWindow | null = null
 let captureWindow: BrowserWindow | null = null
+
+// REA tools run inside the agent and have no IPC context of their own, so their
+// progress is routed to the chat window here. The turn scopes the session id.
+setReaProgressSink((event) => {
+  if (!chatWindow || chatWindow.isDestroyed()) return
+  if (chatWindow.webContents.isDestroyed()) return
+  chatWindow.webContents.send("rea:event", event)
+})
 let pendingChatSeed: ChatSeed | null = null
 let activeHold: CaptureHold | null = null
 let lastHold: CaptureHold | null = null
@@ -412,12 +429,28 @@ function createChatWindow() {
   })
 
   chatWindow.on("closed", () => {
+    // Shells belong to this window, not to the app: kill them before the
+    // reference goes away or a headless zsh outlives the UI.
+    if (chatWindow && !chatWindow.isDestroyed()) {
+      disposeTerminalsFor(chatWindow.webContents)
+    }
     // The embedded browser lives in this window's content view, so it has to be
     // detached before the window goes away. Its logins survive in the partition.
     setHostWindow(null)
     chatWindow = null
     pendingChatSeed = null
   })
+
+  // A full reload throws away xterm without running React cleanup. Reap its
+  // shell on the navigation, not on the final quit.
+  chatWindow.webContents.on(
+    "did-start-navigation",
+    (_event, _url, isInPlace, isMainFrame) => {
+      if (!isMainFrame || isInPlace) return
+      if (!chatWindow || chatWindow.isDestroyed()) return
+      disposeTerminalsFor(chatWindow.webContents)
+    },
+  )
 
   // Parent the embedded browser into this window. Set here rather than lazily so
   // a page the model opened while the user was on another route is already in
@@ -632,9 +665,73 @@ function registerIpcHandlers() {
     typeof value === "string" && value.length > 0 && value.length <= 64
   const badSession = { ok: false as const, error: "Invalid chat session id." }
 
-  ipcMain.handle("chat:send", (_event, text: string, sessionId: unknown, attachments: unknown) =>
-    validSessionId(sessionId) ? sendChatMessage(text, sessionId, attachments) : badSession,
+  ipcMain.handle(
+    "chat:send",
+    (_event, text: string, sessionId: unknown, attachments: unknown, skillId: unknown) =>
+      validSessionId(sessionId)
+        ? sendChatMessage(text, sessionId, attachments, skillId)
+        : badSession,
   )
+  // The picker's catalog. Skills are files, so this is a directory scan rather
+  // than a database read; an empty result simply hides the `/` picker.
+  ipcMain.handle("skills:list", async () => {
+    try {
+      return { ok: true as const, skills: await listSkills() }
+    } catch (err) {
+      return {
+        ok: false as const,
+        error: err instanceof Error ? err.message : "Could not read skills.",
+      }
+    }
+  })
+  // The terminal is a human tool: the renderer sends keystrokes and dimensions,
+  // never a shell, cwd, or command. The manager owns all three.
+  const validTerminalId = (value: unknown): value is string =>
+    typeof value === "string" && value.length > 0 && value.length <= 128
+
+  ipcMain.handle("terminal:create", (event, payload: unknown) => {
+    const size = (payload ?? {}) as { cols?: unknown; rows?: unknown }
+    try {
+      return {
+        ok: true as const,
+        ...createTerminal(event.sender, size.cols, size.rows),
+      }
+    } catch (error) {
+      return {
+        ok: false as const,
+        error: error instanceof Error ? error.message : "Could not start the terminal.",
+      }
+    }
+  })
+  ipcMain.handle("terminal:write", (_event, payload: unknown) => {
+    const { id, data } = (payload ?? {}) as { id?: unknown; data?: unknown }
+    if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
+    try {
+      writeTerminal(id, data)
+      return { ok: true as const }
+    } catch (error) {
+      return {
+        ok: false as const,
+        error: error instanceof Error ? error.message : "Could not write to the terminal.",
+      }
+    }
+  })
+  ipcMain.handle("terminal:resize", (_event, payload: unknown) => {
+    const { id, cols, rows } = (payload ?? {}) as {
+      id?: unknown
+      cols?: unknown
+      rows?: unknown
+    }
+    if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
+    resizeTerminal(id, cols, rows)
+    return { ok: true as const }
+  })
+  ipcMain.handle("terminal:dispose", (_event, id: unknown) => {
+    if (!validTerminalId(id)) return { ok: false as const, error: "Invalid terminal id." }
+    disposeTerminal(id)
+    return { ok: true as const }
+  })
+
   ipcMain.handle("chat:history", (_event, sessionId: unknown) =>
     validSessionId(sessionId) ? getChatHistory(sessionId) : badSession,
   )
@@ -735,163 +832,6 @@ function registerIpcHandlers() {
   ipcMain.handle("chat:stop", () => {
     stopActiveStream()
     return { ok: true as const }
-  })
-  // REA analysis is a long-running subprocess, so it is spawned rather than run
-  // synchronously: a blocking call would freeze the whole app for the duration.
-  //
-  // REA streams progress to stderr as `{"rea_progress":{...}}` lines and writes
-  // the evidence envelope (often tens of megabytes) to stdout. Only the progress
-  // lines are pushed to the renderer; the payload is written to `rea_output/` in
-  // the project directory and only a short preview travels over IPC, so a large
-  // analysis cannot be pasted into the transcript.
-  ipcMain.handle("rea:analyze", async (event, appPath: unknown, sessionId: unknown) => {
-    if (typeof appPath !== "string" || !appPath.trim()) {
-      return { ok: false as const, error: "App path is required." }
-    }
-    const trimmedPath = appPath.trim()
-    const session = typeof sessionId === "string" ? sessionId : ""
-    const emit = (type: "log" | "done" | "error", text: string) => {
-      console.log(`[rea:${type}] ${text}`)
-      if (event.sender.isDestroyed()) return
-      event.sender.send("rea:event", { sessionId: session, type, text })
-    }
-    // A `rea_progress` line is JSON; show its human message rather than the raw
-    // envelope, but fall back to the line itself for anything else.
-    const formatProgress = (line: string): string => {
-      try {
-        const parsed = JSON.parse(line) as {
-          rea_progress?: { message?: string; phase?: string; completed?: number; total?: number }
-        }
-        const progress = parsed.rea_progress
-        if (progress) {
-          const counter =
-            typeof progress.completed === "number" && typeof progress.total === "number" && progress.total > 0
-              ? ` [${progress.completed}/${progress.total}]`
-              : ""
-          return `${progress.message || progress.phase || line}${counter}`
-        }
-      } catch {
-        // Not a progress envelope; surface the raw line.
-      }
-      return line
-    }
-    const { spawn } = await import("child_process")
-    return await new Promise<{ ok: true; result: unknown } | { ok: false; error: string }>((resolve) => {
-      let stdout = ""
-      let stderr = ""
-      let pending = ""
-      let settled = false
-      emit("log", `$ npx -y rea-agents@latest analyze-javascript-application ${trimmedPath} --json`)
-      // stderr lines are split across chunk boundaries, so hold the trailing
-      // partial line until the rest of it arrives.
-      const pushProgress = (text: string) => {
-        pending += text
-        let index = pending.indexOf("\n")
-        while (index >= 0) {
-          const line = pending.slice(0, index).trim()
-          pending = pending.slice(index + 1)
-          if (line) emit("log", formatProgress(line))
-          index = pending.indexOf("\n")
-        }
-      }
-      let child: import("child_process").ChildProcess
-      try {
-        child = spawn(
-          "npx",
-          ["-y", "rea-agents@latest", "analyze-javascript-application", trimmedPath, "--json"],
-          { cwd: process.cwd(), env: process.env },
-        )
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err)
-        emit("error", message)
-        resolve({ ok: false as const, error: message })
-        return
-      }
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        try {
-          child.kill("SIGKILL")
-        } catch {
-          // The process may have already exited; nothing to clean up.
-        }
-        emit("error", "REA analysis timed out after 5 minutes.")
-        resolve({ ok: false as const, error: "REA analysis timed out after 5 minutes." })
-      }, 300_000)
-      // stdout is the evidence payload: buffered whole, never streamed line by
-      // line, because it can be large.
-      child.stdout?.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString()
-      })
-      child.stderr?.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString()
-        pushProgress(chunk.toString())
-      })
-      child.on("error", (err) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        emit("error", err.message)
-        resolve({ ok: false as const, error: err.message })
-      })
-      child.on("close", async (code) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        if (code !== 0) {
-          // REA can exit non-zero with useful output; surface whatever it said.
-          const output = `${stdout.trim()}\n${stderr.trim()}`.trim()
-          const error = output || `REA analysis exited with code ${code}`
-          emit("error", error)
-          resolve({ ok: false as const, error })
-          return
-        }
-        let parsed: unknown
-        try {
-          parsed = JSON.parse(stdout || "{}")
-        } catch {
-          parsed = stdout || "Unable to parse REA output"
-        }
-        // REA returns an evidence envelope with ok=null; the useful data is the
-        // `javascript-module` node list under normalized_result.graph.nodes.
-        const analysis =
-          (parsed as { normalized_result?: { graph?: { nodes?: unknown } } })?.normalized_result?.graph?.nodes ||
-          (parsed as { raw_result?: unknown })?.raw_result ||
-          parsed
-        if (!analysis) {
-          const error = "No analysis data found in REA output."
-          emit("error", error)
-          resolve({ ok: false as const, error })
-          return
-        }
-        // Persist the full envelope under `rea_output/` at the project root so a
-        // large analysis is inspectable without flooding the chat.
-        let file = ""
-        try {
-          const outDir = path.resolve(app.getAppPath(), "..", "rea_output")
-          await fs.mkdir(outDir, { recursive: true })
-          const safeName = (path.basename(trimmedPath) || "app").replace(/[^a-zA-Z0-9._-]/g, "_")
-          const stamp = new Date().toISOString().replace(/[:.]/g, "-")
-          file = path.join(outDir, `${safeName}-${stamp}.json`)
-          await fs.writeFile(file, stdout, "utf-8")
-        } catch (err: unknown) {
-          // Saving is best-effort: the preview still lets the run be read.
-          emit("log", `Could not save REA output: ${err instanceof Error ? err.message : String(err)}`)
-        }
-        let preview: string
-        if (Array.isArray(analysis)) {
-          preview = `Parsed ${analysis.length} entries.\n\n${JSON.stringify(analysis.slice(0, 2), null, 2)}`
-        } else {
-          preview = JSON.stringify(analysis, null, 2)
-        }
-        if (preview.length > 3000) preview = `${preview.slice(0, 3000)}\n…(truncated)`
-        emit("done", file ? `Analysis complete. Saved to ${file}` : "Analysis complete.")
-        resolve({
-          ok: true as const,
-          result: { file, byteSize: Buffer.byteLength(stdout), preview },
-        })
-      })
-    })
   })
   ipcMain.on("chat:open", (_event, text: string) => openChatWindow(seedFor(text)))
   // Pulled by the chat renderer on mount. The seed is NOT cleared on read: the
@@ -1141,6 +1081,7 @@ app.whenReady().then(async () => {
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll()
+  disposeAllTerminals()
   hideCaptureWindow()
   // Best-effort: a deep task still running signals its agent loop to unwind, so
   // `close()` has the best chance of tearing down Chrome before we exit. If the

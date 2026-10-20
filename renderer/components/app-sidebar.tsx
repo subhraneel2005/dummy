@@ -9,9 +9,9 @@ import {
   PanelLeftIcon,
   PencilIcon,
   PlugIcon,
-  SearchIcon,
   SettingsIcon,
   SquarePenIcon,
+  SquareTerminalIcon,
   Trash2Icon,
 } from "lucide-react"
 
@@ -58,12 +58,14 @@ interface AppSidebarProps {
   onNewChat: () => void
   onRename: (id: string, title: string) => void
   onDelete: (id: string) => void
-  onNewReaSession: () => void
   provider: string | null
   /** Whether the browser panel is expanded. The panel lives in the chat page. */
   browserOpen: boolean
   browserPage: { url: string; title: string } | null
   onToggleBrowser: () => void
+  /** Whether the docked terminal is expanded. It lives in the chat page. */
+  terminalOpen: boolean
+  onToggleTerminal: () => void
 }
 
 export function AppSidebar({
@@ -73,11 +75,12 @@ export function AppSidebar({
   onNewChat,
   onRename,
   onDelete,
-  onNewReaSession,
   provider,
   browserOpen,
   browserPage,
   onToggleBrowser,
+  terminalOpen,
+  onToggleTerminal,
 }: AppSidebarProps) {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null)
@@ -172,11 +175,16 @@ export function AppSidebar({
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton
-                    tooltip="REA Session"
-                    onClick={() => onNewReaSession()}
+                    tooltip={
+                      terminalOpen
+                        ? "Hide the embedded terminal"
+                        : "Open a real shell in the project"
+                    }
+                    isActive={terminalOpen}
+                    onClick={onToggleTerminal}
                   >
-                    <SearchIcon aria-hidden="true" />
-                    <span>REA Session</span>
+                    <SquareTerminalIcon aria-hidden="true" />
+                    <span>Terminal</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
                 <SidebarMenuItem>

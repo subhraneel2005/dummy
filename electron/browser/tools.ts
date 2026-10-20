@@ -65,8 +65,18 @@ export type BrowserToolName =
   | "browser_save_pdf"
   | "browser_deep_task"
 
+/**
+ * Skills add their own tools. Resolving a name to a path only reads the
+ * filesystem/Spotlight, so it joins the auto-approved tier; acquiring or
+ * running anything still asks.
+ */
+const SKILL_READ_ONLY = ["rea_resolve_target"] as const
+
 export function isReadOnlyTool(name: string): boolean {
-  return (READ_ONLY as readonly string[]).includes(name)
+  return (
+    (READ_ONLY as readonly string[]).includes(name) ||
+    (SKILL_READ_ONLY as readonly string[]).includes(name)
+  )
 }
 
 /**

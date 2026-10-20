@@ -133,6 +133,31 @@ interface ReaEvent {
   text: string
 }
 
+/** One entry in the `/` picker. Mirrors main's `SkillSummary`. */
+interface SkillInfo {
+  id: string
+  name: string
+  description: string
+}
+
+type SkillsResult =
+  | { ok: true; skills: SkillInfo[] }
+  | { ok: false; error: string }
+
+type TerminalInfoResult =
+  | { ok: true; id: string; shell: string; cwd: string }
+  | { ok: false; error: string }
+type TerminalResult = { ok: true } | { ok: false; error: string }
+interface TerminalDataEvent {
+  id: string
+  data: string
+}
+interface TerminalExitEvent {
+  id: string
+  exitCode: number
+  signal?: number
+}
+
 /** Where the embedded browser currently is. */
 interface BrowserStatus {
   page: { url: string; title: string } | null
@@ -301,6 +326,7 @@ declare global {
           text: string,
           sessionId: string,
           attachments?: ChatAttachmentUpload[],
+          skillId?: string,
         ) => Promise<ChatSendResult>
         history: (sessionId: string) => Promise<ChatHistoryResult>
         reset: (sessionId: string) => Promise<ChatSendResult>
@@ -320,12 +346,19 @@ declare global {
         onInitialText: (callback: (seed: ChatSeed) => void) => () => void
         onEvent: (callback: (event: ChatEvent) => void) => () => void
       }
+      skills: {
+        list: () => Promise<SkillsResult>
+      }
       rea: {
-        analyze: (
-          appPath: string,
-          sessionId: string,
-        ) => Promise<{ ok: true; result: unknown } | { ok: false; error: string }>
         onEvent: (callback: (event: ReaEvent) => void) => () => void
+      }
+      terminal: {
+        create: (cols: number, rows: number) => Promise<TerminalInfoResult>
+        write: (id: string, data: string) => Promise<TerminalResult>
+        resize: (id: string, cols: number, rows: number) => Promise<TerminalResult>
+        dispose: (id: string) => Promise<TerminalResult>
+        onData: (callback: (event: TerminalDataEvent) => void) => () => void
+        onExit: (callback: (event: TerminalExitEvent) => void) => () => void
       }
       browser: {
         show: () => Promise<BrowserStatus>

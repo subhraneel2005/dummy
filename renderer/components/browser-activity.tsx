@@ -13,8 +13,10 @@ import {
   FileTextIcon,
   ArrowLeftIcon,
   ArrowRightIcon,
+  DownloadIcon,
   PlayIcon,
   PauseIcon,
+  SearchIcon,
   ShieldAlertIcon,
   TerminalIcon,
 } from "lucide-react"
@@ -40,6 +42,9 @@ const toolLabels: Record<string, string> = {
   browser_go: "Went back or forward",
   browser_save_pdf: "Saved PDF",
   browser_deep_task: "Ran deep task",
+  rea_resolve_target: "Target lookup",
+  rea_download: "Target download",
+  rea_run: "REA analysis",
 }
 
 const toolIcons: Record<string, typeof GlobeIcon> = {
@@ -52,6 +57,9 @@ const toolIcons: Record<string, typeof GlobeIcon> = {
   browser_go: UndoIcon,
   browser_save_pdf: SaveIcon,
   browser_deep_task: PlayIcon,
+  rea_resolve_target: SearchIcon,
+  rea_download: DownloadIcon,
+  rea_run: TerminalIcon,
 }
 
 /** A stable order for back/forward, which arrive as one tool with a direction. */
@@ -93,6 +101,13 @@ function inputSummary(input: unknown): string {
     const task = record.task
     return task.length > 80 ? `“${task.slice(0, 80)}…”` : `“${task}”`
   }
+  if (typeof record.command === "string") {
+    const args = Array.isArray(record.args)
+      ? record.args.filter((arg): arg is string => typeof arg === "string" && !arg.startsWith("-"))
+      : []
+    return args[0] ? `${record.command} ${args[0]}` : record.command
+  }
+  if (typeof record.query === "string") return record.query
   return ""
 }
 

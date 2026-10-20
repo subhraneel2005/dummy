@@ -36,6 +36,13 @@ interface ToolInfo {
   name: string
   description: string
 }
+
+interface SkillInfo {
+  id: string
+  name: string
+  description: string
+}
+type SkillsResult = { ok: true; skills: SkillInfo[] } | { ok: false; error: string }
 type AiModelsResult = { ok: true; models: ModelInfo[] } | { ok: false; error: string; models?: ModelInfo[] }
 type AiToolCatalogResult = { ok: true; tools: ToolInfo[] } | { ok: false; error: string }
 
@@ -136,6 +143,14 @@ type ReaEvent = {
   type: "log" | "done" | "error"
   text: string
 }
+
+/** One interactive shell created by the main process for this window. */
+type TerminalInfoResult =
+  | { ok: true; id: string; shell: string; cwd: string }
+  | { ok: false; error: string }
+type TerminalResult = { ok: true } | { ok: false; error: string }
+type TerminalDataEvent = { id: string; data: string }
+type TerminalExitEvent = { id: string; exitCode: number; signal?: number }
 
 /** Where the embedded browser currently is. Read-only; the model drives it via tools. */
 type BrowserStatus = {
@@ -329,8 +344,13 @@ const electronAPI = {
         ipcRenderer.invoke("ai:delete-all-attachments") as Promise<AiImagesDeleteResult>,
     },
     chat: {
-      send: (text: string, sessionId: string, attachments?: ChatAttachmentUpload[]) =>
-        ipcRenderer.invoke("chat:send", text, sessionId, attachments) as Promise<ChatSendResult>,
+      send: (
+        text: string,
+        sessionId: string,
+        attachments?: ChatAttachmentUpload[],
+        skillId?: string,
+      ) =>
+        ipcRenderer.invoke("chat:send", text, sessionId, attachments, skillId) as Promise<ChatSendResult>,
       history: (sessionId: string) =>
         ipcRenderer.invoke("chat:history", sessionId) as Promise<ChatHistoryResult>,
       reset: (sessionId: string) =>
@@ -367,15 +387,38 @@ attachmentData: (attachmentId: string) =>
         return () => ipcRenderer.removeListener("chat:event", handler)
       },
     },
+    skills: {
+      list: () => ipcRenderer.invoke("skills:list") as Promise<SkillsResult>,
+    },
     rea: {
-      analyze: (appPath: string, sessionId: string) =>
-        ipcRenderer.invoke("rea:analyze", appPath, sessionId) as Promise<
-          { ok: true; result: unknown } | { ok: false; error: string }
-        >,
+      // Progress from the REA tools during a `/` skill turn. There is no
+      // `analyze` invoke any more: REA is reached through the agent's tools.
       onEvent: (callback: (event: ReaEvent) => void) => {
         const handler = (_event: unknown, payload: ReaEvent) => callback(payload)
         ipcRenderer.on("rea:event", handler)
         return () => ipcRenderer.removeListener("rea:event", handler)
+      },
+    },
+    // A real shell for the human. Keystrokes and dimensions only; main chooses
+    // the shell and cwd. Not registered as an agent tool.
+    terminal: {
+      create: (cols: number, rows: number) =>
+        ipcRenderer.invoke("terminal:create", { cols, rows }) as Promise<TerminalInfoResult>,
+      write: (id: string, data: string) =>
+        ipcRenderer.invoke("terminal:write", { id, data }) as Promise<TerminalResult>,
+      resize: (id: string, cols: number, rows: number) =>
+        ipcRenderer.invoke("terminal:resize", { id, cols, rows }) as Promise<TerminalResult>,
+      dispose: (id: string) =>
+        ipcRenderer.invoke("terminal:dispose", id) as Promise<TerminalResult>,
+      onData: (callback: (event: TerminalDataEvent) => void) => {
+        const handler = (_event: unknown, payload: TerminalDataEvent) => callback(payload)
+        ipcRenderer.on("terminal:data", handler)
+        return () => ipcRenderer.removeListener("terminal:data", handler)
+      },
+      onExit: (callback: (event: TerminalExitEvent) => void) => {
+        const handler = (_event: unknown, payload: TerminalExitEvent) => callback(payload)
+        ipcRenderer.on("terminal:exit", handler)
+        return () => ipcRenderer.removeListener("terminal:exit", handler)
       },
     },
     browser: {

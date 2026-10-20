@@ -700,7 +700,12 @@ export function useChat(sessionId: string | null) {
   // The session id is passed in rather than read from the closure so the first
   // message of a brand-new thread can mint its own id and send immediately.
   const send = useCallback(
-    async (text: string, targetSessionId: string, uploads?: readonly ChatAttachmentUpload[]) => {
+    async (
+      text: string,
+      targetSessionId: string,
+      uploads?: readonly ChatAttachmentUpload[],
+      skillId?: string,
+    ) => {
       const trimmed = text.trim()
       const files = uploads ?? []
       // Images with no caption are a valid message; nothing at all is not.
@@ -742,7 +747,12 @@ export function useChat(sessionId: string | null) {
         },
       ])
       setSending(true)
-      const result = await window.electronAPI?.chat.send(trimmed, targetSessionId, files as ChatAttachmentUpload[])
+      const result = await window.electronAPI?.chat.send(
+        trimmed,
+        targetSessionId,
+        files as ChatAttachmentUpload[],
+        skillId,
+      )
       if (result && !result.ok) {
         setError(typeof result.error === "string" ? result.error : "The chat request failed.")
         setSending(false)

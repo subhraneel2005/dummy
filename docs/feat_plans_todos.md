@@ -1262,7 +1262,7 @@ external Chrome (their process: installed Chrome, own profile, visible window)
 
 ## Feature 8 — REA Reverse-Engineering Sessions
 
-> **Status: shipped** (commit `7473ceb`). Adds a **REA Session** entry to the sidebar: a chat seeded with an **App path** field that runs a [`rea-agents`](https://rea.tools/) analysis of a local application bundle and folds the result back into the conversation.
+> **Status: shipped** (commit `7473ceb`), then **superseded by Feature 9**. Added a **REA Session** entry to the sidebar: a chat seeded with an **App path** field that ran a [`rea-agents`](https://rea.tools/) analysis of a local application bundle and folded the result back into the conversation. Feature 9 removes the dedicated session and turns REA into a `/` skill inside any chat.
 
 ### Goal
 Point a chat session at a local app (e.g. `/Applications/Discord.app`), run REA's `analyze-javascript-application`, watch its progress live in the transcript, and have the model answer over a compact preview of the evidence — without freezing the app and without pasting a multi-megabyte JSON blob into the thread.
@@ -1326,12 +1326,225 @@ AppSidebar → onNewReaSession()             ipcMain.handle("rea:analyze", appPa
 ### Validation
 - ✅ `tsc -b` + preload typecheck green; renderer `tsc --noEmit` and eslint on `app/chat/page.tsx` + `components/app-sidebar.tsx` green.
 - ✅ Manual end-to-end: REA Session → `/Applications/Discord.app` → live progress lines stream, `rea_output/<App>-<timestamp>.json` is written, preview + file path land in the chat, model replies.
-- [ ] Add `rea_output/` to a root `.gitignore` and `git rm --cached` the evidence file that commit `7473ceb` accidentally tracked (`rea_output/Discord.app-…json`, ~10 MB).
+- ✅ Added a root `.gitignore` (`rea_output/`, `rea_downloads/`) and `git rm --cached` the evidence file commit `7473ceb` accidentally tracked (`rea_output/Discord.app-…json`, ~10 MB). The file stays on disk.
 
 ### Open Questions
 - Summarize `normalized_result.graph.nodes` into a tighter structured preview (module list, dependencies) instead of a raw JSON slice?
 - Let the user re-run against the saved file without re-invoking REA, and/or open the JSON from the chat?
 - Offer a cancel button for a long run (today it is a fixed 5-minute kill)?
+
+---
+
+## Feature 9 — Skills & Slash Commands (REA becomes a skill)
+
+> **Status: implemented, pending manual end-to-end check** (uncommitted). Replaces the standalone **REA Session** (Feature 8) with a general **skill** system: type `/` at the **start or end** of the composer, pick a skill, and a chip appears in the input. Keep typing the prompt and send. REA is now one skill among any future ones, and it can resolve or download a target by name — an app path is no longer required up front.
+
+### Why replace Feature 8
+- A separate REA session duplicated everything a chat already does (session id, sidebar entry, transcript, model turning the result into an answer) and hid the feature behind a path field that users had to know.
+- Skills are the general shape: **instructions + optional toolset**, selected per message. REA is just the first one. Adding a second skill (e.g. a writing or research skill) needs no new sidebar entry, tab, or database table.
+- The user asked for opencode-style behavior: `/` lists skills, the chosen skill is visible in the input, and the prompt follows it.
+
+### Skill format (`skills/<id>/SKILL.md`)
+Frontmatter is a tiny parser, not a YAML dependency:
+```
+---
+name: Reverse Engineering
+description: Reverse engineer apps, binaries, websites, firmware…
+toolset: rea
+---
+<instructions injected into the agent for this turn>
+```
+- **Discovery** is a directory scan of `skills/` at the project root (`path.resolve(app.getAppPath(), "..", "skills")`; `app.getAppPath()` is `electron/` in dev).
+- `id` = directory name, validated as `^[a-z0-9][a-z0-9_-]{0,63}$` (no traversal).
+- `name`/`description` feed the picker; the body is appended to the system prompt only for a turn that selected the skill.
+- `toolset: rea` attaches `rea_resolve_target`, `rea_download`, `rea_run` (below). Unknown toolsets attach nothing.
+
+### Slash UX rules (as requested)
+- `/` opens the picker **only** when the token starts the message (`^`) **or** ends it (nothing but whitespace after the caret). A `/` in the middle of prose never opens it.
+- Selecting a skill **removes the typed `/token`** from the text and stores the skill as composer state, shown as a chip (`Sparkles` + skill name + `×`).
+- The chip is carried on the next send only (`skillId` in `chat:send`), then cleared. The prompt itself is stored/displayed exactly as typed — the skill directive is appended on the way to the model, like the existing `@` mention directive.
+- Keyboard: `↑`/`↓`, `Enter`/`Tab` to pick, `Esc` to dismiss. The textarea keeps focus; the picker is a visual echo, same pattern as the `@` tool picker.
+- Empty state gains a "Type `/` for skills" hint.
+
+### REA skill: no path required
+The model is told the workflow and can do it all from a name or URL:
+1. `rea_resolve_target({ query })` — local path, `~` expansion, installed `.app` lookup in `/Applications`, `~/Applications`, `/System/Applications` (+ `mdfind`), archive URL detection, or a `missing` result with a Homebrew cask suggestion. Read-only, auto-approved.
+2. `rea_download({ query })` — for a bare app name, `brew install --cask <slug>`; for an archive URL, streamed download to `rea_downloads/` (+ `unzip`, or `hdiutil` mount/copy for `.dmg`). Requires approval; returns the local path.
+3. `rea_run({ command, args })` — runs `npx -y rea-agents@latest <command> … --format json --full-output`, blocking install/start/instrument/export subcommands. Requires approval. Progress on stderr streams to the transcript; stdout (usually a multi-MB evidence envelope) is written to `rea_output/<command>-<target>-<timestamp>.json` and only a capped preview returns to the model.
+4. The model summarizes the evidence and cites node/address ids and the saved file. It may chain `inspect`/`decompile`/`trace`/`search` calls for depth.
+
+### Final answer: text + Mermaid diagram
+- Every final answer of an REA turn ships a **text explanation and at least one Mermaid diagram**, not text alone. The skill's step 6 and its "Final answer format" section spell this out, so the model emits a fenced ` ```mermaid ` block after the findings.
+- The diagram is evidence-shaped, not decorative: `flowchart LR` for components/data flow, `sequenceDiagram` for a runtime path, `classDiagram` only when the recovered classes are the finding. Labels are short, edges name the protocol or data passed, and the diagram never contains a node that the evidence does not support.
+- Rendering already exists: `MessageResponse` loads `@streamdown/mermaid`, which is backed by the **mermaid.js** package (already in `renderer/package.json`). A fenced ` ```mermaid ` block becomes an SVG in the transcript; no new renderer code is needed.
+- If Mermaid syntax fails, the raw code block stays visible so the answer is still readable. The skill tells the model to keep diagrams small (≤ 20 nodes) and to avoid HTML/`<br/>` in labels.
+
+### Architecture Overview
+```
+renderer (composer)                            electron/main
+--------------------                           -------------
+`/` in text → SkillPicker                      ipcMain.handle("skills:list") → listSkills()
+  pick → chip + skillId                        chat:send(text, session, files, skillId)
+  send ─────────────────────────────────────►  sendChatMessage(…, skillId?)
+                                                 loadSkill(id) → body appended to instructions
+                                                 tools = browser tools + toolsForSkill(skill)
+                                                 ToolLoopAgent
+                                                   rea_resolve_target (read-only)
+                                                   rea_download ──► brew / fetch + extract
+                                                   rea_run ──► npx rea-agents@latest …
+                                                       stderr ─► rea:event ─► log bubble
+                                                       stdout ─► rea_output/*.json
+                                                 model answers over the preview
+```
+
+### IPC Surface (additions/changes)
+- renderer → main (invoke): `skills:list()` → `{ ok: true, skills: [{ id, name, description }] } | { ok: false, error }`.
+- `chat:send(text, sessionId, attachments, skillId?)` — new optional fourth argument; unknown ids are rejected.
+- main → renderer (events): `rea:event` unchanged `{ sessionId, type: "log" | "done" | "error", text }`; now emitted by the REA tools during a skill turn.
+- Removed: `rea:analyze` invoke and `rea.analyze` preload method (the standalone session flow). `rea.onEvent` stays.
+- Preload: `skills.list`; `chat.send` gains `skillId`.
+
+### Files
+- `skills/reverse-engineer/SKILL.md` — the REA skill instructions and command cheat sheet.
+- `electron/skills/registry.ts` — discovery, frontmatter parsing, `listSkills` / `loadSkill`.
+- `electron/skills/rea.ts` — target resolution, download/install, `rea_run`, progress sink, evidence-to-disk.
+- `electron/ai/chat.ts` — `skillId` param, instruction injection, per-skill toolset, REA session scoping.
+- `electron/main.ts` — `skills:list`, `chat:send` fourth arg, progress sink wiring, removal of `rea:analyze`.
+- `electron/preload.ts` + `renderer/electron.d.ts` — `skills` bridge, `chat.send` signature; drop `rea.analyze`.
+- `renderer/app/chat/page.tsx` — skill state, `/` context + picker + chip, send with `skillId`, log bubble now unconditional while a run is live; remove REA-session state/path/button.
+- `renderer/components/app-sidebar.tsx` — remove the **REA Session** item and `onNewReaSession` prop.
+- `renderer/hooks/use-chat.ts` — `send(..., skillId?)` forwards the id.
+- `.gitignore` — ignore `rea_output/` and `rea_downloads/` (evidence/download artifacts, never source).
+
+### Traps to avoid
+1. **Do not put skill text in the stored message.** The user prompt is persisted and displayed as typed; the skill instructions are injected only into `ToolLoopAgent.instructions`. Otherwise every user bubble would contain the whole SKILL.md.
+2. **Do not open `/` mid-sentence.** The regex alone matches anywhere; the extra "start or end of the input" check is the requested behavior and must be explicit.
+3. **Unknown `skillId` must be rejected in main**, not trusted from the renderer. Same posture as session ids and approvals.
+4. **A missing skill directory must not break chat.** `listSkills` returns `[]`; `loadSkill` returns `null`; the renderer hides the picker.
+5. **REA progress needs a session id.** The tool is not given IPC context, so set it from `sendChatMessage` for the duration of the turn (`setReaSession(sessionId)`), clear it in `finally`.
+6. **Never `spawnSync` REA.** It freezes the whole app (Feature 8 trap 1). Keep async `spawn`, stream stderr, buffer stdout, 10-minute kill.
+7. **Downloads/installs are mutating.** `rea_download` and `rea_run` must go through the existing approval policy; only `rea_resolve_target` is read-only. `brew` can also block on a password prompt, so it gets its own timeout and surfaces stderr.
+8. **Do not let the model run arbitrary binaries.** `rea_run` spawns only `rea` from a command allowlist/blocklist, args as an array (no shell), and requires approval.
+9. **Removing `rea.analyze` from the preload also means removing its type** from `renderer/electron.d.ts`; the hand-written d.ts is the reason a stale shape compiles.
+
+### Validation
+- ✅ `npm run build` (electron `tsc -b` + preload) green.
+- ✅ Renderer `npx tsc --noEmit` and eslint on `app/chat/page.tsx`, `components/app-sidebar.tsx`, `hooks/use-chat.ts` green.
+- [ ] Manual: type `/` at the start → picker lists **Reverse Engineering**; pick it → chip appears, `/token` gone; type "reverse engineer Discord" → send.
+- [ ] Manual: REA resolves `/Applications/Discord.app` (or installs it after approval), progress streams into the log bubble, evidence is written to `rea_output/`, and the model summarizes it.
+- [ ] Manual: a `/` typed mid-sentence does not open the picker; `×` on the chip removes the skill; sending without a skill behaves exactly as before.
+- [ ] Manual: a completed REA answer renders the Mermaid block as a diagram (not a raw code fence) below the text findings.
+- [ ] Manual: sidebar has no **REA Session**; normal chat is unchanged.
+
+### Open Questions
+- Should skills also be discoverable from `~/.agents/skills` (opencode-style) or stay repo-local?
+- Per-skill model/temperature overrides?
+- Persist the chosen skill on the assistant turn so the transcript shows what was used after a reload?
+- A proper cancel button for `rea_run` (today: turn Stop / 10-minute kill)?
+
+---
+
+## Feature 10 — Embedded Terminal (xterm.js + node-pty)
+
+> **Status: implemented, pending manual end-to-end check** (uncommitted). A real, interactive shell inside the chat window: **xterm.js** in the renderer and **node-pty** in the Electron main process. Toggle it from the sidebar; it docks between the transcript and the composer in the same slot as the browser panel (one dock at a time).
+
+### Goal
+- Run real commands (`git`, `npm`, `ls`, `vim`, `ssh`, REPLs) inside Dummy without leaving the app.
+- Keep the terminal **user-driven only** in v1: the model gets no shell tool.
+- Keep one PTY session alive while the panel is collapsed, so a long build is not killed by hiding the UI.
+
+### Non-goals (v1)
+- No agent/tool access to the shell (no `terminal_run` tool for the model).
+- No tabs, split panes, or multiple shells; one session per window.
+- No session restore across app restarts, no scrollback persistence.
+- No shell/profile picker; use `$SHELL`, then `/bin/zsh`, `/bin/bash`, `/bin/sh`.
+- No custom keybinding editor, ligatures, or GPU renderer.
+
+### Dependencies (deliberate choices)
+- `@xterm/xterm` + `@xterm/addon-fit` in **renderer**. The old `xterm` package is deprecated; use the scoped packages. Link detection is out of scope (no generic `openExternal` bridge would be safe to add just for that).
+- `node-pty@1.1.0` in **electron** only. It is N-API (`node-addon-api`) and ships a `darwin-arm64` prebuild, so it should load in Electron without `electron-rebuild`. A smoke test proves it before any UI work is trusted.
+- `node-pty` must never be imported by Next.js or the renderer bundle: it is a native module and only exists in the main process.
+
+### Architecture Overview
+```
+renderer/components/terminal-panel.tsx          electron/terminal/manager.ts
+--------------------------------------          ---------------------------
+xterm Terminal + FitAddon                       Map<id, { pty, shell, cwd }>
+  create(cols, rows) ──► terminal:create ─────► resolveShell() + pty.spawn()
+  onData(data)       ──► terminal:write  ─────► pty.write(data)
+  fit → resize       ──► terminal:resize ─────► pty.resize(cols, rows)
+  unmount/restart    ──► terminal:dispose ────► pty.kill()
+  term.write(data) ◄──── terminal:data ◄────── pty.onData()
+  status = exited  ◄──── terminal:exit ◄────── pty.onExit()
+```
+
+- Main owns the trust boundary: the renderer sends **only** keystrokes and dimensions. Shell, cwd, and env are chosen in main; there is no `command` argument in the IPC surface.
+- Shell: first absolute, existing path from `process.env.SHELL`, then `/bin/zsh`, `/bin/bash`, `/bin/sh`. Spawn with `-l` so a GUI-launched Electron still gets the user's login PATH.
+- Cwd: the repo root in dev (`path.resolve(app.getAppPath(), "..")`), the home directory when packaged. Shown in the panel header.
+- Env: `{ ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }`. The PTY is the user's own shell under their account; the app's provider keys are not printed or passed on argv.
+
+### Layout / UX
+- Sidebar gains **Terminal** (`SquareTerminal` icon) under **Browser automation**, same active/toggle pattern as the browser item. A small dot marks a live session.
+- The panel docks in the same slot as `BrowserPanel` (between transcript and composer, `CHAT_COLUMN` width). **One dock at a time:** opening the terminal collapses the browser and vice versa, because two panels plus the composer do not fit on a short window. Hiding the terminal keeps its PTY alive, so a build survives while the user looks at the browser.
+- Header: status dot, "Terminal", `<cwd> · <shell>`, **Restart** (`RotateCcw`), **Hide** (`X`). Hiding keeps the PTY alive; restart disposes and spawns a fresh one.
+- Body: xterm fills a `36vh` box (`min-h-[200px] max-h-[480px]`), dark palette, monospace, 5k scrollback, blinking cursor. Clicking the panel focuses it; opening it focuses and fits.
+- Keys: `Ctrl+C`/`Ctrl+D` reach the shell unchanged; `Cmd+C` copies the xterm selection; `Cmd+V` pastes into the PTY. Normal typing is never intercepted.
+- Errors (native module missing, spawn failure) render inside the panel with the actual message plus a Retry button; the rest of the app keeps working.
+
+### IPC Surface (additions)
+Renderer → main (invoke):
+- `terminal:create({ cols, rows })` → `{ ok: true, id, shell, cwd } | { ok: false, error }`.
+- `terminal:write({ id, data })` → `{ ok: true } | { ok: false, error }`; `data` capped at 64 KiB.
+- `terminal:resize({ id, cols, rows })` → `{ ok: true } | { ok: false, error }`; cols 2–500, rows 1–300.
+- `terminal:dispose({ id })` → `{ ok: true }`.
+
+Main → renderer (events):
+- `terminal:data({ id, data })`.
+- `terminal:exit({ id, exitCode, signal? })`.
+
+Preload: `electronAPI.terminal.{create,write,resize,dispose,onData,onExit}`. Types added to `renderer/electron.d.ts`, matching the hand-written bridge.
+
+### Lifecycle
+- `before-quit` / `will-quit`: `disposeAllTerminals()` kills every PTY.
+- Chat window `closed`: dispose that window's sessions before `chatWindow = null`.
+- A reload of the renderer keeps the PTY alive (events buffered by xterm? no) — acceptable: the panel re-creates only if the session id is gone. On reload the old PTY is orphaned unless the window's `render-process-gone` / reload is handled; add a `did-start-navigation`? Simpler: dispose sessions on `chatWindow.webContents.on("destroyed")`, which fires on reload/navigation, then let the panel spawn a new one.
+- `pty.onExit` removes the session and notifies the panel; the panel shows `[process exited with code N]` and offers Restart.
+
+### Files
+- `electron/terminal/manager.ts` — shell resolution, spawn/write/resize/dispose, event forwarding, `disposeAllTerminals`.
+- `electron/main.ts` — IPC handlers, window-close/quit disposal.
+- `electron/preload.ts`, `renderer/electron.d.ts` — `terminal` bridge.
+- `renderer/components/terminal-panel.tsx` — xterm mount, FitAddon, resize observer, key handling, header/status.
+- `renderer/app/chat/page.tsx` — `terminalOpen` state, render panel, pass toolbar props.
+- `renderer/components/app-sidebar.tsx` — Terminal menu item.
+- `electron/scripts/terminal-smoke.mjs` + `test:terminal` script — loads node-pty under Electron, spawns a PTY, asserts output.
+- `README.md` — feature row + repo layout.
+
+### Traps to avoid
+1. **Native ABI mismatch.** node-pty's `.node` must be built/loaded for Electron, not the Next.js Node runtime. Keep it in `electron/`, verify with the Electron smoke test, and never import it in renderer code. This repo's npm policy also skips install scripts, and the tarball's `spawn-helper` has no executable bit; the manager `chmod +x`es it before the first spawn, otherwise `pty.spawn` fails with `posix_spawnp failed`.
+2. **No server-side xterm.** The component is `"use client"`, creates `Terminal` only inside an effect, and disposes it on unmount; xterm touches `document` and will break SSR.
+3. **Fit before layout.** A hidden panel has zero size, so `fit()` must run only when visible, after a frame, and again from a `ResizeObserver`; guard against 0×0.
+4. **Resize storms.** Coalesce `fit()`/`resize` into one `requestAnimationFrame` and send `terminal:resize` only when `cols`/`rows` actually changed.
+5. **Zombie shells.** Kill the PTY on dispose, window close, renderer reload, and quit. Never leave a `zsh` child after the window is gone.
+6. **Never render terminal output through React state.** Write directly with `term.write()`; a state update per chunk would re-render the chat on every byte.
+7. **Don't steal keys.** Do not intercept `Ctrl+C`, arrows, or Tab; only handle `Cmd+C`/`Cmd+V`. `attachCustomKeyEventHandler` must return `true` for everything else.
+8. **Trust boundary.** The renderer cannot pick a shell, cwd, env, or argv. Validate the session id and numeric dimensions in main; ignore writes to dead sessions.
+9. **No model access.** Do not register the terminal in the tool catalog. If that changes later, it needs approval and output-scoping first.
+
+### Validation
+- ✅ `npm run build` (electron), renderer `tsc --noEmit`, eslint, and `next build` green.
+- ✅ `npm run test:terminal` spawns node-pty under Electron, streams input/output, and exits cleanly.
+- [ ] Manual: sidebar → **Terminal** opens a shell prompt in the repo root; `pwd`, `ls`, `echo $TERM` (`xterm-256color`) work.
+- [ ] Manual: colors in `ls`/`git status`, `vim`/`top` redraw correctly, `Ctrl+C` interrupts, arrow keys and history work.
+- [ ] Manual: resize the window → `stty size` changes; collapsing keeps a running `sleep`/build alive; Restart kills and respawns; Hide/Show preserves scrollback.
+- [ ] Manual: closing the window/app leaves no `zsh`/`node-pty` children (`pgrep -fl zsh`).
+- [ ] Manual: opening the browser collapses the terminal without killing the shell, and reopening the terminal shows the same scrollback; chat send still works.
+
+### Open Questions
+- Bottom dock (chosen) vs a right-side dock for terminals?
+- Keep one shell per window, or add tabs later?
+- Should the agent get a `terminal_run` tool behind the existing approval flow (and a command allowlist)?
+- Should the terminal start in the repo root or the user's home directory when packaged?
 
 ---
 

@@ -8,6 +8,7 @@ import {
   type FilePart,
   type ModelMessage,
   type TextPart,
+  type ToolSet,
   type UserContent,
 } from "ai"
 
@@ -17,6 +18,8 @@ import { abandonCaptures, beginCaptures, capturesFor, commitCaptures } from "../
 import { DEEP_TASK_APPROVAL_REASON, isReadOnlyTool, mentionCatalog, toolsForBackend } from "../browser/tools.js"
 import { abortDeepTask, registerDeepSessionProvider } from "../browser/deep-task.js"
 import { isOpen, releasePageMemory } from "../browser/window.js"
+import { loadSkill, type Skill } from "../skills/registry.js"
+import { reaTools, setReaSession } from "../skills/rea.js"
 import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   attachmentKind,
@@ -207,6 +210,26 @@ function chatInstructions(backend: BrowserBackend): string {
     backend === "deep" ? DEEP_BROWSER_INSTRUCTIONS : EMBEDDED_BROWSER_INSTRUCTIONS,
     TOOL_ERROR_INSTRUCTIONS,
   ].join("\n\n")
+}
+
+/**
+ * A skill contributes its SKILL.md body to the system prompt for one turn.
+ * It never enters the stored message: the user's bubble has to stay exactly
+ * what they typed.
+ */
+function instructionsForSkill(backend: BrowserBackend, skill: Skill | null): string {
+  const base = chatInstructions(backend)
+  if (!skill) return base
+  return `${base}\n\n## Active skill: ${skill.name}\n\n${skill.instructions}`
+}
+
+/**
+ * Tools a skill brings with it. Unknown or absent toolsets attach nothing, so a
+ * text-only skill is just instructions on top of the normal browser tool set.
+ */
+function toolsForSkill(skill: Skill | null): ToolSet {
+  if (skill?.toolset === "rea") return reaTools
+  return {}
 }
 
 /**
@@ -724,9 +747,19 @@ export async function sendChatMessage(
   text: string,
   sessionId: string,
   incoming?: unknown,
+  skillId?: unknown,
 ): Promise<ChatSendResult> {
   const trimmed = text.trim()
   if (!sessionId) return { ok: false, error: "No chat session is open." }
+
+  const requestedSkill =
+    typeof skillId === "string" && skillId.length > 0 && skillId.length <= 64
+      ? skillId
+      : null
+  const skill = requestedSkill ? await loadSkill(requestedSkill) : null
+  if (requestedSkill && !skill) {
+    return { ok: false, error: "That skill is no longer available." }
+  }
 
   let attachments: IncomingAttachment[]
   try {
@@ -747,8 +780,8 @@ export async function sendChatMessage(
     backend = await getBrowserBackend()
     agent = new ToolLoopAgent({
       model: resolved.model,
-      instructions: chatInstructions(backend),
-      tools: toolsForBackend(backend),
+      instructions: instructionsForSkill(backend, skill),
+      tools: { ...toolsForBackend(backend), ...toolsForSkill(skill) },
       stopWhen: stepCountIs(BROWSER_STEP_LIMIT),
       timeout: {
         totalMs: DEEP_STEP_TIMEOUT_MS,
@@ -854,6 +887,8 @@ export async function sendChatMessage(
   const controller = new AbortController()
   const turn: ActiveTurn = { controller, denyPending: null, token: randomUUID(), sessionId }
   activeTurn = turn
+  // REA tools emit progress without IPC context, so the turn scopes it here.
+  setReaSession(sessionId)
 
   // Captures arrive with the session id because the renderer only shows one
   // conversation at a time, exactly like the rest of these events.
@@ -1105,6 +1140,7 @@ export async function sendChatMessage(
       await abandonCaptures(turn.token)
       if (activeTurn === turn) {
         activeTurn = null
+        setReaSession("")
         // The turn is over, so the page is now idle. A browser that was never
         // opened needs no timer at all.
         if (isOpen()) scheduleIdleRelease()

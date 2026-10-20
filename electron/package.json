@@ -11,9 +11,10 @@
     "db:generate": "drizzle-kit generate",
     "test:providers": "node scripts/provider-compat.mjs",
     "test:browser": "npm run build && electron scripts/browser-smoke.mjs",
+    "test:terminal": "npm run build && electron scripts/terminal-smoke.mjs",
     "test:approvals": "node --experimental-strip-types scripts/approval-smoke.mjs",
     "test:backends": "node --experimental-strip-types scripts/browser-backends-smoke.mjs",
-    "test": "npm run test:providers && npm run test:approvals && npm run test:backends && npm run build && electron scripts/browser-smoke.mjs"
+    "test": "npm run test:providers && npm run test:approvals && npm run test:backends && npm run build && electron scripts/browser-smoke.mjs && electron scripts/terminal-smoke.mjs"
   },
   "keywords": [],
   "author": "",
@@ -35,6 +36,7 @@
     "@libsql/client": "^0.18.0",
     "ai": "^7.0.114",
     "drizzle-orm": "^1.0.0-rc.4",
+    "node-pty": "^1.1.0",
     "zod": "^4.6.5"
   }
 }

@@ -51,7 +51,8 @@ Everything is local-first: your API keys are encrypted with the **OS keychain** 
 | 8 | **`@` tool picker** | Type `@` in the composer for one entry — **`@BrowserAutomation`** — and the model is told to use the browser for that message. You name the *capability*, never the internal steps; the mention resolves to whichever tools the active backend has. |
 | 9 | **Human-in-the-loop CAPTCHA handoff** | When a site hits a "verify you are human" wall, the agent **pauses and hands it to you** instead of fighting it. No automated bypass — resolve it, press Resume, and the run picks up where it stopped. |
 | 10 | **Rate-limit resilience** | Transient `429`s from free-tier providers are retried with backoff instead of killing the run, and a tool failure is never dressed up as an answer: the model retries transient errors, states what it could not do, and finishes the rest of the task. |
-| 11 | **REA reverse-engineering session** | Point a session at a local app bundle (e.g. `/Applications/Discord.app`); [`rea-agents`](https://rea.tools/) inventories and parses it as a streamed subprocess, progress renders live in the chat, the full evidence JSON is saved to `rea_output/`, and only a short preview is handed to the model for analysis. |
+| 11 | **Skills & `/` commands (REA)** | Type `/` at the start or end of the composer, pick a skill, and a chip appears in the input. The first skill is **Reverse Engineering**: say "reverse engineer Discord" and the agent resolves (or installs/downloads) the target, runs [`rea-agents`](https://rea.tools/) as a streamed subprocess, saves the evidence JSON to `rea_output/`, and answers over a bounded preview — as text plus a rendered **Mermaid** diagram. Add skills by dropping a `SKILL.md` in `skills/`. |
+| 12 | **Embedded terminal** | A real PTY-backed shell (**node-pty** + **xterm.js**) docked under the transcript. Toggle it from the sidebar, run `git`/`npm`/`vim`/REPLs, resize the window live, and collapse it without killing a running build. The agent gets no shell access. |
 
 ### Browser automation, two lanes
 
@@ -66,20 +67,26 @@ Both lanes run on the same `ToolLoopAgent` as normal chat, so the assistant inte
 | **Good for** | "What's on this page?", quick lookups | "Research these ten companies and verify each site" |
 | **Blocked walls** | n/a | Pauses for you at a CAPTCHA or human-verification wall |
 
-### REA reverse-engineering sessions
+### Skills and `/` commands
 
-The sidebar's **REA Session** opens a chat with an **App path** field above the composer. **Analyze with REA** shells out to [`rea-agents`](https://rea.tools/) (`analyze-javascript-application <path> --json`) and folds the result back into the conversation:
+Type `/` at the **start or end** of the composer. The picker lists the skills discovered under `skills/`; choosing one removes the `/token`, shows a chip in the input, and attaches that skill to the next message only. A `/` in the middle of prose is left alone.
 
-- The subprocess is **spawned, not run synchronously** — otherwise REA's runtime would freeze the whole app while it parses the bundle.
-- REA emits progress to **stderr** as `{"rea_progress":{…}}` lines; those are decoded and streamed live into the transcript as a "thinking" log bubble.
-- The evidence envelope goes to **stdout** and can be tens of megabytes, so it is written to `rea_output/<App>-<timestamp>.json` at the project root instead of being pasted into the chat.
-- Only a short preview plus the saved file path is handed to the model, which then answers normally in the same thread.
+The bundled **Reverse Engineering** skill wraps [`rea-agents`](https://rea.tools/) and does not need a path up front:
+
+1. `rea_resolve_target` turns a name (`Discord`), path, or URL into a local app or artifact.
+2. `rea_download` installs the Homebrew cask or downloads/extracts an archive when the target is not present (approval required).
+3. `rea_run` executes one allowlisted REA analysis command. The subprocess is **spawned, not run synchronously**, so REA's runtime cannot freeze the app; progress on stderr streams into a live log bubble.
+4. The evidence envelope (often tens of megabytes) goes to `rea_output/<command>-<target>-<timestamp>.json`; only a capped preview returns to the model, which answers with evidence ids and the saved file path.
+
+Every REA answer is **text + a Mermaid diagram**, not text alone. The skill makes the model finish with a fenced ` ```mermaid ` block that maps the components or runtime path it actually established; `@streamdown/mermaid` renders it with [mermaid.js](https://mermaid.js.org/) in the transcript (raw code stays visible if the syntax is invalid).
+
+A new skill is just `skills/<id>/SKILL.md` with `name`, `description`, and an optional `toolset` in the frontmatter. `toolset: rea` attaches the three REA tools above.
 
 ## How it works
 
 ```
 ┌────────────────────────────── renderer (Next.js, sandboxed) ───────────────────────────────┐
-│  Dynamic island · capture overlay · chat panel · settings · browser activity feed            │
+│  Dynamic island · capture overlay · chat panel · settings · browser feed · xterm terminal    │
 └───────────────────────────────────────┬──────────────────────────────────────────────────────┘
                                         │  IPC (invoke / events) — no renderer knows Node
 ┌───────────────────────────────────────▼──────────────────────────────────────────────────────┐
@@ -89,6 +96,7 @@ The sidebar's **REA Session** opens a chat with an **App path** field above the 
 │  browser/     embedded Chromium via webContents.debugger — CDP, tools, approval loop          │
 │               deep-task.ts — @browser_use/pi agent in its own Chrome window                  │
 │  capture.ts   circle-capture service (desktopCapturer → PNG, 1568px downscale)               │
+│  terminal/    node-pty sessions — shell/cwd chosen in main, no agent tool                    │
 │  transcribe.ts whisper.cpp → text · ai/attachments.ts file storage + sniffing                │
 │  db/          SQLite (libsql + Drizzle) — settings, encrypted keys, chat, tools, attachments │
 └───────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -111,8 +119,11 @@ The sidebar's **REA Session** opens a chat with an **App path** field above the 
 │   ├── db/                   # libsql + Drizzle schema, keys (safeStorage), migrations
 │   ├── scripts/              # dev, whisper setup, offline test suites
 │   ├── drizzle/              # committed SQL migrations
+│   ├── skills/               # skill registry + the REA toolset
+│   ├── terminal/             # node-pty session manager (spawn/write/resize/dispose)
 │   └── models/ vendor/       # whisper model + whisper.cpp (generated, gitignored)
 ├── renderer/                 # Next.js (sandboxed) UI — island, chat, capture, settings
+├── skills/                   # user-editable skills; each is <id>/SKILL.md
 ├── docs/feat_plans_todos.md  # the design + status ledger for every feature
 └── README.md
 ```
@@ -163,7 +174,7 @@ All suites are **offline** (model transport mocked) and chained by one command:
 (cd electron && npm test)
 ```
 
-This runs: provider compatibility matrix (incl. tool-calling and PDF file-part capability per provider) → approval-loop smoke (park/approve/deny + resume-shape regression) → browser-backend smoke (lane exclusivity + `@` mention scoping) → main + preload typecheck/build → embedded-browser CDP smoke (navigation, refs, inputs, screenshot, PDF, panel rectangle/collapse, concurrent-navigation race).
+This runs: provider compatibility matrix (incl. tool-calling and PDF file-part capability per provider) → approval-loop smoke (park/approve/deny + resume-shape regression) → browser-backend smoke (lane exclusivity + `@` mention scoping) → main + preload typecheck/build → embedded-browser CDP smoke (navigation, refs, inputs, screenshot, PDF, panel rectangle/collapse, concurrent-navigation race) → terminal smoke (node-pty loads under Electron and spawns a working PTY).
 
 ## Configuration
 
@@ -186,6 +197,7 @@ The browser backend is set in the same panel under **Browser automation**. It is
 - **Embedded browser page is hostile-by-default** — own partition (`persist:dummy-browser`), no preload, hard-deny `file:`/`javascript:`/`data:` schemes, camera/mic/geolocation denied, popups folded into the same view.
 - **No remote debugging port** — CDP runs in-process over `webContents.debugger`, so nothing is exposed on the network.
 - **Writes require approval** — `browser_type` and `browser_save_pdf` prompt; reads and clicks run visibly in the panel. A deep task is **one** approval for the whole run, and the card says exactly that grant before you accept it.
+- **The terminal is human-only** — main chooses the shell and cwd; the renderer can only send keystrokes and dimensions, and no model tool can reach the PTY. Shells survive hiding the panel but are killed on window close, reload, and quit.
 - **No automated CAPTCHA bypass** — a human-verification wall is handed to you. The run pauses, you solve it, you press Resume. Stealth fingerprints and solver services are anti-bot circumvention and are deliberately absent.
 - **Attachment safety** — per-category byte caps, content sniffing (real images, `%PDF-` magic, no binary-in-text), main derives all on-disk paths; the renderer can never inject a filesystem path.
 - **Local data wipe** — Settings → Data & privacy deletes rows *and* files (including staging/orphans) in one transaction, so a reset frees real bytes, not just database rows.
@@ -194,8 +206,8 @@ The browser backend is set in the same panel under **Browser automation**. It is
 
 | | |
 |---|---|
-| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation · **deep-task agent (`@browser_use/pi`)** · **switchable browser backend** · **`@` tool picker** · **CAPTCHA handoff** · **rate-limit resilience** · **REA reverse-engineering session** · local data wipe & image deletion |
-| 📋 Backlog | Streaming/VAD dictation · local command execution · chat-scoped dictation · compact tool-trace summaries in chat · headless deep runs |
+| ✅ Shipped | Push-to-talk dictation · provider config · jargon polish · persistent chat · circle-capture · document/text attachments · embedded browser automation · **deep-task agent (`@browser_use/pi`)** · **switchable browser backend** · **`@` tool picker** · **CAPTCHA handoff** · **rate-limit resilience** · **`/` skills with REA reverse engineering** · **Mermaid-diagram answers** · **embedded terminal (node-pty + xterm.js)** · local data wipe & image deletion |
+| 📋 Backlog | Streaming/VAD dictation · agent shell tool (approval-gated) · chat-scoped dictation · compact tool-trace summaries in chat · headless deep runs |
 
 The **ledger** for every feature — decisions, provider quirks, hard constraints, and traps found — lives in [`docs/feat_plans_todos.md`](docs/feat_plans_todos.md). It is written as the work happens, not after.
 
@@ -207,6 +219,8 @@ The **ledger** for every feature — decisions, provider quirks, hard constraint
 | UI | Next.js 16 · React 19 · shadcn/ui · react-markdown |
 | AI | Vercel AI SDK 7 (`ToolLoopAgent`, `streamText`) + `@ai-sdk/{openai,anthropic,google,xai}` |
 | Deep-task agent | `@browser_use/pi` 0.1.0 (`@earendil-works/pi-ai` provider layer) |
+| Terminal | `node-pty` 1.1 (N-API PTY in main) + `@xterm/xterm` 6 (renderer) |
+| Diagrams | `mermaid` 12 via `@streamdown/mermaid` |
 | Storage | SQLite via `@libsql/client` + Drizzle ORM (committed migrations) |
 | Transcription | whisper.cpp (`base.en`) as a local subprocess |
 | Browser automation | raw CDP over `webContents.debugger` for the embedded lane — zero new runtime deps |
